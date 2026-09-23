@@ -1,5 +1,11 @@
 """
-Ticker universe for the offline training pipeline.
+Ticker universe (281 tickers, 11 GICS sectors).
+
+Sector is the only industry information the fair-value model gets, and GICS
+sectors are coarse: hardware vs. software (HPQ vs. ADBE) or airlines vs.
+defense (DAL vs. LMT) share a sector but not a normal multiple. Stocks from
+structurally cheaper sub-industries therefore tend to show up as "저평가".
+Finer industry labels would be the first thing to add if that matters.
 
 v3 (2026-09-18) — expanded from 66 (11 sectors x 6) toward ~30/sector, per
 user request after the first two real-data runs (66 tickers) came back
@@ -15,12 +21,9 @@ power. Also folds in two other 2026-09-18 decisions:
    tickers to support its own regression — 6/sector clearly wasn't enough,
    and even the sectors below that only reached the high teens/20s (Energy,
    Materials, Communication Services, Real Estate — see note at the bottom)
-   are still thin for a fully separate per-sector model. What's already
-   sector-aware today: features.add_percentile_scores groups by (as_of,
-   sector) before ranking, so every _pct column and composite_score are
-   already sector-relative. A literal "train 11 separate Ridge/XGBoost
-   models" step is future work, gated on this universe (or a further
-   expansion) proving big enough per sector.
+   are still thin for a fully separate per-sector model. Sector enters the
+   fair-value model as a one-hot level shift instead (fair_value.py), and
+   every _pct column is sector-relative (features.add_percentile_scores).
 
 2. A handful of tickers below are deliberately NOT S&P 500-only picks, and
    a handful are deliberately chosen for being awkward cases (meme-stock
@@ -30,9 +33,8 @@ power. Also folds in two other 2026-09-18 decisions:
    ("밈주식이라 갑자기 고평가", "저평가인데 평생 못 오르는 주식") actually
    sitting in the training data, so any future anomaly-detection/filtering
    logic has real cases to be tested against instead of being designed in
-   the abstract. They are NOT excluded from the main pipeline by default —
-   filtering them out is exactly the still-undesigned next step (see
-   run_real_data.py TODO once that's built).
+   the abstract. They are NOT excluded from anything — screening.py's
+   meme_flag / value_trap_flag are what's meant to surface them.
 
 HOW THIS LIST WAS BUILT — please read this before trusting it blindly:
 Sector/ticker membership for the "core" names was cross-checked against
@@ -41,7 +43,7 @@ GICS sector. Everything beyond that core list (older delistings, spinoffs,
 which tickers have decades of trading history vs. a handful of years) is
 from general knowledge, NOT re-verified against a live data feed per
 ticker — that verification is exactly what the pipeline's own
-data_quality_report() in run_real_data.py already does at collection time
+data.data_quality_report() does at collection time
 ("no price history" flags). Treat any ticker flagged there as suspect —
 see the 2026-09-18 correction note below for what that turned up the first
 time this ran on 283 tickers.
@@ -72,6 +74,13 @@ source checked, so its "no price history" is presumed a transient
 yfinance/network hiccup, not a real problem — left as-is, but if it keeps
 showing up in data_quality_report, that's worth a second look (possibly
 try the pre-2023 ticker FISV as a fallback).
+
+FOLLOW-UP (2026-09-23): FI flagged "no price history" again on the next
+real run, so it was checked directly — yfinance now returns 404 / "possibly
+delisted" for FI, while FISV returns current prices (through 2026-09-22).
+Fiserv's ticker is FISV again, not a delisting — relabeled FI -> FISV
+below, same treatment as BK -> BNY. (Checked on yfinance only; if Finnhub
+still expects the old symbol, data_quality_report will show it.)
 
 This will keep happening — completed M&A is exactly the kind of "special
 case" the user's meme-stock/value-trap discussion was about, just from the
@@ -121,7 +130,7 @@ UNIVERSE: dict[str, dict[str, str]] = {
     "ADSK": {"name": "Autodesk", "sector": "Technology"},
     "CTSH": {"name": "Cognizant", "sector": "Technology"},
     "ACN": {"name": "Accenture", "sector": "Technology"},
-    "FI": {"name": "Fiserv", "sector": "Technology"},  # renamed from FISV in 2023; flagged "no price history" once, still actively trading per web search — see correction note above
+    "FISV": {"name": "Fiserv", "sector": "Technology"},  # FISV -> FI (2023) -> back to FISV; see 2026-09-23 follow-up in docstring
     "TER": {"name": "Teradyne", "sector": "Technology"},
     "ADI": {"name": "Analog Devices", "sector": "Technology"},
     "TYL": {"name": "Tyler Technologies", "sector": "Technology"},
@@ -180,7 +189,7 @@ UNIVERSE: dict[str, dict[str, str]] = {
     "PRU": {"name": "Prudential Financial", "sector": "Financials"},
     "ALL": {"name": "Allstate", "sector": "Financials"},
     "PNC": {"name": "PNC Financial Services", "sector": "Financials"},
-    "BNY": {"name": "Bank of New York Mellon", "sector": "Financials"},  # ticker renamed from BK in 2025
+    "BNY": {"name": "Bank of New York Mellon", "sector": "Financials"},  # renamed from BK in 2025; Finnhub PER/PBR under BNY look broken (~0.04/0.006) — excluded by the fair-value bounds, see data_quality_report
     "STT": {"name": "State Street", "sector": "Financials"},
     "FITB": {"name": "Fifth Third Bancorp", "sector": "Financials"},
     "RF": {"name": "Regions Financial", "sector": "Financials"},
@@ -254,7 +263,7 @@ UNIVERSE: dict[str, dict[str, str]] = {
     "EFX": {"name": "Equifax", "sector": "Industrials"},
     "NDSN": {"name": "Nordson Corporation", "sector": "Industrials"},
 
-    # ---- Energy (16 — see docstring on why this sector is smaller) ----
+    # ---- Energy (15 — see docstring on why this sector is smaller) ----
     "XOM": {"name": "ExxonMobil", "sector": "Energy"},
     "CVX": {"name": "Chevron", "sector": "Energy"},
     "COP": {"name": "ConocoPhillips", "sector": "Energy"},
@@ -330,7 +339,7 @@ UNIVERSE: dict[str, dict[str, str]] = {
     "KOSS": {"name": "Koss Corporation", "sector": "Consumer Discretionary"},  # meme-stock watchlist — NOT in a major index
     "M": {"name": "Macy's", "sector": "Consumer Discretionary"},  # value-trap watchlist
 
-    # ---- Communication Services (14 — see docstring on why this sector is smaller) ----
+    # ---- Communication Services (13 — see docstring on why this sector is smaller) ----
     "GOOGL": {"name": "Alphabet", "sector": "Communication Services"},
     "DIS": {"name": "Disney", "sector": "Communication Services"},
     "VZ": {"name": "Verizon", "sector": "Communication Services"},  # value-trap watchlist

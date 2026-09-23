@@ -1,63 +1,91 @@
-# 밸류에이션 팩터 → 기대수익률 모델 (학습 파이프라인)
+# 적정 밸류에이션 스크리닝 (Stock_Prediction)
 
-기술명세서(technical-spec.md)에서 정한 설계를 코드로 구현한 것입니다: 밸류·퀄리티·기술 지표로 섹터 상대 percentile 스코어를 만들고, 그 스코어가 실제로 forward return과 관계가 있는지 통계적으로 검증한 뒤, Ridge(주 모델)/Fama-MacBeth/XGBoost/RandomForest로 기대수익률을 추정합니다.
+미국 상장 종목 280여 개를 대상으로, 각 회사의 재무 지표(ROE, 영업이익률, 매출성장률, 부채비율, 배당성향, 변동성, 섹터)를 보면 **시장이 보통 PER·PBR을 얼마나 쳐주는지(적정 배수)**를 학습합니다. 그리고 **실제 배수가 적정 배수보다 얼마나 싸거나 비싼지**로 저평가/고평가를 판단합니다.
 
-## 실행 방법
+- 수익률 예측 모델이 아닙니다. "지금 이 회사의 재무 수준에 비해 주가가 싸게/비싸게 매겨져 있다"는 **서술**입니다.
+- 모든 판단에는 근거가 함께 나옵니다. 예: `PER 29.5배 (적정 22.2배, +33%) — 적정 PER을 높인 요인 섹터 +16%, 매출성장률 +8% / 낮춘 요인 배당성향 -18%`
+
+## 실행
 
 ```bash
 pip install -r requirements.txt
 
-# 1) 파이프라인 로직 자체를 검증하는 synthetic 데이터 스모크 테스트 (지금 바로 실행 가능, 외부 API 불필요)
-python tests/synthetic_smoke_test.py
+python tests/test_pipeline.py                 # synthetic 데이터 테스트 (API 불필요)
 
-# 2) 실제 데이터로 돌리려면 (Finnhub API 키 필요: https://finnhub.io/register)
-export FINNHUB_API_KEY=your_key_here
-python train.py --tickers AAPL MSFT JNJ ...   # 아직 CLI 미구현, 아래 "다음 단계" 참고
+export FINNHUB_API_KEY=...                    # https://finnhub.io/register (무료, 분당 50콜)
+python src/main.py build                      # 데이터 수집 → real_data_output/panel.parquet (첫 실행 약 6분, 이후 캐시)
+python src/main.py verify-multiples           # PER/PBR 주가 보정 가정 확인 (API 6콜)
+python src/main.py evaluate                   # 모델 성능 + "싸다는 판단이 수익률과 관계있나" 검정
+python src/main.py screen                     # 최신 시점 리포트 (+ CSV 저장)
+python src/main.py screen --ticker AAPL       # 한 종목 설명
 ```
 
-**Colab에서 실행할 때:** `src/`, `tests/` 폴더 구분 없이 `.py` 파일 전부를 `/content/` 한 폴더에 평평하게 업로드한 뒤 `!python synthetic_smoke_test.py`로 실행하면 됩니다 (내부 import가 `from config import ...` 식이라 같은 폴더에 있으면 그대로 동작). 세션이 끊기면 업로드한 파일이 사라지니 새 세션마다 다시 올려야 합니다.
+**Colab**: `src/`, `tests/`의 `.py` 파일을 전부 `/content/`에 평평하게 올린 뒤 실행합니다.
+
+```python
+import main
+main.build(api_key="...")
+main.evaluate()
+report = main.screen()
+```
+
+`data_cache/`는 런타임을 다시 시작하면 사라지므로, 유지하려면 Google Drive 경로를 `cache_dir`로 지정하세요. 파일을 교체한 뒤에는 **런타임을 다시 시작**해야 새 코드가 반영됩니다.
 
 ## 파일 구성
 
 | 파일 | 역할 |
 |---|---|
-| `src/config.py` | 지표 목록, 예측 호라이즌, 방향(higher/lower_is_better) 정의 |
-| `src/data_collection.py` | yfinance(가격) + Finnhub(과거 point-in-time 펀더멘털) 수집 |
-| `src/features.py` | look-ahead bias 없이 시점별 지표값·섹터 percentile·forward return 계산 |
-| `src/factor_validation.py` | 분위별 팩터 스프레드, 정보계수(IC), FDR 보정 |
-| `src/models.py` | RidgeQuantileModel(주 모델), FamaMacBethModel, XGBQuantileModel, RandomForestQuantileModel |
-| `src/pipeline.py` | 위 전부를 시간 기준 Train/Val/Test 분할로 묶어서 실행 |
-| `tests/synthetic_smoke_test.py` | 가짜 데이터로 전체 파이프라인이 에러 없이 도는지 + 통계가 말이 되는지 확인 |
+| `src/config.py` | Train/Val/Test 날짜, 지표, 적정가 모델 설정, 라벨 기준 |
+| `src/universe.py` | 종목 281개와 섹터 (상장폐지·티커 변경 이력 포함) |
+| `src/data.py` | yfinance(가격) + Finnhub(분기 재무) 수집, 캐시, 데이터 품질 검사 |
+| `src/features.py` | 시점별 패널 생성. **look-ahead 방지 로직은 모두 여기에** 있음 |
+| `src/fair_value.py` | 적정 배수 모델(Ridge), 모델 평가, 수익률 가설 검정 |
+| `src/screening.py` | 라벨, 판단 근거, 밈주식·밸류트랩·전환 플래그, 리포트 |
+| `src/main.py` | CLI: `build` / `evaluate` / `screen` / `verify-multiples` |
+| `tests/test_pipeline.py` | look-ahead 방지, 적정가 복원, out-of-fold, 라벨·플래그 테스트 |
 
-## 지금 실제로 검증된 것 / 아직 안 된 것
+## 모델
 
-**검증됨 (synthetic 데이터로 실행 확인)**
-- look-ahead bias 없는 point-in-time 피처 계산 (재무제표는 발표 후 45일 지연 반영 — `features.py`의 `REPORTING_LAG_DAYS`, 실제 공시 지연과 다를 수 있어 검증 필요)
-- 섹터 상대 percentile + composite score 계산
-- 시간 기준 Train/Val/Test 분할 (랜덤 split 아님)
-- Ridge/Fama-MacBeth/XGBoost/RandomForest 4개 모델이 전부 에러 없이 학습·예측
-- 분위별 팩터 스프레드, IC, FDR 보정까지 전체 파이프라인 실행
+분기마다(그리고 오늘 기준으로 한 번 더) 그 시점의 전체 종목 단면으로 학습합니다.
 
-**synthetic 테스트에서 실제로 발견된 것 (중요, 실제 데이터에서도 그대로 나올 가능성 높음)**
-- **모델 간 과적합 정도 차이가 설계 의도대로 나타남**: XGBoost는 Train MAE가 Val MAE보다 훨씬 낮게 나오는 반면(과적합), Ridge/RandomForest는 Train-Val 격차가 거의 없거나 오히려 Val이 더 낮게 나옴. 3.5절에서 예상한 대로 "작은 데이터에서는 Ridge/RF가 XGBoost보다 안전하다"는 게 실제로 재현됨.
-- **다중공선성 때문에 Fama-MacBeth 개별 feature 계수의 부호가 불안정함**: synthetic 데이터는 지표들이 전부 하나의 공통 요인에서 파생되도록 설계했는데, 이렇게 지표끼리 상관관계가 높으면 여러 feature를 한꺼번에 넣은 회귀에서 개별 계수 부호가 뒤집히거나 유의하지 않게 나옵니다(공동 설명력은 있어도 "이 지표가 범인이다"를 개별적으로 짚어내기 어려움). composite_score의 IC 자체는 기대대로 전부 양수였습니다. **실제 지표(PER-PBR, ROE-영업이익률 등)도 서로 상관관계가 높을 가능성이 커서, 실제 데이터에서도 같은 문제가 나올 수 있습니다.** 이 경우 지표를 하나씩 넣는 단변량(univariate) Fama-MacBeth로 바꾸거나, PCA로 차원을 줄이는 방법을 고려해야 합니다 — 지금 코드에는 아직 안 넣었습니다.
-- 종목 30개 × 분기 13개(Train 기준)짜리 synthetic 데이터에서도 통계적 유의성(p<0.05)은 안 나왔습니다. 실제 프로젝트 목표인 10~20개 종목이면 검정력이 이보다도 낮을 가능성이 높다는 뜻이므로, "통계적으로 유의미하다"고 말하려면 종목 수/기간을 늘리는 게 중요해집니다.
+1. **타깃**: log PER, log PBR. 적자·자본잠식, 비정상적으로 큰 값(PER 100 초과, PBR 20 초과)이나 작은 값은 제외합니다.
+2. **입력**: ROE, 영업이익률, 매출성장률, 부채비율, 배당성향, 63일 변동성, 섹터. 가격에서 나온 지표(모멘텀 등)는 넣지 않습니다. 주가가 빠진 것을 모델이 "원래 싸야 할 종목"으로 설명해 버리기 때문입니다.
+3. **Ridge 회귀, 종목 단위 out-of-fold**: 각 종목의 적정 배수는 그 종목을 **빼고** 학습한 모델로 계산합니다. 자기 가격이 자기 적정가에 섞이지 않습니다.
+4. **괴리** = log(실제 / 적정). PER과 PBR 괴리의 평균을 같은 시점 전체 종목 중 순위로 바꿔 상위 20%는 **저평가**, 하위 20%는 **고평가**로 봅니다. 최근 12개월 적자 기업은 **판단 보류**입니다.
 
-**실제 Finnhub 계정으로 검증 완료 (2026-09-14, AAPL 기준)**
-- `FINNHUB_FIELD_MAP`의 5개 지표(`trailing_pe`, `price_to_book`, `return_on_equity`, `debt_to_equity`, `operating_margin`)는 실제 응답 필드명으로 수정 완료 (`peTTM`, `pb`, `roeTTM`, `totalDebtToEquity`, `operatingMargin`)
-- `dividend_yield`, `revenue_growth_yoy`는 Finnhub에 직접 필드가 없다는 것도 확인됨 → 원재료(`eps`, `payoutRatioTTM`, `salesPerShare`)를 대신 수집해서 `features.py`에서 파생 계산하도록 구현:
-  - `dividend_yield` ≈ `payout_ratio_ttm * eps / 그 시점 가격` (`features.py`의 `_dividend_yield`)
-  - `revenue_growth_yoy` ≈ `sales_per_share`의 YoY(365일±45일 허용) 변화율 (`features.py`의 `add_revenue_growth_yoy`)
-  - synthetic 데이터로 파생 로직 자체도 검증함 (`tests/synthetic_smoke_test.py`): 설계한 성장률과 복원된 값이 근접, `dividend_yield`/`revenue_growth_yoy` NA율 0%, 전체 파이프라인 정상 실행 + IC 양수(PASS)
+### 실제 데이터 결과 (2026-09-23, 280개 종목, 2004~2026)
 
-**아직 안 됨 (실제 데이터 연결 필요)**
-- 실제 종목 리스트(10~20개) 선정, 실제 데이터 수집 실행, 실제 결과 해석은 안 함 — synthetic 데이터는 로직 검증용일 뿐 실제 시장에 대해 아무것도 말해주지 않음
-- CLI(`train.py`)나 MLflow 연동은 아직 없음 — 지금은 `pipeline.run_all_horizons(panel, horizons)`을 직접 호출하는 라이브러리 형태
-- `dividend_yield`/`revenue_growth_yoy` 파생 로직은 synthetic 데이터로만 검증됨 — 실제 AAPL 등 데이터로 계산했을 때 값 자체가 상식적인 범위(예: 배당수익률이 0~10% 사이 등)인지는 아직 확인 안 함
+**적정 배수 설명력** (out-of-fold R², 시점 평균). 기준선은 "섹터 중앙값 배수"입니다.
 
-## 다음 단계
+| | 섹터 중앙값 | 적정가 모델 |
+|---|---|---|
+| PBR train / val / test | 0.20 / 0.25 / 0.16 | **0.47 / 0.52 / 0.55** |
+| PER train / val / test | 0.12 / 0.16 / 0.16 | **0.27 / 0.31 / 0.28** |
 
-1. 지원 종목 10~20개 확정 (기술명세서 11절) → `data_collection.py`로 실제 수집
-2. 실제 데이터로 `dividend_yield`/`revenue_growth_yoy` 파생값이 상식적인 범위인지 확인
-3. 다중공선성 문제 확인되면 univariate Fama-MacBeth 또는 지표 축소 적용
-4. MLflow로 실험 추적 연결, `train.py` CLI 작성
+- **PBR**은 재무 지표로 잘 설명됩니다. ROE 계수는 **모든 시점(100%)**에서 양수였습니다.
+- **PER**은 설명력이 중간 정도입니다. PER에는 미래 이익에 대한 기대가 반영되는데, 과거 재무 지표로는 이를 알 수 없습니다.
+- 전형적인 오차는 log 기준 0.32~0.43입니다. 그래서 ±20% 정도의 괴리는 잡음 수준이고, 상위·하위 20%에 들어야 의미가 있습니다.
+- 시장이 꾸준히 더 쳐준 요인은 PBR에서 ROE와 부채비율, PER에서 배당성향이었습니다.
+
+**"싸다"는 판단이 이후 수익률과 관계가 있었나?** 이것은 모델 성능이 아니라 별도의 가설 검정입니다.
+- 방법: 시점별 IC와 분위 스프레드. 6·12개월처럼 기간이 겹치는 수익률은 Newey-West로 보정하고, 전체 결과에 FDR 보정을 적용했습니다.
+- 결과: **0/24 유의**. 적정가 대비 싸다는 판단이 이후 초과수익으로 이어졌다는 증거는 없습니다.
+
+## 한계 (리포트를 읽을 때 같이 볼 것)
+
+- **모델이 보지 못하는 것은 모두 괴리에 들어갑니다.** 브랜드, 해자, 신약 파이프라인, M&A, 일회성 이익 같은 것들입니다. 그래서 COST, WMT, ISRG, CDNS처럼 프리미엄을 받는 기업이 "고평가"로 나옵니다. 판단 근거 설명을 같이 확인하세요.
+- **섹터가 너무 넓습니다.** 하드웨어(HPQ)와 소프트웨어, 항공(DAL)과 방산이 같은 섹터로 묶입니다. 원래 싸게 거래되는 세부 업종은 "저평가"로 나오기 쉽습니다.
+- **Finnhub 데이터의 한계**
+  - 공시일 정보가 없어서 분기 말 45일 뒤부터 재무 데이터를 안다고 가정합니다.
+  - PER과 PBR은 분기 말 주가 기준이라 스냅샷 시점 주가로 보정합니다. `verify-multiples`로 이 가정을 확인할 수 있습니다.
+  - BNY는 PER/PBR 데이터가 전 기간 비정상이라 자동으로 제외됩니다.
+  - 배당성향은 약 30%가 비어 있습니다.
+- **밈주식 플래그**는 각 스냅샷 직전 5거래일만 봅니다. 분기 사이에 일어난 사건(예: 2021년 1월 GME)은 놓칩니다.
+
+## 프로젝트 이력
+
+1. **2026-09-14~18 · 수익률 예측**: 밸류·퀄리티·기술 지표 11개로 1/3/6/12개월 수익률을 예측했습니다. Ridge, XGBoost, RandomForest, Fama-MacBeth를 사용했습니다.
+   - 결과: 281개 종목, 16년 데이터에서 FDR 보정 후 0/60 유의였습니다. 모델은 "섹터 평균 수익률" 기준선을 넘지 못했습니다. 그래서 수익률 예측 목표는 버렸습니다.
+2. **2026-09-23 · 섹터 대비 스크리닝**: 11개 지표의 평균 점수로 라벨을 붙이니 93%가 중립으로 나오고, 퀄리티·모멘텀이 섞여 "고평가"의 의미가 흐려졌습니다. 그래서 밸류 지표만 쓰는 섹터 순위로 바꿨습니다.
+3. **2026-09-23 · 적정 밸류에이션 모델(현재)**: 섹터 순위는 성장성과 수익성을 무시합니다. 그래서 "이 재무 수준이면 적정 배수가 얼마인가"를 학습하는 모델로 바꾸고, 코드를 7개 파일로 통합했습니다.
+   - 삭제한 파일: `models.py`, `baselines.py`, `pipeline.py`, `factor_validation.py`, `run_real_data.py`, `data_collection.py`. 이 파일들은 git 첫 커밋에 남아 있습니다.
