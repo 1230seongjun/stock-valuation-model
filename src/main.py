@@ -2,18 +2,20 @@
 Entry point.
 
     python src/main.py build     [--force-refresh]   # collect data -> real_data_output/panel.parquet
+    python src/main.py verify-multiples              # check the multiples' price rescaling against yfinance
+    python src/main.py compare-features              # which candidate features help (Train/Val)
     python src/main.py evaluate                      # fair-value model quality + gap-vs-return test
     python src/main.py screen    [--ticker AAPL] [--as-of 2026-07-01]
-    python src/main.py verify-multiples              # check the PER/PBR rescaling assumption (6 API calls)
 
-build needs FINNHUB_API_KEY (env var or --api-key). evaluate/screen only need
-the saved panel, and recompute the fair-value model from it every time, so a
-saved panel never carries a stale model.
+build needs FINNHUB_API_KEY (env var or --api-key). The other commands only
+need the saved panel, and recompute the fair-value model from it every time,
+so a saved panel never carries a stale model.
 
 Colab (every .py uploaded flat into /content):
     import main
     main.build(api_key="...")      # first run ~6 min, then cached in ./data_cache
-    main.verify_multiples(api_key="...")
+    main.verify_multiples()
+    main.compare_features()
     main.evaluate()
     report = main.screen()         # or main.screen(ticker="AAPL")
 """
@@ -25,9 +27,9 @@ from pathlib import Path
 
 import pandas as pd
 
-from config import TRAIN_START
+from config import FAIR_VALUE_FEATURE_CANDIDATES, FAIR_VALUE_FEATURES, FAIR_VALUE_TARGETS, TRAIN_START
 from data import DEFAULT_CACHE_DIR, collect, data_quality_report
-from fair_value import add_fair_value, coefficient_summary, gap_return_test, summarize_diagnostics
+from fair_value import add_fair_value, coefficient_summary, compare_feature_sets, gap_return_test, summarize_diagnostics
 from features import add_percentile_scores, build_as_of_dates, build_raw_panel
 from screening import report_at, screen as screen_panel
 from universe import TICKERS, UNIVERSE
@@ -35,8 +37,8 @@ from universe import TICKERS, UNIVERSE
 OUTPUT_DIR = Path("real_data_output")
 PANEL_PATH = OUTPUT_DIR / "panel.parquet"
 
-pd.set_option("display.width", 200)
-pd.set_option("display.max_columns", 30)
+pd.set_option("display.width", 250)
+pd.set_option("display.max_columns", 40)
 
 
 def build(api_key: str | None = None, cache_dir: str | Path = DEFAULT_CACHE_DIR, force_refresh: bool = False,
@@ -52,9 +54,14 @@ def build(api_key: str | None = None, cache_dir: str | Path = DEFAULT_CACHE_DIR,
     if panel.empty:
         raise RuntimeError("panel is empty — check that collection worked")
 
-    print(f"  {len(panel)} rows, {panel['ticker'].nunique()} tickers")
-    for col in ("trailing_pe", "price_to_book", "return_on_equity", "revenue_growth_yoy", "payout_ratio_ttm", "dividend_yield"):
-        print(f"  {col:20s} missing {panel[col].isna().mean():.1%}")
+    print(f"  {len(panel)} rows, {panel['ticker'].nunique()} tickers — share of rows missing:")
+    multiples = [spec["column"] for spec in FAIR_VALUE_TARGETS.values()]
+    for col in [*multiples, *FAIR_VALUE_FEATURES, *FAIR_VALUE_FEATURE_CANDIDATES, "dividend_yield"]:
+        missing = panel[col].isna().mean()
+        warn = "  <- almost empty: check the Finnhub field name (data.FINNHUB_FIELD_MAP)" if missing > 0.95 else ""
+        print(f"    {col:24s} {missing:6.1%}{warn}")
+    print(f"    dividend payers in latest snapshot: "
+          f"{(panel.loc[panel['as_of'] == panel['as_of'].max(), 'dividend_yield'] > 0).mean():.0%}")
 
     Path(panel_path).parent.mkdir(parents=True, exist_ok=True)
     panel.to_parquet(panel_path)
@@ -69,6 +76,25 @@ def _load(panel_path: str | Path) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+def compare_features(panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
+    """Out-of-fold R^2 of each multiple for: the current features, current +
+    each candidate alone, and current + all candidates. Keep a candidate only
+    if it helps on train AND val (test is for the final report)."""
+    panel = _load(panel_path)
+    candidates = [c for c in FAIR_VALUE_FEATURE_CANDIDATES if c in panel.columns]
+    sets = {"current": FAIR_VALUE_FEATURES}
+    sets.update({f"+{c}": [*FAIR_VALUE_FEATURES, c] for c in candidates})
+    sets["+all"] = [*FAIR_VALUE_FEATURES, *candidates]
+    print(f"Comparing {len(sets)} feature sets on {panel['as_of'].nunique()} snapshots (takes a few minutes)...")
+    table = compare_feature_sets(panel, sets)
+    delta = table.drop(columns=["sector_median", "current"]).sub(table["current"], axis=0)
+    print("\n=== out-of-fold R^2 (mean per date) ===")
+    print(table.round(3).T.to_string())
+    print("\n=== change vs. current features (positive = helps) ===")
+    print(delta.round(3).T.to_string())
+    return table
+
+
 def evaluate(panel_path: str | Path = PANEL_PATH) -> dict[str, pd.DataFrame]:
     panel, diagnostics = add_fair_value(_load(panel_path))
 
@@ -77,13 +103,18 @@ def evaluate(panel_path: str | Path = PANEL_PATH) -> dict[str, pd.DataFrame]:
     print("    r2_model must beat r2_sector_median, i.e. explain more than 'which sector is it'.")
     print(summary.round(3).to_string())
 
+    labelled = panel[panel["valuation_gap"].notna() & (panel["n_gaps"] > 1)]
+    print("\n=== 2. Combined verdict: do the multiples agree? ===")
+    print(f"    mean share of views on the same side as the combined gap: {labelled['gap_agreement'].mean():.0%}")
+    print(f"    rows where every view agrees: {(labelled['gap_agreement'] == 1).mean():.0%}")
+
     coefs = coefficient_summary(diagnostics)
-    print("\n=== 2. What the market paid for (standardized Ridge coefficient, all dates) ===")
+    print("\n=== 3. What the market paid for (standardized Ridge coefficient, all dates) ===")
     print("    same_sign_share = share of dates with the same sign as the mean")
     print(coefs.pivot(index="feature", columns="target", values=["mean_coef", "same_sign_share"]).round(2).to_string())
 
     tests = gap_return_test(panel)
-    print("\n=== 3. Hypothesis test: did stocks called cheap later outperform? (not a model metric) ===")
+    print("\n=== 4. Hypothesis test: did stocks called cheap later outperform? (not a model metric) ===")
     print("    ic = Spearman(cheapness, forward return) per date; spread = cheapest - most expensive quintile.")
     print("    Newey-West errors for overlapping horizons, BH-FDR across the whole table.")
     if tests.empty:
@@ -118,15 +149,17 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
 
     counts = report["valuation_label"].value_counts()
     print(f"Screening report {date} ({len(report)} tickers): " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+    pct = lambda s: s.map(lambda v: f"{v:+.0%}" if pd.notna(v) else "")
     table = report.assign(
-        gap=report["valuation_gap_pct"].map(lambda v: f"{v:+.0%}" if pd.notna(v) else ""),
-        pe=report["trailing_pe"].round(1), fair_pe=report["fair_pe"].round(1),
-        pb=report["price_to_book"].round(2), fair_pb=report["fair_pb"].round(2),
-        rank=report["cheapness_rank"].round(0), sector_rank=report["sector_valuation_rank"].round(0),
+        rank=report["cheapness_rank"].round(0),
+        gap=pct(report["valuation_gap_pct"]),
+        agree=[f"{a * n:.0f}/{n:.0f}" if pd.notna(a) else "" for a, n in zip(report["gap_agreement"], report["n_gaps"])],
+        **{spec["label"]: pct(report[f"{key}_gap"]) for key, spec in FAIR_VALUE_TARGETS.items()},
         quality=report["quality_score"].round(0),
     )
-    cols = ["ticker", "sector", "valuation_label", "rank", "gap", "valuation_basis", "pe", "fair_pe", "pb", "fair_pb",
-            "sector_rank", "quality", "loss_flag"]
+    cols = ["ticker", "sector", "valuation_label", "rank", "gap", "agree",
+            *[spec["label"] for spec in FAIR_VALUE_TARGETS.values()], "quality"]
+    print("    (gap = combined; agree = views on the same side; per-multiple columns = actual vs. fair)")
     print("\n-- 저평가 상위 15 --")
     print(table[cols].head(15).to_string(index=False))
     print("\n-- 고평가 상위 15 --")
@@ -152,36 +185,45 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
 VERIFY_TICKERS = ["AAPL", "MSFT", "JPM", "XOM", "KO", "TSLA"]
 
 
-def verify_multiples(tickers: list[str] = VERIFY_TICKERS, api_key: str | None = None,
-                     panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
-    """Checks config.RESCALE_MULTIPLES_TO_AS_OF_PRICE: compares the latest
-    snapshot's rescaled and as-reported PER/PBR with Finnhub's current-price
-    metrics. Run right after `build` so the latest snapshot is today.
-    If "rescaled" sits close to Finnhub and "reported" doesn't, the
-    period-end-price assumption holds. A newer quarter reported < 45 days ago
-    (not yet in our snapshot, by design) can also cause a gap."""
-    from data import fetch_current_metrics
+def verify_multiples(tickers: list[str] = VERIFY_TICKERS, panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
+    """Checks config.RESCALE_MULTIPLES_TO_AS_OF_PRICE: the latest snapshot's
+    rescaled multiples next to yfinance's current ones (and the as-reported
+    Finnhub values). Run right after `build` so the latest snapshot is today.
+    "rescaled" close to yfinance and "reported" not = the rescaling holds.
+
+    yfinance, not Finnhub, is the reference: on 2026-09-23 Finnhub's own
+    "current" pbQuarterly metric turned out to equal its period-end series
+    value exactly (AAPL 38.49 vs. yfinance 46.16), so it can't tell stale from
+    current. Gaps can also come from a quarter reported < 45 days ago (not in
+    our snapshot yet, by design) or from yfinance's own definitions (its
+    EV/EBITDA and FCF differ from Finnhub's in detail — look for the same
+    ballpark and the right direction of the rescaling, not equality)."""
+    import yfinance as yf
 
     panel = _load(panel_path)
-    latest = panel[panel["as_of"] == panel["as_of"].max()].set_index("ticker")
+    as_of = panel["as_of"].max()
+    latest = panel[panel["as_of"] == as_of].set_index("ticker")
     rows = []
     for ticker in tickers:
-        metric = fetch_current_metrics(ticker, api_key)
-        pe_now = next((metric[k] for k in ("peTTM", "peExclExtraTTM", "peBasicExclExtraTTM") if metric.get(k)), None)
-        pb_now = next((metric[k] for k in ("pbQuarterly", "pb", "pbAnnual") if metric.get(k)), None)
-        row = latest.loc[ticker] if ticker in latest.index else None
-        rows.append({
-            "ticker": ticker,
-            "finnhub_pe_now": pe_now,
-            "pe_rescaled": None if row is None else row.get("trailing_pe"),
-            "pe_reported": None if row is None else row.get("trailing_pe_reported"),
-            "finnhub_pb_now": pb_now,
-            "pb_rescaled": None if row is None else row.get("price_to_book"),
-            "pb_reported": None if row is None else row.get("price_to_book_reported"),
-        })
+        info = yf.Ticker(ticker).info
+        row = latest.loc[ticker] if ticker in latest.index else pd.Series(dtype=float)
+        mcap, fcf = info.get("marketCap"), info.get("freeCashflow")
+        yf_values = {
+            "trailing_pe": info.get("trailingPE"),
+            "price_to_book": info.get("priceToBook"),
+            "price_to_sales": info.get("priceToSalesTrailing12Months"),
+            "ev_to_ebitda": info.get("enterpriseToEbitda"),
+            "price_to_fcf": mcap / fcf if mcap and fcf and fcf > 0 else None,
+        }
+        for col, yf_value in yf_values.items():
+            rows.append({"ticker": ticker, "multiple": col, "yfinance": yf_value,
+                         "rescaled": row.get(col), "reported": row.get(f"{col}_reported")})
     result = pd.DataFrame(rows)
-    print(f"Latest snapshot in panel: {latest.index.size} tickers as of {panel['as_of'].max().date()}")
-    print(result.round(2).to_string(index=False))
+    print(f"Latest snapshot: {len(latest)} tickers as of {as_of.date()}")
+    if latest["price"].isna().all():
+        print("  WARNING: no prices in the latest snapshot — rescaling could not run (rebuild with the current code)")
+    print(result.pivot(index="ticker", columns="multiple", values=["yfinance", "rescaled", "reported"])
+          .swaplevel(axis=1).sort_index(axis=1).round(2).to_string())
     return result
 
 
@@ -192,23 +234,25 @@ def main() -> None:
     b.add_argument("--api-key")
     b.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR))
     b.add_argument("--force-refresh", action="store_true")
+    v = sub.add_parser("verify-multiples", help="check the multiples' price rescaling against yfinance")
+    v.add_argument("--tickers", nargs="+", default=VERIFY_TICKERS)
+    c = sub.add_parser("compare-features", help="out-of-fold R^2 with each candidate feature added")
     e = sub.add_parser("evaluate", help="fair-value model quality + gap-vs-return test")
     s = sub.add_parser("screen", help="screening report")
     s.add_argument("--as-of")
     s.add_argument("--ticker")
-    v = sub.add_parser("verify-multiples", help="check the PER/PBR price-rescaling assumption against Finnhub")
-    v.add_argument("--api-key")
-    v.add_argument("--tickers", nargs="+", default=VERIFY_TICKERS)
-    for p in (b, e, s, v):
+    for p in (b, v, c, e, s):
         p.add_argument("--panel", default=str(PANEL_PATH))
     args = parser.parse_args()
 
     if args.command == "build":
         build(api_key=args.api_key, cache_dir=args.cache_dir, force_refresh=args.force_refresh, panel_path=args.panel)
+    elif args.command == "verify-multiples":
+        verify_multiples(args.tickers, panel_path=args.panel)
+    elif args.command == "compare-features":
+        compare_features(args.panel)
     elif args.command == "evaluate":
         evaluate(args.panel)
-    elif args.command == "verify-multiples":
-        verify_multiples(args.tickers, api_key=args.api_key, panel_path=args.panel)
     else:
         screen(args.panel, as_of=args.as_of, ticker=args.ticker)
 

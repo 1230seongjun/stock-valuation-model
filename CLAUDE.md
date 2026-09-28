@@ -13,6 +13,8 @@
 1. **Train/Val/Test는 절대 랜덤 split 금지.** 항상 `src/config.py`의 고정 날짜(`TRAIN_END`, `VAL_END`)로 나눈다.
    - 적정가 모델은 한 시점의 종목 단면 안에서만 학습한다. 종목 단위 out-of-fold이고, 미래 행은 쓰지 않는다.
    - 모델 설정(변수, 범위, 기준)은 Train/Val 결과만 보고 정한다. Test는 최종 보고용이다.
+   - 새 입력 변수는 먼저 `config.FAIR_VALUE_FEATURE_CANDIDATES`에 넣고, `python src/main.py compare-features`에서 Train과 Val 설명력을 모두 올릴 때만 `FAIR_VALUE_FEATURES`로 옮긴다.
+   - 배당수익률처럼 스냅샷 주가가 들어간 값은 입력 변수로 쓰지 않는다. 배당은 주가와 무관한 이력(무삭감 연수, 배당성장률)만 후보로 둔다.
 2. **look-ahead bias 방지가 최우선 원칙이다.** "시점 T에 무엇을 알 수 있었나"는 `src/features.py`에서만 결정한다(모듈 docstring 참고).
    - 재무 데이터는 분기 말 + 45일(`REPORTING_LAG_DAYS`)부터 알 수 있다고 본다.
    - 가격은 as_of 당일까지만 쓴다.

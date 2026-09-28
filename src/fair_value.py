@@ -1,6 +1,10 @@
 """
-Fair-value model: what PER/PBR would the market normally pay for THIS
-company's fundamentals, and how far is the actual multiple from that?
+Fair-value model: what multiples (PER, PBR, PSR, EV/EBITDA, P/FCF — see
+config.FAIR_VALUE_TARGETS) would the market normally pay for THIS company's
+fundamentals, and how far are the actual multiples from that? The views are
+combined into one verdict (valuation_gap, with gap_agreement = how many of
+them point the same way); a stock is only called cheap/expensive when that
+combined view is in the tails.
 
 WHY: a plain "PER vs. sector peers" rank calls every high-growth, high-ROE
 company expensive and every shrinking, low-return one cheap. A human analyst
@@ -18,7 +22,11 @@ METHOD (per as_of date, per multiple in config.FAIR_VALUE_TARGETS):
   4. fair_<m> = exp(prediction); <m>_gap = log(actual / fair). A gap of
      -0.3 means the stock trades ~26% below the multiple its fundamentals
      would justify at that date.
-  5. valuation_gap = mean of the available <m>_gap values.
+  5. valuation_gap = mean of the available <m>_gap values (none for
+     loss-makers — see loss_flag). On the 2026-09-23 panel the PER and PBR
+     gaps had a mean per-date Spearman correlation of 0.64, and 97% of
+     labelled stocks had both pointing the same way, so the combined verdict
+     is not driven by one multiple.
 
 POINT-IN-TIME: step 1 uses only rows of the same as_of, which features.py
 already restricted to data known on that date. No future rows, no forward
@@ -47,7 +55,10 @@ which trailing fundamentals don't capture. Typical out-of-fold error is
 ~0.32-0.43 in log units, so a gap of +-20% is within noise; only the tails
 (screening's top/bottom 20%) carry information. gap_return_test on the same
 panel: 0/24 significant after FDR — cheap-vs-fair did not predict returns.
-Run `python src/main.py evaluate` for current numbers.
+PSR (added 2026-09-28): sector median 0.19/0.12/0.11 -> Ridge 0.45/0.37/0.48;
+operating margin's coefficient had the same sign on 99% of dates. Finnhub's
+psTTM confirmed trailing-12-month and period-end priced (rescaled AAPL 10.60
+vs. yfinance 10.66). Run `python src/main.py evaluate` for current numbers.
 
 LIMITATIONS:
   - The residual is "cheap relative to what this model can see". Anything
@@ -85,6 +96,17 @@ FEATURE_LABELS_KO = {
     "debt_to_equity": "부채비율",
     "payout_ratio_ttm": "배당성향",
     "volatility_63d": "변동성",
+    "roic": "ROIC",
+    "gross_margin": "매출총이익률",
+    "fcf_margin": "FCF이익률",
+    "net_debt_to_capital": "순부채비율",
+    "current_ratio": "유동비율",
+    "asset_turnover": "자산회전율",
+    "sga_to_sales": "판관비율",
+    "revenue_cagr_3y": "3년 매출성장률",
+    "op_margin_volatility": "이익률 변동성",
+    "dividend_growth_3y": "3년 배당성장률",
+    "dividend_years_no_cut": "배당 무삭감 연수",
     "sector": "섹터",
 }
 
@@ -92,10 +114,19 @@ FEATURE_LABELS_KO = {
 def loss_flag(df: pd.DataFrame) -> pd.Series:
     """PER unavailable AND (latest EPS <= 0 or TTM ROE < 0): the company is
     losing money, not just missing data (ROE catches TTM losses whose latest
-    quarter happens to be positive, e.g. HAS/TAP after impairments). Such
-    rows keep their PBR gap for reference but get no label and are left out
-    of gap_return_test: with no PER and a negative ROE the fair PBR is an
-    extrapolation (XRX came out as the #2 "저평가" stock before this)."""
+    quarter happens to be positive, e.g. HAS/TAP after impairments).
+
+    These rows keep their per-multiple gaps for reference but get no
+    valuation_gap, i.e. no verdict ("판단 보류(적자)" in screening):
+      - PBR alone: with no PER and a negative ROE the fair PBR is an
+        extrapolation (XRX came out as the #2 "저평가" stock).
+      - PSR alone (tried 2026-09-28, reverted the same day): 8 of the 15
+        loss-makers landed in the 15 cheapest / 15 most expensive of 278.
+        One-off impairments (GILD, APD, TTWO, ARE, INTC) turn TTM operating
+        margin negative, and since margin is the PSR model's strongest
+        driver their fair PSR collapsed (+200~700% "고평가"); structurally
+        shrinking names (XRX, F, AMC) looked cheap on sales — a value trap,
+        not a mispricing. A loss year says too little about which case it is."""
     pe_missing = df["trailing_pe"].isna() | (df["trailing_pe"] <= 0)
     losing = (df["eps"] <= 0) | (df["return_on_equity"] < 0)
     return (pe_missing & losing).fillna(False).astype(bool)
@@ -109,12 +140,15 @@ def split_of(as_of: pd.Timestamp) -> str:
     return "test"
 
 
-def _prepare_features(cross_section: pd.DataFrame, sectors: list[str]) -> tuple[pd.DataFrame, dict[str, list[str]]]:
+def _prepare_features(
+    cross_section: pd.DataFrame, sectors: list[str], features: list[str] = FAIR_VALUE_FEATURES
+) -> tuple[pd.DataFrame, dict[str, list[str]]]:
     """Design matrix for one as_of cross-section + a map from each reported
-    driver ("return_on_equity", ..., "sector") to its underlying columns."""
+    driver ("return_on_equity", ..., "sector") to its underlying columns.
+    A feature the panel doesn't have (built before it existed) is skipped."""
     X = pd.DataFrame(index=cross_section.index)
     groups: dict[str, list[str]] = {}
-    for feat in FAIR_VALUE_FEATURES:
+    for feat in (f for f in features if f in cross_section.columns):
         raw = cross_section[feat].astype(float)
         if raw.notna().sum() >= 3:
             lo, hi = raw.quantile([FAIR_VALUE_WINSOR_QUANTILE, 1 - FAIR_VALUE_WINSOR_QUANTILE])
@@ -140,16 +174,20 @@ def _fit_ridge(X: pd.DataFrame, y: pd.Series) -> tuple[RidgeCV, pd.Series, pd.Se
     return model, mean, scale
 
 
-def _fit_cross_section(cs: pd.DataFrame, key: str, spec: dict, sectors: list[str]) -> tuple[pd.DataFrame, dict] | None:
+def _fit_cross_section(
+    cs: pd.DataFrame, key: str, spec: dict, sectors: list[str], features: list[str] = FAIR_VALUE_FEATURES
+) -> tuple[pd.DataFrame, dict] | None:
     """Out-of-fold fair multiple + per-driver contributions for one as_of and
     one multiple, plus diagnostics (Ridge vs. sector-median baseline on the
     exact same folds, and full-fit standardized coefficients)."""
     col = spec["column"]
+    if col not in cs.columns:  # panel built before this multiple existed
+        return None
     eligible = cs[(cs[col] >= spec["min"]) & (cs[col] <= spec["max"])]
     if len(eligible) < FAIR_VALUE_MIN_ROWS:
         return None
 
-    X, groups = _prepare_features(eligible, sectors)
+    X, groups = _prepare_features(eligible, sectors, features)
     y = np.log(eligible[col].astype(float))
     pred = pd.Series(np.nan, index=eligible.index)
     baseline = pd.Series(np.nan, index=eligible.index)
@@ -186,15 +224,17 @@ def _fit_cross_section(cs: pd.DataFrame, key: str, spec: dict, sectors: list[str
         "mae_model": float((y - pred).abs().mean()),
         "mae_sector_median": float((y - baseline).abs().mean()),
         "alpha": float(full_model.alpha_),
-        **{f"coef_{f}": float(coefs[f]) for f in FAIR_VALUE_FEATURES},
+        **{f"coef_{f}": float(coefs[f]) for f in features if f in coefs.index},
     }
     return out, diag
 
 
-def add_fair_value(panel: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def add_fair_value(panel: pd.DataFrame, features: list[str] = FAIR_VALUE_FEATURES) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Adds fair_<m>, <m>_gap, <m>_contrib_<driver> for each multiple, plus
-    valuation_gap / n_gaps / valuation_basis. Returns (panel, diagnostics),
-    diagnostics having one row per (as_of, multiple) that could be fit."""
+    the combined verdict: valuation_gap (mean gap), n_gaps, valuation_basis
+    and gap_agreement (share of the available views pointing the same way as
+    valuation_gap — 1.0 = every multiple agrees). Returns (panel,
+    diagnostics), one diagnostics row per (as_of, multiple) that could be fit."""
     df = panel.reset_index(drop=True)
     sectors = sorted(df["sector"].dropna().unique())
     pieces: dict[str, list[pd.DataFrame]] = {key: [] for key in FAIR_VALUE_TARGETS}
@@ -202,7 +242,7 @@ def add_fair_value(panel: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     for as_of, cs in df.groupby("as_of"):
         for key, spec in FAIR_VALUE_TARGETS.items():
-            result = _fit_cross_section(cs, key, spec, sectors)
+            result = _fit_cross_section(cs, key, spec, sectors, features)
             if result is None:
                 continue
             out, diag = result
@@ -210,19 +250,38 @@ def add_fair_value(panel: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             diagnostics.append({"as_of": as_of, "split": split_of(as_of), **diag})
 
     for key, frames in pieces.items():
-        cols = [f"fair_{key}", f"{key}_gap"] + [f"{key}_contrib_{d}" for d in [*FAIR_VALUE_FEATURES, "sector"]]
+        cols = [f"fair_{key}", f"{key}_gap"] + [f"{key}_contrib_{d}" for d in [*features, "sector"]]
         fitted = pd.concat(frames) if frames else pd.DataFrame(columns=cols, dtype=float)
         df = df.drop(columns=[c for c in cols if c in df.columns]).join(fitted.reindex(columns=cols))
 
-    gap_cols = [f"{key}_gap" for key in FAIR_VALUE_TARGETS]
-    df["valuation_gap"] = df[gap_cols].mean(axis=1, skipna=True)
-    df["n_gaps"] = df[gap_cols].notna().sum(axis=1)
+    df["loss_flag"] = loss_flag(df)
+    gaps = df[[f"{key}_gap" for key in FAIR_VALUE_TARGETS]].copy()
+    gaps.loc[df["loss_flag"]] = np.nan  # no verdict for loss-makers, see loss_flag
+    df["valuation_gap"] = gaps.mean(axis=1, skipna=True)
+    df["n_gaps"] = gaps.notna().sum(axis=1)
+    same_side = np.sign(gaps).eq(np.sign(df["valuation_gap"]), axis=0) & gaps.notna()
+    df["gap_agreement"] = (same_side.sum(axis=1) / df["n_gaps"]).where(df["n_gaps"] > 0)
     labels = [spec["label"] for spec in FAIR_VALUE_TARGETS.values()]
-    df["valuation_basis"] = df[gap_cols].notna().apply(
+    df["valuation_basis"] = gaps.notna().apply(
         lambda row: "+".join(lbl for lbl, has in zip(labels, row) if has), axis=1
     )
-    df["loss_flag"] = loss_flag(df)
     return df, pd.DataFrame(diagnostics)
+
+
+def compare_feature_sets(panel: pd.DataFrame, feature_sets: dict[str, list[str]]) -> pd.DataFrame:
+    """Out-of-fold R^2 per (feature set, multiple, split), same folds and
+    bounds for every set — how model features are chosen. Decide on the
+    train/val columns only; test is for the final report."""
+    rows = []
+    for name, features in feature_sets.items():
+        _, diag = add_fair_value(panel, features)
+        if diag.empty:
+            continue
+        summary = diag.groupby(["target", "split"])["r2_model"].mean().rename(name)
+        rows.append(summary)
+    table = pd.concat(rows, axis=1)
+    baseline = diag.groupby(["target", "split"])["r2_sector_median"].mean().rename("sector_median")
+    return pd.concat([baseline, table], axis=1).reindex(["train", "val", "test"], level="split")
 
 
 def summarize_diagnostics(diagnostics: pd.DataFrame) -> pd.DataFrame:
@@ -240,9 +299,12 @@ def coefficient_summary(diagnostics: pd.DataFrame) -> pd.DataFrame:
     of dates where it had that same sign — a quick read of what the market
     has consistently paid up for."""
     rows = []
+    features = [c.removeprefix("coef_") for c in diagnostics.columns if c.startswith("coef_")]
     for key, group in diagnostics.groupby("target"):
-        for feat in FAIR_VALUE_FEATURES:
-            coefs = group[f"coef_{feat}"]
+        for feat in features:
+            coefs = group[f"coef_{feat}"].dropna()
+            if coefs.empty:
+                continue
             sign = np.sign(coefs.mean())
             rows.append({
                 "target": key,
@@ -276,9 +338,9 @@ def gap_return_test(panel: pd.DataFrame, horizons: list[int] = HORIZONS_MONTHS, 
     is applied across every row of the table at once.
 
     Cross-sectional per date, so market-wide drift cancels out (a strategy
-    doesn't "work" just because stocks went up). Loss-making rows are left
-    out, matching the rows screening actually labels."""
-    df = panel[~panel["loss_flag"]].dropna(subset=["valuation_gap"]).copy()
+    doesn't "work" just because stocks went up). Uses exactly the rows that
+    screening labels (every row with a valuation_gap; never loss-makers)."""
+    df = panel.dropna(subset=["valuation_gap"]).copy()
     df["cheapness"] = -df["valuation_gap"]
     df["split"] = df["as_of"].map(split_of)
     rows = []

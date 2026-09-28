@@ -83,20 +83,20 @@ def valuation_label(cheapness_rank: float) -> str:
 
 
 def add_labels(panel: pd.DataFrame) -> pd.DataFrame:
-    """cheapness_rank + valuation_label from valuation_gap (loss-makers,
-    fair_value.loss_flag, get "판단 보류(적자)" and no rank), plus context
+    """cheapness_rank + valuation_label from valuation_gap, plus context
     columns: sector_valuation_rank (naive multiple-vs-sector view),
-    quality_score, momentum_score (means of sector percentiles)."""
+    quality_score, momentum_score (means of sector percentiles).
+    Loss-makers (fair_value.loss_flag) have no valuation_gap and get
+    "판단 보류(적자)" instead of "데이터 부족"."""
     df = panel.copy()
     if "loss_flag" not in df.columns:
         df["loss_flag"] = loss_flag(df)
 
-    rankable = df["valuation_gap"].where(~df["loss_flag"])
-    df["cheapness_rank"] = _pct_rank(-rankable, df["as_of"])
+    df["cheapness_rank"] = _pct_rank(-df["valuation_gap"], df["as_of"])
     df["valuation_label"] = df["cheapness_rank"].apply(valuation_label)
-    df.loc[df["loss_flag"], "valuation_label"] = "판단 보류(적자)"
+    df.loc[df["loss_flag"] & df["cheapness_rank"].isna(), "valuation_label"] = "판단 보류(적자)"
 
-    naive = df[[f"{k}_pct" for k in VALUATION_INDICATORS]].mean(axis=1, skipna=True)
+    naive = df[[f"{k}_pct" for k in VALUATION_INDICATORS if f"{k}_pct" in df.columns]].mean(axis=1, skipna=True)
     df["sector_valuation_rank"] = _pct_rank(naive, [df["as_of"], df["sector"]])
     df["quality_score"] = df[[f"{k}_pct" for k in QUALITY_INDICATORS]].mean(axis=1, skipna=True)
     df["momentum_score"] = df[[f"{k}_pct" for k in MOMENTUM_INDICATORS]].mean(axis=1, skipna=True)
@@ -247,24 +247,42 @@ def explain(row: pd.Series) -> str:
     a multiple was skipped if it was."""
     lines = []
     for key, spec in FAIR_VALUE_TARGETS.items():
+        if spec["column"] not in row.index:  # panel built before this multiple existed
+            continue
         actual, fair, gap = row.get(spec["column"]), row.get(f"fair_{key}"), row.get(f"{key}_gap")
         if pd.notna(gap):
+            excluded = " [적자라 참고용]" if row.get("loss_flag") else ""
+            particle = "를" if spec["label"].endswith(("EBITDA", "FCF")) else "을"  # 에이/에프 end in a vowel
             lines.append(
-                f"{spec['label']} {actual:.1f}배 (적정 {fair:.1f}배, {np.expm1(gap):+.0%}) — 적정 {spec['label']}을 "
-                f"{_driver_text(row, key)}"
+                f"{spec['label']} {actual:.1f}배 (적정 {fair:.1f}배, {np.expm1(gap):+.0%}){excluded} — 적정 "
+                f"{spec['label']}{particle} {_driver_text(row, key)}"
             )
         elif pd.isna(actual) or actual <= 0:
             why = "적자라 계산 불가" if key == "pe" and row.get("loss_flag") else "값 없음(적자·자본잠식 또는 데이터 누락)"
             lines.append(f"{spec['label']}: {why}")
         elif actual > spec["max"]:
-            base = "이익이 너무 작아" if key == "pe" else "자본이 너무 작아(자사주 매입 등)"
+            base = {
+                "pe": "이익이 너무 작아",
+                "pb": "자본이 너무 작아(자사주 매입 등)",
+                "ps": "매출 대비 가격이 너무 높아",
+                "ev_ebitda": "EBITDA가 너무 작아",
+                "pfcf": "잉여현금흐름이 너무 작아",
+            }.get(key, "기준 범위를 벗어나")
             lines.append(f"{spec['label']} {actual:.0f}배: {base} 배수로 비교하기 어려움")
         elif actual < spec["min"]:
             lines.append(f"{spec['label']} {actual:.2f}배: 비정상적으로 작은 값 — 데이터 오류 가능성")
         else:
             lines.append(f"{spec['label']}: 같은 시점 비교 종목 부족")
     if row.get("loss_flag"):
-        lines.append("최근 12개월 적자 — 적정 배수 추정을 신뢰하기 어려워 판단을 보류함")
+        lines.append(
+            "최근 12개월 적자 — 일회성 손상인지 구조적 부진인지 재무 지표만으로 구분할 수 없어 판단을 보류함 "
+            "(위 배수 괴리는 참고용)"
+        )
+    elif pd.notna(row.get("valuation_gap")) and row.get("n_gaps", 0) > 1:
+        n = int(row["n_gaps"])
+        agree = int(round(row["gap_agreement"] * n))
+        side = "싸다" if row["valuation_gap"] < 0 else "비싸다"
+        lines.append(f"종합: {n}개 관점 중 {agree}개가 '{side}' 쪽 (평균 괴리 {np.expm1(row['valuation_gap']):+.0%})")
     return "\n".join(lines)
 
 
@@ -281,7 +299,12 @@ def screen(panel: pd.DataFrame) -> pd.DataFrame:
 
 REPORT_COLUMNS = [
     "ticker", "sector", "as_of", "valuation_label", "cheapness_rank", "valuation_gap_pct", "valuation_basis",
-    "trailing_pe", "fair_pe", "price_to_book", "fair_pb", "sector_valuation_rank", "quality_score",
+    "n_gaps", "gap_agreement",
+    "trailing_pe", "fair_pe", "price_to_book", "fair_pb", "price_to_sales", "fair_ps",
+    "ev_to_ebitda", "fair_ev_ebitda", "price_to_fcf", "fair_pfcf",
+    "pe_gap", "pb_gap", "ps_gap", "ev_ebitda_gap", "pfcf_gap",
+    "dividend_yield", "dividend_years_no_cut",
+    "sector_valuation_rank", "quality_score",
     "momentum_score", "loss_flag", "meme_flag", "value_trap_flag", "transition_flag", "transition_type",
     "meme_reason", "value_trap_reason", "transition_reason", "explanation",
 ]
@@ -293,8 +316,13 @@ def report_at(screened: pd.DataFrame, as_of: pd.Timestamp | None = None) -> pd.D
     rows = screened[screened["as_of"] == target].copy()
     if rows.empty:
         return pd.DataFrame(columns=REPORT_COLUMNS)
-    rows["valuation_gap_pct"] = np.expm1(rows["valuation_gap"])
     rows["explanation"] = rows.apply(explain, axis=1)
+    # report gaps as % (actual / fair - 1); the model works in log units
+    rows["valuation_gap_pct"] = np.expm1(rows["valuation_gap"])
+    for key in FAIR_VALUE_TARGETS:
+        if f"{key}_gap" in rows.columns:
+            rows[f"{key}_gap"] = np.expm1(rows[f"{key}_gap"])
+    rows = rows.reindex(columns=REPORT_COLUMNS)  # a panel built before PSR has no price_to_sales
     return rows[REPORT_COLUMNS].sort_values("cheapness_rank", ascending=False, na_position="last").reset_index(drop=True)
 
 
