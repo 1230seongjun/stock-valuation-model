@@ -281,6 +281,18 @@ def test_missing_close_days_are_ignored():
     assert row["price"] == last_real and pd.notna(row["volatility_63d"])
 
 
+def test_non_positive_prices_are_dropped():
+    """A bad 0 close in yfinance's history must not reach volatility or the
+    forward-return labels as +-inf."""
+    tickers, universe, prices, fundamentals = make_raw_data(n_tickers=1)
+    df = prices[tickers[0]].copy()
+    bad = df["date"].isin(df["date"].iloc[[1500, 1510]])
+    df.loc[bad, ["close", "close_raw"]] = 0.0
+    panel = build_raw_panel(tickers, {tickers[0]: df}, fundamentals, universe, list(pd.date_range("2019-01-01", "2023-01-01", freq="QS")))
+    numeric = panel.select_dtypes("number")
+    assert np.isfinite(numeric.to_numpy()[~np.isnan(numeric.to_numpy())]).all()
+
+
 def test_multiples_rescaled_to_as_of_price():
     """Price multiples scale with the QUOTED price; EV/EBITDA only through its
     market-cap part. The dividend-adjusted close moves differently (100->150

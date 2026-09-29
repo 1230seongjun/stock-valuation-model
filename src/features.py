@@ -398,7 +398,13 @@ def build_raw_panel(
         # before the market closes, which made every "today" snapshot price
         # NaN (and silently skipped the multiple rescaling) until 2026-09-23.
         # Drop them so the latest price is the last real trade.
-        price_df = price_df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
+        # ...and non-positive closes (SAFE's yfinance history has some, 2026-09-29): a 0 turns
+        # volatility and forward log returns into +-inf, which poisons a whole date's return test.
+        price_df = price_df.dropna(subset=["close"])
+        positive = price_df["close"] > 0
+        if "close_raw" in price_df.columns:
+            positive &= price_df["close_raw"].isna() | (price_df["close_raw"] > 0)
+        price_df = price_df[positive].sort_values("date").reset_index(drop=True)
         if price_df.empty:
             continue
         raw_col = "close_raw" if "close_raw" in price_df.columns else "close"
