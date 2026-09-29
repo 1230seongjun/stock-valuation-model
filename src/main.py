@@ -11,13 +11,8 @@ build needs FINNHUB_API_KEY (env var or --api-key). The other commands only
 need the saved panel, and recompute the fair-value model from it every time,
 so a saved panel never carries a stale model.
 
-Colab (every .py uploaded flat into /content):
-    import main
-    main.build(api_key="...")      # first run ~6 min, then cached in ./data_cache
-    main.verify_multiples()
-    main.compare_features()
-    main.evaluate()
-    report = main.screen()         # or main.screen(ticker="AAPL")
+Colab: clone the repo's dev branch and add src/ to sys.path — the full
+cell-by-cell setup (Drive cache, module reload after git pull) is in README.md.
 """
 from __future__ import annotations
 
