@@ -3,3 +3,4 @@ __pycache__/
 data_cache/
 real_data_output/
 .env
+.venv/

@@ -45,6 +45,7 @@ from config import (
     ALL_INDICATORS,
     FUNDAMENTAL_INDICATORS,
     HORIZONS_MONTHS,
+    N_JOBS,
     REBALANCE_FREQ,
     RESCALE_MULTIPLES_TO_AS_OF_PRICE,
     TECHNICAL_INDICATORS,
@@ -374,70 +375,102 @@ def _forward_log_return(prices: pd.DataFrame, as_of: pd.Timestamp, base_close: f
     return float(np.log(future["close"].iloc[-1] / base_close))
 
 
+def _ticker_rows(
+    ticker: str,
+    price_df: pd.DataFrame | None,
+    fundamentals: pd.DataFrame | None,
+    meta: dict[str, str],
+    as_of_dates: list[pd.Timestamp],
+) -> list[dict]:
+    """All snapshot rows of one ticker (see build_raw_panel). Uses nothing
+    but this ticker's own data, so tickers can be built in any order or in
+    parallel."""
+    if price_df is None or price_df.empty:
+        return []
+    # yfinance returns empty closes on some days — including TODAY's row
+    # before the market closes, which made every "today" snapshot price
+    # NaN (and silently skipped the multiple rescaling) until 2026-09-23.
+    # Drop them so the latest price is the last real trade.
+    # ...and non-positive closes (SAFE's yfinance history has some, 2026-09-29): a 0 turns
+    # volatility and forward log returns into +-inf, which poisons a whole date's return test.
+    price_df = price_df.dropna(subset=["close"])
+    positive = price_df["close"] > 0
+    if "close_raw" in price_df.columns:
+        positive &= price_df["close_raw"].isna() | (price_df["close_raw"] > 0)
+    price_df = price_df[positive].sort_values("date").reset_index(drop=True)
+    if price_df.empty:
+        return []
+    raw_col = "close_raw" if "close_raw" in price_df.columns else "close"
+    quoted = price_df[["date", raw_col]].rename(columns={raw_col: "price"}).dropna()
+    payments = (
+        price_df.loc[price_df["dividend"] > 0, ["date", "dividend"]]
+        if "dividend" in price_df.columns else pd.DataFrame(columns=["date", "dividend"])
+    )
+    has_fundamentals = fundamentals is not None and not fundamentals.empty
+    fund_df = apply_reporting_lag(add_fundamental_trends(fundamentals)) if has_fundamentals else pd.DataFrame()
+    sector = meta.get("sector", "Unknown")
+    size_group = meta.get("size", "large")
+
+    rows = []
+    for as_of in as_of_dates:
+        window = price_df[price_df["date"] <= as_of].tail(260)
+        if window.empty or (as_of - window["date"].iloc[-1]).days > MAX_PRICE_STALENESS_DAYS:
+            continue
+        close = window["close"].reset_index(drop=True)
+        volume = window["volume"].reset_index(drop=True)
+        quoted_now = quoted[quoted["date"] <= as_of]
+        price = quoted_now["price"].iloc[-1] if len(quoted_now) else np.nan
+
+        row = {"as_of": as_of, "ticker": ticker, "sector": sector, "size_group": size_group, "price": price}
+        row.update(_as_of_fundamentals(fund_df, as_of))
+        period_price = _rescale_multiples(row, quoted_now)
+        row.update(_size_features(row, period_price))
+        # already at the as_of price (no Finnhub period-end price involved)
+        row["normalized_pe"] = price / (4 * row["eps_avg_3y"]) if row["eps_avg_3y"] > 0 else np.nan
+        row.update(_dividend_features(payments, as_of, price))
+        row.update(_technicals_asof(close, volume))
+        row.update(_anomaly_signals_asof(close, volume))
+        for h in HORIZONS_MONTHS:
+            row[f"fwd_return_{h}m"] = _forward_log_return(price_df, as_of, close.iloc[-1], h)
+        rows.append(row)
+    return rows
+
+
+# Below this many tickers the process start-up costs more than it saves.
+_MIN_TICKERS_FOR_PARALLEL = 50
+_PROGRESS_EVERY = 200
+
+
 def build_raw_panel(
     tickers: list[str],
     prices: dict[str, pd.DataFrame],
     fundamentals: dict[str, pd.DataFrame],
     universe: dict[str, dict[str, str]],
     as_of_dates: list[pd.Timestamp],
+    n_jobs: int | None = None,
 ) -> pd.DataFrame:
     """One row per (ticker, as_of) with raw indicators, price, dividend and
     anomaly features and forward-return labels. A (ticker, as_of) with no
     trade in the MAX_PRICE_STALENESS_DAYS before as_of gets no row (not listed
     yet / anymore); missing fundamentals become NaN rather than an error.
     Price data cached before 2026-09-28 has no close_raw / dividend columns:
-    close then stands in for the quoted price and dividends count as none."""
-    lagged = {t: apply_reporting_lag(add_fundamental_trends(df)) for t, df in fundamentals.items() if not df.empty}
+    close then stands in for the quoted price and dividends count as none.
+    Tickers are built in parallel (n_jobs, default config.N_JOBS); the rows
+    come back in `tickers` order, so the panel is the same either way."""
+    n_jobs = N_JOBS if n_jobs is None else n_jobs
+    args = [(t, prices.get(t), fundamentals.get(t), universe.get(t, {}), as_of_dates) for t in tickers]
+    if n_jobs == 1 or len(tickers) < _MIN_TICKERS_FOR_PARALLEL:
+        per_ticker = (_ticker_rows(*a) for a in args)
+    else:
+        from joblib import Parallel, delayed
+
+        per_ticker = Parallel(n_jobs=n_jobs, return_as="generator")(delayed(_ticker_rows)(*a) for a in args)
 
     rows = []
-    for ticker in tickers:
-        price_df = prices.get(ticker)
-        if price_df is None or price_df.empty:
-            continue
-        # yfinance returns empty closes on some days — including TODAY's row
-        # before the market closes, which made every "today" snapshot price
-        # NaN (and silently skipped the multiple rescaling) until 2026-09-23.
-        # Drop them so the latest price is the last real trade.
-        # ...and non-positive closes (SAFE's yfinance history has some, 2026-09-29): a 0 turns
-        # volatility and forward log returns into +-inf, which poisons a whole date's return test.
-        price_df = price_df.dropna(subset=["close"])
-        positive = price_df["close"] > 0
-        if "close_raw" in price_df.columns:
-            positive &= price_df["close_raw"].isna() | (price_df["close_raw"] > 0)
-        price_df = price_df[positive].sort_values("date").reset_index(drop=True)
-        if price_df.empty:
-            continue
-        raw_col = "close_raw" if "close_raw" in price_df.columns else "close"
-        quoted = price_df[["date", raw_col]].rename(columns={raw_col: "price"}).dropna()
-        payments = (
-            price_df.loc[price_df["dividend"] > 0, ["date", "dividend"]]
-            if "dividend" in price_df.columns else pd.DataFrame(columns=["date", "dividend"])
-        )
-        fund_df = lagged.get(ticker, pd.DataFrame())
-        sector = universe.get(ticker, {}).get("sector", "Unknown")
-        size_group = universe.get(ticker, {}).get("size", "large")
-
-        for as_of in as_of_dates:
-            window = price_df[price_df["date"] <= as_of].tail(260)
-            if window.empty or (as_of - window["date"].iloc[-1]).days > MAX_PRICE_STALENESS_DAYS:
-                continue
-            close = window["close"].reset_index(drop=True)
-            volume = window["volume"].reset_index(drop=True)
-            quoted_now = quoted[quoted["date"] <= as_of]
-            price = quoted_now["price"].iloc[-1] if len(quoted_now) else np.nan
-
-            row = {"as_of": as_of, "ticker": ticker, "sector": sector, "size_group": size_group, "price": price}
-            row.update(_as_of_fundamentals(fund_df, as_of))
-            period_price = _rescale_multiples(row, quoted_now)
-            row.update(_size_features(row, period_price))
-            # already at the as_of price (no Finnhub period-end price involved)
-            row["normalized_pe"] = price / (4 * row["eps_avg_3y"]) if row["eps_avg_3y"] > 0 else np.nan
-            row.update(_dividend_features(payments, as_of, price))
-            row.update(_technicals_asof(close, volume))
-            row.update(_anomaly_signals_asof(close, volume))
-            for h in HORIZONS_MONTHS:
-                row[f"fwd_return_{h}m"] = _forward_log_return(price_df, as_of, close.iloc[-1], h)
-            rows.append(row)
+    for i, ticker_rows in enumerate(per_ticker, start=1):
+        rows.extend(ticker_rows)
+        if len(tickers) >= _PROGRESS_EVERY and i % _PROGRESS_EVERY == 0:
+            print(f"  panel {i}/{len(tickers)} tickers")
 
     panel = pd.DataFrame(rows)
     for col in ("eps_one_off_period", "per_share_break_period"):  # all-NaT vs. mixed rows infer different units

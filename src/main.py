@@ -39,6 +39,7 @@ from fair_value import (
     gap_return_test,
     r2_by_group,
     summarize_diagnostics,
+    target_features,
 )
 from features import add_percentile_scores, build_as_of_dates, build_raw_panel
 from screening import flag_fundamental_break, report_at, screen as screen_panel
@@ -46,6 +47,9 @@ from universe import load_universe
 
 OUTPUT_DIR = Path("real_data_output")
 PANEL_PATH = OUTPUT_DIR / "panel.parquet"
+# screen prints this many rows per flag (most extreme labels first); the CSV
+# has all of them (2026-09-29: 393 fundamental-break lines otherwise).
+MAX_FLAGGED_SHOWN = 15
 
 pd.set_option("display.width", 250)
 pd.set_option("display.max_columns", 40)
@@ -112,15 +116,22 @@ def _load(panel_path: str | Path) -> pd.DataFrame:
 def compare_features(panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
     """Out-of-fold R^2 of each multiple for: the current features (each
     multiple with its extra_features), current + each candidate alone,
-    current + all candidates, and the current features under the other
-    transform (winsor/rank, config FAIR_VALUE_FEATURE_TRANSFORM).
+    current minus each feature in use, current + all candidates, and the
+    current features under the other transform (winsor/rank, config
+    FAIR_VALUE_FEATURE_TRANSFORM).
     Keep a candidate (for all multiples, or as one multiple's extra) only if
-    it gains >= FAIR_VALUE_MIN_GAIN on train AND val — the last table lists
-    those. Test is for the final report."""
+    it gains >= FAIR_VALUE_MIN_GAIN on train AND val; the "-feature" rows
+    re-check the features already in use the same way (dropping one should
+    cost at least that much where it is used — the second round after
+    adopting several overlapping candidates at once). Test is for the final
+    report."""
     panel = _load(panel_path)
     candidates = [c for c in FAIR_VALUE_FEATURE_CANDIDATES if c in panel.columns]
-    sets = {"current": FAIR_VALUE_FEATURES}
+    in_use = {key: target_features(spec, FAIR_VALUE_FEATURES) for key, spec in FAIR_VALUE_TARGETS.items()}
+    used = list(dict.fromkeys(f for feats in in_use.values() for f in feats))
+    sets: dict = {"current": FAIR_VALUE_FEATURES}
     sets.update({f"+{c}": [*FAIR_VALUE_FEATURES, c] for c in candidates})
+    sets.update({f"-{f}": {"drop": (f,)} for f in used})
     sets["+all"] = [*FAIR_VALUE_FEATURES, *candidates]
     other = "winsor" if FAIR_VALUE_FEATURE_TRANSFORM == "rank" else "rank"
     sets[f"{other}_transform"] = (FAIR_VALUE_FEATURES, other)
@@ -129,19 +140,33 @@ def compare_features(panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
     delta = table.drop(columns=["sector_median", "current"]).sub(table["current"], axis=0)
     print("\n=== out-of-fold R^2 (mean per date) ===")
     print(table.round(3).T.to_string())
-    print("\n=== change vs. current features (positive = helps) ===")
+    print("\n=== change vs. current features (+candidate: positive = helps; -feature: negative = it was helping) ===")
     print(delta.round(3).T.to_string())
 
-    print(f"\n=== meets the bar (>= +{FAIR_VALUE_MIN_GAIN} on train AND val), per multiple ===")
+    def split_delta(name: str, key: str) -> tuple[float, float] | None:
+        if key not in delta.index.get_level_values(0) or name not in delta.columns:
+            return None
+        return delta.loc[(key, "train"), name], delta.loc[(key, "val"), name]
+
+    print(f"\n=== candidates that meet the bar (>= +{FAIR_VALUE_MIN_GAIN} on train AND val), per multiple ===")
     hits = []
-    for name in delta.columns:
+    for name in (c for c in delta.columns if not c.startswith("-")):
         for key in FAIR_VALUE_TARGETS:
-            if key not in delta.index.get_level_values(0):
-                continue
-            tr, va = delta.loc[(key, "train"), name], delta.loc[(key, "val"), name]
-            if tr >= FAIR_VALUE_MIN_GAIN and va >= FAIR_VALUE_MIN_GAIN:
-                hits.append(f"    {name:24s} {FAIR_VALUE_TARGETS[key]['label']:10s} {tr:+.3f} / {va:+.3f}")
+            d = split_delta(name, key)
+            if d and d[0] >= FAIR_VALUE_MIN_GAIN and d[1] >= FAIR_VALUE_MIN_GAIN:
+                hits.append(f"    {name:24s} {FAIR_VALUE_TARGETS[key]['label']:10s} {d[0]:+.3f} / {d[1]:+.3f}")
     print("\n".join(hits) if hits else "    (none)")
+
+    print(f"\n=== features in use: R^2 lost when dropped (train / val; bar {FAIR_VALUE_MIN_GAIN} on both) ===")
+    for feat in used:
+        cells = []
+        for key, spec in FAIR_VALUE_TARGETS.items():
+            d = split_delta(f"-{feat}", key)
+            if feat not in in_use[key] or d is None:
+                continue
+            ok = -d[0] >= FAIR_VALUE_MIN_GAIN and -d[1] >= FAIR_VALUE_MIN_GAIN
+            cells.append(f"{spec['label']} {-d[0]:+.3f}/{-d[1]:+.3f}{'' if ok else ' (below bar)'}")
+        print(f"    {feat:24s} " + "; ".join(cells))
     return table
 
 
@@ -231,7 +256,7 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
             print(f"{row['ticker']} ({row['sector']}, {row['size_group']}) {date}: {row['valuation_label']} (저평가 순위 {rank}/100)")
             print(row["explanation"])
             for col in ("meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason",
-                        "fundamental_break_reason"):
+                        "fundamental_break_reason", "single_view_reason"):
                 if row[col]:
                     print(f"※ {row[col]}")
         return report
@@ -257,16 +282,22 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
     print("\n-- 고평가 상위 15 --")
     print(table[table["valuation_label"] == "고평가"][cols].tail(15).iloc[::-1].to_string(index=False))
 
+    # flagged rows nearest the label extremes first; the full lists are in the CSV
+    extremeness = (report["cheapness_rank"] - 50).abs().fillna(-1)
     for flag, reason, title in [("meme_flag", "meme_reason", "급등락·거래량 이상"),
                                 ("value_trap_flag", "value_trap_reason", "밸류트랩 후보"),
                                 ("transition_flag", "transition_reason", "저평가→고평가 전환"),
                                 ("report_lag_flag", "report_lag_reason", "재무 기준일 이후 주가 급변"),
-                                ("fundamental_break_flag", "fundamental_break_reason", "최근 12개월 재무 단절")]:
+                                ("fundamental_break_flag", "fundamental_break_reason", "최근 12개월 재무 단절"),
+                                ("single_view_flag", "single_view_reason", "한 가지 배수로만 판단")]:
         hits = report[report[flag]]
         if not hits.empty:
             print(f"\n-- {title} ({len(hits)}) --")
-            for _, row in hits.iterrows():
-                print(f"  {row['ticker']:6s} {row[reason]}")
+            shown = hits.loc[extremeness[hits.index].sort_values(ascending=False, kind="stable").index[:MAX_FLAGGED_SHOWN]]
+            for _, row in shown.iterrows():
+                print(f"  {row['ticker']:6s} {row['valuation_label']:4s} {row[reason]}")
+            if len(hits) > MAX_FLAGGED_SHOWN:
+                print(f"  ... +{len(hits) - MAX_FLAGGED_SHOWN} more (CSV column {flag})")
 
     if save:
         out = OUTPUT_DIR / f"screening_{date}.csv"

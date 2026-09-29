@@ -461,6 +461,14 @@ INDEX_PAGES = {
 }
 # Wikipedia uses GICS names; the core list uses these two shorter ones.
 _GICS_TO_SECTOR = {"Information Technology": "Technology", "Health Care": "Healthcare"}
+# Mortgage REITs that Wikipedia's tables still list under Real Estate. GICS
+# moved the Mortgage REITs sub-industry to Financials in 2023 (the other
+# mortgage REITs in the lists, AGNC/NLY/ABR/RITM/STWD/BXMT, already read
+# Financials). Their "sales", EBITDA and FCF are interest flows, so under
+# Real Estate they were judged on PSR/EV/EBITDA/P/FCF as well: on 2026-09-29
+# PMT, FBRT and ARR were 저평가 at ranks 97.9-99.8. Found by the "Mortgage
+# REITs" sub-industry of the 2026-09-29 Wikipedia pages.
+_SECTOR_OVERRIDES = {"ADAM": "Financials", "ARR": "Financials", "FBRT": "Financials", "PMT": "Financials"}
 
 
 def parse_constituents(html: str) -> pd.DataFrame:
@@ -502,13 +510,16 @@ def _index_members(index: str, cache_dir: Path) -> pd.DataFrame:
 def load_universe(cache_dir: str | Path, indexes: tuple[str, ...] = tuple(INDEX_PAGES)) -> dict[str, dict[str, str]]:
     """The core UNIVERSE (size_group "large") plus each index's members.
     A ticker in both keeps its core sector label but takes the index's
-    size_group."""
+    size_group. _SECTOR_OVERRIDES corrects sector labels last."""
     universe = {t: {**meta, "size": "large"} for t, meta in UNIVERSE.items()}
     for index in indexes:
         size, _ = INDEX_PAGES[index]
         for row in _index_members(index, Path(cache_dir)).itertuples():
             base = universe.get(row.ticker, {"name": row.name, "sector": row.sector})
             universe[row.ticker] = {**base, "size": size}
+    for ticker, sector in _SECTOR_OVERRIDES.items():
+        if ticker in universe:
+            universe[ticker] = {**universe[ticker], "sector": sector}
     return universe
 
 

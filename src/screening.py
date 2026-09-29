@@ -49,6 +49,11 @@ FLAGS (heuristics to prompt a second look, not verdicts):
     and 26.9% of the most expensive 20% vs. 19.6% in the middle. Enriched
     in the tails, but withholding a quarter of all verdicts for a 1.4x
     enrichment would cost more than it saves; it stays a warning.
+  - single_view_flag: 저평가/고평가 resting on one multiple (the others out
+    of range or missing). On 2026-09-29 10 of 445 labels (MBGL and VSNT on
+    PBR alone, AAL on PSR alone near the top of the cheap list; RYAN and
+    AAMI, asset-light financials, on one view among the most expensive).
+    Few, but they sit at the extremes; label unchanged, warning only.
 """
 from __future__ import annotations
 
@@ -204,6 +209,22 @@ def flag_fundamental_break(panel: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def flag_single_view(panel: pd.DataFrame) -> pd.DataFrame:
+    """single_view_flag: labelled 저평가/고평가 from ONE multiple, because the
+    others were out of range, missing or excluded for the sector — nothing
+    cross-checks it (see module docstring)."""
+    df = panel.copy()
+    n_gaps = df["n_gaps"] if "n_gaps" in df.columns else pd.Series(np.nan, index=df.index)
+    basis = df["valuation_basis"] if "valuation_basis" in df.columns else pd.Series("", index=df.index)
+    labelled = df["valuation_label"].isin(["저평가", "고평가"])
+    df["single_view_flag"] = (labelled & (n_gaps == 1)).fillna(False).astype(bool)
+    df["single_view_reason"] = [
+        f"{b} 한 가지 배수로만 판단 — 다른 배수는 범위 밖이거나 값이 없어 교차 확인이 안 됨 (신뢰도 낮음)" if hit else ""
+        for hit, b in zip(df["single_view_flag"], basis)
+    ]
+    return df
+
+
 def _log_change(prev: float, cur: float) -> float:
     """ln(cur/prev), NaN when either side is missing or non-positive (a loss
     or a sign flip has no meaningful log change)."""
@@ -355,6 +376,9 @@ def explain(row: pd.Series) -> str:
         agree = int(round(row["gap_agreement"] * n))
         side = "싸다" if row["valuation_gap"] < 0 else "비싸다"
         lines.append(f"종합: {n}개 관점 중 {agree}개가 '{side}' 쪽 (평균 괴리 {np.expm1(row['valuation_gap']):+.0%})")
+    elif pd.notna(row.get("valuation_gap")) and row.get("n_gaps", 0) == 1:
+        lines.append(f"종합: {row.get('valuation_basis')} 한 가지 관점으로만 판단 (괴리 {np.expm1(row['valuation_gap']):+.0%}) "
+                     "— 다른 배수로 교차 확인할 수 없음")
     return "\n".join(lines)
 
 
@@ -368,6 +392,7 @@ def screen(panel: pd.DataFrame) -> pd.DataFrame:
     df = flag_value_trap(df)
     df = flag_report_lag(df)
     df = flag_fundamental_break(df)
+    df = flag_single_view(df)
     return classify_valuation_transition(df)
 
 
@@ -380,9 +405,9 @@ REPORT_COLUMNS = [
     "dividend_yield", "dividend_years_no_cut",
     "sector_valuation_rank", "quality_score",
     "momentum_score", "loss_flag", "meme_flag", "value_trap_flag", "transition_flag", "transition_type",
-    "report_lag_flag", "price_move_since_report", "fundamental_break_flag",
+    "report_lag_flag", "price_move_since_report", "fundamental_break_flag", "single_view_flag",
     "meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason", "fundamental_break_reason",
-    "explanation",
+    "single_view_reason", "explanation",
 ]
 
 

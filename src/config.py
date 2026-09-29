@@ -38,6 +38,11 @@ HORIZONS_MONTHS = [1, 3, 6, 12]
 
 RANDOM_SEED = 42
 
+# CPU processes for the per-ticker panel build and the per-date fair-value
+# fits (joblib; -1 = all cores). Each unit is independent, so results are
+# identical to a single-process run, only faster. Set 1 to debug.
+N_JOBS = -1
+
 # ---- Indicators ----------------------------------------------------------
 # metric_key -> direction used when turning a raw value into a sector
 # percentile (features.add_percentile_scores). These percentiles are CONTEXT
@@ -113,6 +118,42 @@ UNIVERSE_INDEXES = ("sp400", "sp600")
 #   PBR    + net_debt_to_capital   +.012/+.026
 # Just short: asset_turnover for EV/EBITDA (+.008/+.005), roic for PER
 # (+.009/+.016) and PBR (+.007/+.015).
+# 2026-09-29, extended universe (1,261 tickers, rank transform), each
+# candidate alone on top of the model above (train/val):
+#   PER    + log_book_value  +.019/+.021   + roe_avg_3y      +.014/+.022
+#   PBR    + log_book_value  +.028/+.038   + roe_avg_3y      +.012/+.028
+#   PSR    + log_revenue     +.015/+.015
+#   EV/EBITDA + asset_turnover +.015/+.012
+#   P/FCF  + asset_turnover  +.015/+.017
+# log_book_value / log_revenue are company size without the price. They
+# were adopted (user decision, 2026-09-29) hoping they would take the
+# small-cap discount out of the gap (before: 26% of small caps but 9% of
+# large caps 저평가). They did NOT: their coefficients are negative (PBR on
+# log_book_value -0.27, PSR on log_revenue -0.15, same sign on 100% of
+# dates) — mostly the denominator effect (more book, lower P/B at a given
+# market value), so small caps get a HIGHER fair multiple. Mean
+# valuation_gap on 2026-09-29 stayed small -0.12 / mid +0.01 / large +0.20
+# (log); labels 저평가 small 139 / large 21. They stay because they explain
+# the multiples (the R^2 rule), not because they neutralize size. pe_norm
+# takes PER's extras so the PER vs. normalized PER comparison (evaluate 2b)
+# stays like for like.
+# Second round (all of the above in, each feature dropped once; R^2 lost
+# train/val, bar = FAIR_VALUE_MIN_GAIN on both):
+#   log_book_value  PER .021/.023  PBR .029/.039
+#   roe_avg_3y      PER .017/.023  PBR .013/.030
+#   asset_turnover  PSR .104/.072  EV/EBITDA .015/.012  P/FCF .014/.017
+#                   PBR -.001/.002 -> taken out of PBR (chosen under winsor,
+#                   no longer pulls its weight with rank + the size features)
+#   net_debt_to_capital PBR .012/.016   log_revenue PSR .015/.014
+#   fcf_margin      P/FCF .089/.052
+# and one new pass on top: log_revenue for PBR +.015/+.013. Third round
+# (PBR as below, dropped once): log_book_value .043/.056, net_debt_to_capital
+# .018/.019, log_revenue .014/.015, roe_avg_3y .012/.028; asset_turnover
+# added back +.001/-.000.
+# The common FAIR_VALUE_FEATURES were dropped once too: operating_margin,
+# current_ratio and sga_to_sales no longer clear the bar for any multiple
+# (each <= .006) — they overlap with the features added since. Left in for
+# now (removing them is a separate decision; Ridge keeps them harmless).
 # in_verdict=False: shown in the report, left out of valuation_gap (the
 # combined verdict). pe_norm (PER on 3-year average EPS, 2026-09-29) is a
 # candidate replacement for PER that one-off quarters distort less; whether
@@ -122,18 +163,22 @@ UNIVERSE_INDEXES = ("sp400", "sp600")
 # 23% with one; per-date Spearman between the two gaps 0.65. Normalized PER
 # is only better where the TTM is broken, so it does not replace PER.
 # Out-of-fold R^2 train/val 0.18/0.11 vs. PER's 0.29/0.33.
+# Extended universe + current features (2026-09-29, 59,961 labelled rows):
+# 0.43 vs. 0.43 with a break (26%), PER 0.32 vs. 0.35 without; R^2
+# 0.25/0.27 vs. PER's 0.38/0.44. Not better even where the TTM is broken.
 FAIR_VALUE_TARGETS = {
-    "pe": {"column": "trailing_pe", "min": 1.0, "max": 100.0, "label": "PER"},
+    "pe": {"column": "trailing_pe", "min": 1.0, "max": 100.0, "label": "PER",
+           "extra_features": ("log_book_value", "roe_avg_3y")},
     "pb": {"column": "price_to_book", "min": 0.1, "max": 20.0, "label": "PBR",
-           "extra_features": ("asset_turnover", "net_debt_to_capital")},
+           "extra_features": ("net_debt_to_capital", "log_book_value", "roe_avg_3y", "log_revenue")},
     "ps": {"column": "price_to_sales", "min": 0.05, "max": 40.0, "label": "PSR",
-           "exclude_sectors": ("Financials",), "extra_features": ("asset_turnover",)},
+           "exclude_sectors": ("Financials",), "extra_features": ("asset_turnover", "log_revenue")},
     "ev_ebitda": {"column": "ev_to_ebitda", "min": 1.0, "max": 60.0, "label": "EV/EBITDA",
-                  "exclude_sectors": ("Financials",)},
+                  "exclude_sectors": ("Financials",), "extra_features": ("asset_turnover",)},
     "pfcf": {"column": "price_to_fcf", "min": 1.0, "max": 100.0, "label": "P/FCF",
-             "exclude_sectors": ("Financials",), "extra_features": ("fcf_margin",)},
+             "exclude_sectors": ("Financials",), "extra_features": ("fcf_margin", "asset_turnover")},
     "pe_norm": {"column": "normalized_pe", "min": 1.0, "max": 100.0, "label": "정규화 PER",
-                "in_verdict": False},
+                "in_verdict": False, "extra_features": ("log_book_value", "roe_avg_3y")},
 }
 FAIR_VALUE_MIN_GAIN = 0.01
 

@@ -35,6 +35,7 @@ from screening import (
     classify_valuation_transition,
     flag_meme_stock,
     flag_report_lag,
+    flag_single_view,
     flag_value_trap,
     report_at,
     screen,
@@ -464,14 +465,37 @@ def test_rank_transform_caps_an_extreme_value():
 
 def test_compare_feature_sets():
     """A feature that drives the planted multiples must beat a set without
-    it, on the same folds."""
+    it, on the same folds; a {"drop": ...} set is the same as leaving the
+    feature out of the list."""
     panel = make_fair_value_panel(n_dates=2)
     table = compare_feature_sets(panel, {
         "without_growth": [f for f in FAIR_VALUE_FEATURES if f != "revenue_growth_yoy"],
+        "-revenue_growth_yoy": {"drop": ("revenue_growth_yoy",)},
         "current": FAIR_VALUE_FEATURES,
     })
-    assert {"sector_median", "without_growth", "current"} <= set(table.columns)
+    assert {"sector_median", "without_growth", "-revenue_growth_yoy", "current"} <= set(table.columns)
     assert (table.loc["pe", "current"] > table.loc["pe", "without_growth"] + 0.05).all()
+    assert np.allclose(table["without_growth"], table["-revenue_growth_yoy"])
+
+
+def test_parallel_fits_match_sequential():
+    """Dates and feature sets fitted in worker processes give exactly the
+    single-process result."""
+    panel = make_fair_value_panel(n_tickers=100, n_dates=8)  # >= fair_value._MIN_DATES_FOR_PARALLEL
+    seq, seq_diag = add_fair_value(panel, n_jobs=1)
+    par, par_diag = add_fair_value(panel, n_jobs=2)
+    pd.testing.assert_frame_equal(seq, par)
+    pd.testing.assert_frame_equal(seq_diag, par_diag)
+    sets = {"current": FAIR_VALUE_FEATURES, "-payout": {"drop": ("payout_ratio_ttm",)}}
+    pd.testing.assert_frame_equal(compare_feature_sets(panel, sets, n_jobs=1), compare_feature_sets(panel, sets, n_jobs=2))
+
+
+def test_parallel_panel_matches_sequential():
+    tickers, universe, prices, fundamentals = make_raw_data(n_tickers=50)  # >= features._MIN_TICKERS_FOR_PARALLEL
+    as_of = list(pd.date_range("2019-01-01", "2020-01-01", freq="QS"))
+    seq = build_raw_panel(tickers, prices, fundamentals, universe, as_of, n_jobs=1)
+    par = build_raw_panel(tickers, prices, fundamentals, universe, as_of, n_jobs=2)
+    pd.testing.assert_frame_equal(seq, par)
 
 
 # ---------------------------------------------------------------------------
@@ -516,8 +540,8 @@ def test_stale_price_cache_is_refreshed_and_delisted_history_kept():
     cache = Path(tempfile.mkdtemp())
     (cache / "prices").mkdir()
     (cache / "fundamentals").mkdir()
-    stale = pd.DataFrame({"date": [pd.Timestamp("2026-01-02")], "close": [1.0], "close_raw": [1.0],
-                          "volume": [1.0], "dividend": [0.0]})
+    stale_day = pd.Timestamp.today().normalize() - pd.Timedelta(days=30)  # stale, but not a truncation
+    stale = pd.DataFrame({"date": [stale_day], "close": [1.0], "close_raw": [1.0], "volume": [1.0], "dividend": [0.0]})
     for t in ("LIVE", "GONE"):
         stale.to_parquet(cache / "prices" / f"{t}.parquet")
         pd.DataFrame({"period": [pd.Timestamp("2025-12-31")], **{k: [1.0] for k in data.FINNHUB_FIELD_MAP}}) \
@@ -535,6 +559,33 @@ def test_stale_price_cache_is_refreshed_and_delisted_history_kept():
     assert len(prices["GONE"]) == 1, "a delisted ticker keeps its cached history"
 
 
+def test_truncated_refetch_keeps_cached_history():
+    """A re-fetch that returns a delisting stub (EA: 1 row, 2026-09-29) must
+    not replace years of cached prices; the quality report names short
+    histories."""
+    import tempfile
+    import data
+
+    cache = Path(tempfile.mkdtemp())
+    (cache / "prices").mkdir()
+    (cache / "fundamentals").mkdir()
+    days = pd.date_range("2015-01-02", "2026-08-03", freq="B")
+    full = pd.DataFrame({"date": days, "close": 1.0, "close_raw": 1.0, "volume": 1.0, "dividend": 0.0})
+    full.to_parquet(cache / "prices" / "EA.parquet")
+    pd.DataFrame({"period": [pd.Timestamp("2025-12-31")], **{k: [1.0] for k in data.FINNHUB_FIELD_MAP}}) \
+        .to_parquet(cache / "fundamentals" / "EA.parquet")
+    stub = full.tail(1).assign(close=2.0)
+    orig = data.fetch_price_history
+    data.fetch_price_history = lambda t: stub
+    try:
+        prices, fundamentals = data.collect(["EA"], api_key="x", cache_dir=cache)
+    finally:
+        data.fetch_price_history = orig
+    assert len(prices["EA"]) == len(full) and len(pd.read_parquet(cache / "prices" / "EA.parquet")) == len(full)
+    issues = data.data_quality_report({"EA": stub, "OK": full}, {"EA": fundamentals["EA"], "OK": fundamentals["EA"]})
+    assert issues == ["EA"]
+
+
 def test_parse_constituents_and_load_universe():
     import tempfile
     import universe
@@ -543,9 +594,10 @@ def test_parse_constituents_and_load_universe():
     <tr><td>MOG.A</td><td>Moog</td><td>Industrials</td><td>Aerospace</td></tr>
     <tr><td>ABC</td><td>Abc Corp</td><td>Information Technology</td><td>Software</td></tr>
     <tr><td>AMC</td><td>AMC Entertainment</td><td>Communication Services</td><td>Movies</td></tr>
+    <tr><td>PMT</td><td>PennyMac Mortgage</td><td>Real Estate</td><td>Mortgage REITs</td></tr>
     <tr><td>ABC</td><td>dup</td><td>Health Care</td><td>x</td></tr></table>"""
     members = universe.parse_constituents(html)
-    assert members["ticker"].tolist() == ["MOG.A", "ABC", "AMC"]
+    assert members["ticker"].tolist() == ["MOG.A", "ABC", "AMC", "PMT"]
     assert members.set_index("ticker").loc["ABC", "sector"] == "Technology"
 
     cache = Path(tempfile.mkdtemp())
@@ -554,7 +606,8 @@ def test_parse_constituents_and_load_universe():
     loaded = universe.load_universe(cache, indexes=("sp600",))
     assert loaded["MOG.A"] == {"name": "Moog", "sector": "Industrials", "size": "small"}
     assert loaded["AMC"]["sector"] == universe.UNIVERSE["AMC"]["sector"] and loaded["AMC"]["size"] == "small"
-    assert loaded["AAPL"]["size"] == "large" and len(loaded) == len(universe.UNIVERSE) + 2
+    assert loaded["AAPL"]["size"] == "large" and len(loaded) == len(universe.UNIVERSE) + 3
+    assert loaded["PMT"]["sector"] == "Financials", "mortgage REITs are judged like other lenders"
 
 
 def test_size_features_are_price_free():
@@ -621,6 +674,19 @@ def test_value_trap_and_meme_flags():
     assert not trapped.loc[("FRESH", dates[-1]), "value_trap_flag"], "newly cheap is not a trap"
     memes = flag_meme_stock(panel)
     assert memes["meme_flag"].sum() == 1 and "급등" in memes.loc[memes["meme_flag"], "meme_reason"].iloc[0]
+
+
+def test_single_view_flag():
+    """A verdict that rests on one multiple is flagged and says so."""
+    panel = make_fair_value_panel(n_dates=1)
+    only_pb = panel["ticker"] == "T001"  # non-Financials, planted cheap
+    panel.loc[only_pb, ["trailing_pe", "price_to_sales", "ev_to_ebitda", "price_to_fcf"]] = np.nan
+    report = report_at(flag_single_view(screen_ready(add_fair_value(panel)[0]))).set_index("ticker")
+    row = report.loc["T001"]
+    assert row["n_gaps"] == 1 and row["valuation_label"] == "저평가"
+    assert row["single_view_flag"] and "PBR 한 가지 배수" in row["single_view_reason"]
+    assert "한 가지 관점으로만 판단" in row["explanation"]
+    assert not report.drop("T001")["single_view_flag"].any()
 
 
 def test_report_lag_flag():

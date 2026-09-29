@@ -22,7 +22,8 @@ The newest quarter / last few days CAN still change — pass
 force_refresh=True before a run whose conclusions matter. Cached prices
 older than PRICE_REFRESH_DAYS are re-fetched automatically (until
 2026-09-29 they never were, so a later build's "today" snapshot silently
-used the prices of the day the cache was made). In Colab the cache
+used the prices of the day the cache was made); a re-fetch that comes back
+as a short delisting stub does not replace a longer cached history. In Colab the cache
 lives on local disk and is lost on a runtime restart unless cache_dir points
 into a mounted Google Drive.
 """
@@ -69,6 +70,14 @@ FINNHUB_FIELD_MAP = {
 
 DEFAULT_CACHE_DIR = Path("data_cache")
 PRICE_REFRESH_DAYS = 3  # covers a weekend; a cache older than this is re-fetched
+# A re-fetched history that starts this much later than the cached one is a
+# truncated stub, not an update (see _is_truncated) — the cache is kept.
+TRUNCATED_HISTORY_DAYS = 365
+# Fewer daily rows than this is reported by data_quality_report: too short
+# for any snapshot's technicals, and usually a delisting stub (AVB, EA, EQR,
+# HLX, LEG on 2026-09-29: 1-8 rows each, so the panel silently had no row
+# for them) or a very recent IPO.
+MIN_PRICE_ROWS = 60
 _PROGRESS_EVERY = 200
 _FINNHUB_CALLS_PER_MIN = 50
 _MIN_INTERVAL_SEC = 60.0 / _FINNHUB_CALLS_PER_MIN
@@ -187,6 +196,21 @@ def _cache_is_current(cached: pd.DataFrame, required: list[str]) -> bool:
     return set(required).issubset(cached.columns)
 
 
+def _is_truncated(fetched: pd.DataFrame, cached: pd.DataFrame) -> bool:
+    """yfinance returns only the last few days for some acquired/delisted
+    tickers (2026-09-29: EA 1 row, AVB 2, HLX 8, where 20 years were
+    expected) — and, once, for two listed ones: AEP and XEL came back as a
+    single day on 2026-09-29 and overwrote 60+ years of cache (a re-fetch an
+    hour later returned the full history). Overwriting a cached history with
+    such a stub would throw the history away, so a fetch starting
+    TRUNCATED_HISTORY_DAYS after the cached start is treated as truncated."""
+    if fetched.empty or cached.empty:
+        return False
+    first_fetched = pd.to_datetime(fetched["date"]).min()
+    first_cached = pd.to_datetime(cached["date"]).min()
+    return (first_fetched - first_cached).days > TRUNCATED_HISTORY_DAYS
+
+
 def collect(
     tickers: list[str] = TICKERS,
     api_key: str | None = None,
@@ -203,6 +227,7 @@ def collect(
     frozen into the cache — just re-run to fill them in."""
     prices: dict[str, pd.DataFrame] = {}
     failed: list[str] = []
+    truncated: list[str] = []
     print(f"Prices for {len(tickers)} tickers (yfinance, cache={cache_dir})...")
     for i, ticker in enumerate(tickers, start=1):
         if i % _PROGRESS_EVERY == 0:
@@ -219,6 +244,12 @@ def collect(
         if df is not None and df.empty and path.exists():
             prices[ticker] = pd.read_parquet(path)  # delisted since it was cached: keep its history
             continue
+        if df is not None and path.exists():
+            cached = pd.read_parquet(path)
+            if _is_truncated(df, cached):
+                prices[ticker] = cached  # a delisting stub: keep the full history
+                truncated.append(ticker)
+                continue
         if df is None:
             failed.append(f"{ticker} (prices)")
             if path.exists():  # outdated cache still beats nothing for this run
@@ -228,6 +259,8 @@ def collect(
         if not df.empty:
             path.parent.mkdir(parents=True, exist_ok=True)
             df.to_parquet(path)
+    if truncated:
+        print(f"  {len(truncated)} re-fetched histories were truncated stubs, cached history kept: {', '.join(truncated)}")
 
     fundamentals: dict[str, pd.DataFrame] = {}
     n_calls = 0
@@ -276,8 +309,12 @@ def data_quality_report(prices: dict[str, pd.DataFrame], fundamentals: dict[str,
         issues = []
         if price_df is None or price_df.empty:
             issues.append("no price history")
-        elif (price_df["close"] <= 0).any():
-            issues.append("non-positive close price present")
+        else:
+            if len(price_df) < MIN_PRICE_ROWS:
+                issues.append(f"price history under {MIN_PRICE_ROWS} days (delisting stub with the history lost, "
+                              "or a new listing)")
+            if (price_df["close"] <= 0).any():
+                issues.append("non-positive close price present")
         if fund_df is None or fund_df.empty:
             issues.append("no fundamentals")
         else:

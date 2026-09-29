@@ -15,9 +15,10 @@ METHOD (per as_of date, per multiple in config.FAIR_VALUE_TARGETS):
      config bounds [min, max] (outside = undefined, distorted or bad data),
      minus the multiple's exclude_sectors (Financials for PSR, EV/EBITDA and
      P/FCF — see config).
-  2. Features = config.FAIR_VALUE_FEATURES, winsorized and median-imputed
-     within that cross-section (+ a missing flag per feature), plus sector
-     one-hot. Target = log(multiple).
+  2. Features = config.FAIR_VALUE_FEATURES + the multiple's extra_features,
+     turned into percentiles (or winsorized, FAIR_VALUE_FEATURE_TRANSFORM)
+     and median-imputed within that cross-section (+ a missing flag per
+     feature), plus sector one-hot. Target = log(multiple).
   3. Ridge regression, out-of-fold by ticker (GroupKFold): each stock's fair
      multiple comes from a model that never saw that stock, so its own price
      cannot pull its own fair value toward itself.
@@ -87,10 +88,15 @@ from config import (
     FAIR_VALUE_TARGETS,
     FAIR_VALUE_WINSOR_QUANTILE,
     HORIZONS_MONTHS,
+    N_JOBS,
     RIDGE_ALPHAS,
     TRAIN_END,
     VAL_END,
 )
+
+# Below this many dates (the tests' small panels) process start-up costs
+# more than parallel fitting saves.
+_MIN_DATES_FOR_PARALLEL = 8
 
 FEATURE_LABELS_KO = {
     "return_on_equity": "ROE",
@@ -250,32 +256,61 @@ def _fit_cross_section(
     return out, diag
 
 
+def _model_features(spec: dict, features: list[str], drop: tuple[str, ...] = ()) -> list[str]:
+    """target_features minus `drop` (compare-features' "-feature" rows)."""
+    return [f for f in target_features(spec, features) if f not in drop]
+
+
+def _fit_date(
+    as_of: pd.Timestamp, cs: pd.DataFrame, sectors: list[str], features: list[str], transform: str,
+    drop: tuple[str, ...],
+) -> list[tuple[str, pd.DataFrame, dict]]:
+    """Every multiple's fit for one as_of cross-section. Dates never share
+    data, so they can run in any order or in parallel."""
+    results = []
+    for key, spec in FAIR_VALUE_TARGETS.items():
+        result = _fit_cross_section(cs, key, spec, sectors, _model_features(spec, features, drop), transform)
+        if result is not None:
+            out, diag = result
+            results.append((key, out, {"as_of": as_of, "split": split_of(as_of), **diag}))
+    return results
+
+
 def add_fair_value(
-    panel: pd.DataFrame, features: list[str] = FAIR_VALUE_FEATURES, transform: str = FAIR_VALUE_FEATURE_TRANSFORM
+    panel: pd.DataFrame, features: list[str] = FAIR_VALUE_FEATURES, transform: str = FAIR_VALUE_FEATURE_TRANSFORM,
+    drop: tuple[str, ...] = (), n_jobs: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Adds fair_<m>, <m>_gap, <m>_contrib_<driver> for each multiple
-    (fitted on target_features(spec, features)), plus the combined verdict
-    over the multiples with in_verdict (default True): valuation_gap (mean
-    gap), n_gaps, valuation_basis and gap_agreement (share of the available
-    views pointing the same way as valuation_gap — 1.0 = every multiple
-    agrees). Returns (panel, diagnostics), one diagnostics row per (as_of,
-    multiple) that could be fit."""
+    (fitted on target_features(spec, features), minus `drop`), plus the
+    combined verdict over the multiples with in_verdict (default True):
+    valuation_gap (mean gap), n_gaps, valuation_basis and gap_agreement
+    (share of the available views pointing the same way as valuation_gap —
+    1.0 = every multiple agrees). Returns (panel, diagnostics), one
+    diagnostics row per (as_of, multiple) that could be fit. Dates are fitted
+    in parallel (n_jobs, default config.N_JOBS); the result doesn't depend
+    on it."""
     df = panel.reset_index(drop=True)
     sectors = sorted(df["sector"].dropna().unique())
     pieces: dict[str, list[pd.DataFrame]] = {key: [] for key in FAIR_VALUE_TARGETS}
     diagnostics = []
 
-    for as_of, cs in df.groupby("as_of"):
-        for key, spec in FAIR_VALUE_TARGETS.items():
-            result = _fit_cross_section(cs, key, spec, sectors, target_features(spec, features), transform)
-            if result is None:
-                continue
-            out, diag = result
+    n_jobs = N_JOBS if n_jobs is None else n_jobs
+    dates = list(df.groupby("as_of"))
+    if n_jobs == 1 or len(dates) < _MIN_DATES_FOR_PARALLEL:
+        per_date = [_fit_date(as_of, cs, sectors, features, transform, drop) for as_of, cs in dates]
+    else:
+        from joblib import Parallel, delayed
+
+        per_date = Parallel(n_jobs=n_jobs)(
+            delayed(_fit_date)(as_of, cs, sectors, features, transform, drop) for as_of, cs in dates
+        )
+    for results in per_date:
+        for key, out, diag in results:
             pieces[key].append(out)
-            diagnostics.append({"as_of": as_of, "split": split_of(as_of), **diag})
+            diagnostics.append(diag)
 
     for key, frames in pieces.items():
-        drivers = [*target_features(FAIR_VALUE_TARGETS[key], features), "sector"]
+        drivers = [*_model_features(FAIR_VALUE_TARGETS[key], features, drop), "sector"]
         cols = [f"fair_{key}", f"{key}_gap"] + [f"{key}_contrib_{d}" for d in drivers]
         fitted = pd.concat(frames) if frames else pd.DataFrame(columns=cols, dtype=float)
         df = df.drop(columns=[c for c in cols if c in df.columns]).join(fitted.reindex(columns=cols))
@@ -296,23 +331,50 @@ def add_fair_value(
     return df, pd.DataFrame(diagnostics)
 
 
-def compare_feature_sets(panel: pd.DataFrame, feature_sets: dict[str, list[str] | tuple[list[str], str]]) -> pd.DataFrame:
+def _set_diagnostics(panel: pd.DataFrame, spec: list[str] | tuple | dict) -> pd.DataFrame:
+    """Diagnostics of one compare_feature_sets entry (sequential inside: the
+    sets themselves are what runs in parallel)."""
+    if isinstance(spec, dict):
+        features = spec.get("features", FAIR_VALUE_FEATURES)
+        transform = spec.get("transform", FAIR_VALUE_FEATURE_TRANSFORM)
+        drop = tuple(spec.get("drop", ()))
+    elif isinstance(spec, tuple):
+        (features, transform), drop = spec, ()
+    else:
+        features, transform, drop = spec, FAIR_VALUE_FEATURE_TRANSFORM, ()
+    return add_fair_value(panel, features, transform, drop=drop, n_jobs=1)[1]
+
+
+def compare_feature_sets(
+    panel: pd.DataFrame, feature_sets: dict[str, list[str] | tuple[list[str], str] | dict], n_jobs: int | None = None,
+) -> pd.DataFrame:
     """Out-of-fold R^2 per (feature set, multiple, split), same folds and
     bounds for every set — how model features are chosen. A set is a
-    feature list (each multiple's extra_features are added to it) or
-    (features, transform). Decide on the train/val columns only; test is for
-    the final report."""
-    rows = []
-    for name, spec in feature_sets.items():
-        features, transform = spec if isinstance(spec, tuple) else (spec, FAIR_VALUE_FEATURE_TRANSFORM)
-        _, diag = add_fair_value(panel, features, transform)
-        if diag.empty:
-            continue
-        summary = diag.groupby(["target", "split"])["r2_model"].mean().rename(name)
-        rows.append(summary)
+    feature list (each multiple's extra_features are added to it),
+    (features, transform), or a dict with any of "features", "transform" and
+    "drop" (features taken out of every multiple, extra_features included).
+    Sets run in parallel (n_jobs, default config.N_JOBS). Decide on the
+    train/val columns only; test is for the final report."""
+    n_jobs = N_JOBS if n_jobs is None else n_jobs
+    names, specs = list(feature_sets), list(feature_sets.values())
+    # only what the fits read, so each worker gets a small copy of the panel
+    used = {f for spec in specs for f in (spec.get("features", FAIR_VALUE_FEATURES) if isinstance(spec, dict)
+                                          else spec[0] if isinstance(spec, tuple) else spec)}
+    used |= {f for spec in FAIR_VALUE_TARGETS.values() for f in (spec["column"], *spec.get("extra_features", ()))}
+    keep = ["as_of", "ticker", "sector", "eps", "trailing_pe", "return_on_equity", *sorted(used)]
+    slim = panel[list(dict.fromkeys(c for c in keep if c in panel.columns))]
+    if n_jobs == 1 or len(specs) == 1 or slim["as_of"].nunique() < _MIN_DATES_FOR_PARALLEL:
+        diags = [_set_diagnostics(slim, spec) for spec in specs]
+    else:
+        from joblib import Parallel, delayed
+
+        diags = Parallel(n_jobs=n_jobs)(delayed(_set_diagnostics)(slim, spec) for spec in specs)
+    rows = [diag.groupby(["target", "split"])["r2_model"].mean().rename(name)
+            for name, diag in zip(names, diags) if not diag.empty]
     table = pd.concat(rows, axis=1)
-    baseline = diag.groupby(["target", "split"])["r2_sector_median"].mean().rename("sector_median")
-    return pd.concat([baseline, table], axis=1).reindex(["train", "val", "test"], level="split")
+    # the baseline depends only on the rows and folds, which every set shares
+    baseline = next(d for d in diags if not d.empty).groupby(["target", "split"])["r2_sector_median"].mean()
+    return pd.concat([baseline.rename("sector_median"), table], axis=1).reindex(["train", "val", "test"], level="split")
 
 
 def r2_by_group(panel: pd.DataFrame, group_col: str = "size_group") -> pd.DataFrame:
