@@ -44,7 +44,11 @@ FLAGS (heuristics to prompt a second look, not verdicts):
     multiples mix incomparable quarters. Found on HON 2026-09-29 (one-off
     gain + sales/share doubling made all 5 views -77%); first suspected to
     be a spin-off price drop, which verify-multiples ruled out. Label
-    unchanged for now; evaluate reports how often it hits the tails.
+    unchanged: on 2026-09-29 it hit 22.9% of labelled rows (60 of 278 on
+    the latest date — GAAP one-offs are common), 28.7% of the cheapest 20%
+    and 26.9% of the most expensive 20% vs. 19.6% in the middle. Enriched
+    in the tails, but withholding a quarter of all verdicts for a 1.4x
+    enrichment would cost more than it saves; it stays a warning.
 """
 from __future__ import annotations
 

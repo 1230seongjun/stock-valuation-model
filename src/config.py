@@ -117,6 +117,11 @@ UNIVERSE_INDEXES = ("sp400", "sp600")
 # combined verdict). pe_norm (PER on 3-year average EPS, 2026-09-29) is a
 # candidate replacement for PER that one-off quarters distort less; whether
 # it replaces PER is decided from the reference runs, not assumed.
+# 2026-09-29 (all splits, 20,112 labelled rows): mean |gap| PER 0.29 vs.
+# normalized 0.34 on rows without a fundamental break, 0.46 vs. 0.42 on the
+# 23% with one; per-date Spearman between the two gaps 0.65. Normalized PER
+# is only better where the TTM is broken, so it does not replace PER.
+# Out-of-fold R^2 train/val 0.18/0.11 vs. PER's 0.29/0.33.
 FAIR_VALUE_TARGETS = {
     "pe": {"column": "trailing_pe", "min": 1.0, "max": 100.0, "label": "PER"},
     "pb": {"column": "price_to_book", "min": 0.1, "max": 20.0, "label": "PBR",
@@ -221,8 +226,13 @@ FAIR_VALUE_WINSOR_QUANTILE = 0.02   # clip each feature to [2%, 98%] per as_of
 # percentile within the as_of cross-section, so one extreme value (AAPL's
 # buyback-inflated ROE drove its fair PSR +108% on 2026-09-29) can move a
 # fair multiple no more than the most extreme rank. compare-features runs
-# both; switch only if rank helps on Train and Val.
-FAIR_VALUE_FEATURE_TRANSFORM = "winsor"
+# the other one as a comparison row.
+# 2026-09-29 (92 snapshots, change in out-of-fold R^2 train/val, rank vs.
+# winsor): PER +.048/+.045, PBR +.038/+.030, PSR +.012/+.018 (all past
+# FAIR_VALUE_MIN_GAIN), P/FCF +.009/+.011, EV/EBITDA -.004/+.015 (~0),
+# normalized PER +.006/+.004. Switched to rank. extra_features were chosen
+# under winsor; the next compare-features re-checks them under rank.
+FAIR_VALUE_FEATURE_TRANSFORM = "rank"
 FAIR_VALUE_MIN_ROWS = 50            # skip an as_of with fewer usable rows
 RIDGE_ALPHAS = [0.01, 0.1, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0]
 

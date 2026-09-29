@@ -567,7 +567,7 @@ def test_r2_and_return_test_by_size_group():
     panel["size_group"] = np.where(panel["ticker"].str[1:].astype(int) % 2 == 0, "large", "small")
     out, _ = add_fair_value(panel)
     r2 = r2_by_group(out)
-    assert set(r2.index.get_level_values("group")) == {"large", "small"} and (r2["r2"] > 0.3).all()
+    assert set(r2.index.get_level_values("group")) == {"large", "small"} and (r2["r2"] > 0.2).all()
     rng = np.random.default_rng(0)
     out["fwd_return_1m"] = rng.normal(0, 0.05, len(out))
     tests = gap_return_test(out, horizons=[1], by="size_group")

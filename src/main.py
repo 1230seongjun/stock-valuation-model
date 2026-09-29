@@ -29,6 +29,7 @@ import pandas as pd
 
 from config import (
     FAIR_VALUE_FEATURE_CANDIDATES,
+    FAIR_VALUE_FEATURE_TRANSFORM,
     FAIR_VALUE_FEATURES,
     FAIR_VALUE_MIN_GAIN,
     FAIR_VALUE_TARGETS,
@@ -116,7 +117,8 @@ def _load(panel_path: str | Path) -> pd.DataFrame:
 def compare_features(panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
     """Out-of-fold R^2 of each multiple for: the current features (each
     multiple with its extra_features), current + each candidate alone,
-    current + all candidates, and the current features rank-transformed.
+    current + all candidates, and the current features under the other
+    transform (winsor/rank, config FAIR_VALUE_FEATURE_TRANSFORM).
     Keep a candidate (for all multiples, or as one multiple's extra) only if
     it gains >= FAIR_VALUE_MIN_GAIN on train AND val — the last table lists
     those. Test is for the final report."""
@@ -125,7 +127,8 @@ def compare_features(panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
     sets = {"current": FAIR_VALUE_FEATURES}
     sets.update({f"+{c}": [*FAIR_VALUE_FEATURES, c] for c in candidates})
     sets["+all"] = [*FAIR_VALUE_FEATURES, *candidates]
-    sets["rank_transform"] = (FAIR_VALUE_FEATURES, "rank")
+    other = "winsor" if FAIR_VALUE_FEATURE_TRANSFORM == "rank" else "rank"
+    sets[f"{other}_transform"] = (FAIR_VALUE_FEATURES, other)
     print(f"Comparing {len(sets)} feature sets on {panel['as_of'].nunique()} snapshots (takes a few minutes)...")
     table = compare_feature_sets(panel, sets)
     delta = table.drop(columns=["sector_median", "current"]).sub(table["current"], axis=0)
