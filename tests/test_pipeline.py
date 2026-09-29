@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 from config import FAIR_VALUE_FEATURES, HORIZONS_MONTHS
-from fair_value import add_fair_value, compare_feature_sets, gap_return_test, summarize_diagnostics
+from fair_value import add_fair_value, compare_feature_sets, gap_return_test, r2_by_group, summarize_diagnostics
 from features import (
     _dividend_features,
     add_fundamental_trends,
@@ -479,7 +479,7 @@ def test_cache_refetches_when_a_field_was_added():
     pd.DataFrame({"period": period, "trailing_pe": [20.0]}).to_parquet(cache / "fundamentals" / "OLD.parquet")
     current_fund = pd.DataFrame({"period": period, **{k: [1.0] for k in data.FINNHUB_FIELD_MAP}})
     current_fund.to_parquet(cache / "fundamentals" / "NEW.parquet")
-    day = [pd.Timestamp("2020-01-02")]
+    day = [pd.Timestamp.today().normalize()]  # recent, so only the missing columns force a re-fetch
     pd.DataFrame({"date": day, "close": [1.0], "volume": [1.0]}).to_parquet(cache / "prices" / "OLD.parquet")
     current_price = pd.DataFrame({"date": day, "close": [1.0], "close_raw": [1.0], "volume": [1.0], "dividend": [0.0]})
     current_price.to_parquet(cache / "prices" / "NEW.parquet")
@@ -495,6 +495,83 @@ def test_cache_refetches_when_a_field_was_added():
     assert fund_calls == ["OLD"] and price_calls == ["OLD"]
     assert "ev_to_ebitda" in fundamentals["OLD"].columns and "dividend" in prices["OLD"].columns
     assert "ev_to_ebitda" in pd.read_parquet(cache / "fundamentals" / "OLD.parquet").columns
+
+
+def test_stale_price_cache_is_refreshed_and_delisted_history_kept():
+    import tempfile
+    import data
+
+    cache = Path(tempfile.mkdtemp())
+    (cache / "prices").mkdir()
+    (cache / "fundamentals").mkdir()
+    stale = pd.DataFrame({"date": [pd.Timestamp("2026-01-02")], "close": [1.0], "close_raw": [1.0],
+                          "volume": [1.0], "dividend": [0.0]})
+    for t in ("LIVE", "GONE"):
+        stale.to_parquet(cache / "prices" / f"{t}.parquet")
+        pd.DataFrame({"period": [pd.Timestamp("2025-12-31")], **{k: [1.0] for k in data.FINNHUB_FIELD_MAP}}) \
+            .to_parquet(cache / "fundamentals" / f"{t}.parquet")
+    fresh = stale.assign(date=pd.Timestamp.today().normalize(), close=2.0)
+    calls = []
+    orig = data.fetch_price_history
+    data.fetch_price_history = lambda t: calls.append(t) or (fresh if t == "LIVE" else pd.DataFrame(columns=data.PRICE_COLUMNS))
+    try:
+        prices, _ = data.collect(["LIVE", "GONE"], api_key="x", cache_dir=cache)
+    finally:
+        data.fetch_price_history = orig
+    assert calls == ["LIVE", "GONE"]
+    assert prices["LIVE"]["close"].iloc[-1] == 2.0 and pd.read_parquet(cache / "prices" / "LIVE.parquet")["close"].iloc[-1] == 2.0
+    assert len(prices["GONE"]) == 1, "a delisted ticker keeps its cached history"
+
+
+def test_parse_constituents_and_load_universe():
+    import tempfile
+    import universe
+
+    html = """<table><tr><th>Symbol</th><th>Security</th><th>GICS Sector</th><th>GICS Sub-Industry</th></tr>
+    <tr><td>MOG.A</td><td>Moog</td><td>Industrials</td><td>Aerospace</td></tr>
+    <tr><td>ABC</td><td>Abc Corp</td><td>Information Technology</td><td>Software</td></tr>
+    <tr><td>AMC</td><td>AMC Entertainment</td><td>Communication Services</td><td>Movies</td></tr>
+    <tr><td>ABC</td><td>dup</td><td>Health Care</td><td>x</td></tr></table>"""
+    members = universe.parse_constituents(html)
+    assert members["ticker"].tolist() == ["MOG.A", "ABC", "AMC"]
+    assert members.set_index("ticker").loc["ABC", "sector"] == "Technology"
+
+    cache = Path(tempfile.mkdtemp())
+    (cache / "universe").mkdir()
+    members.to_csv(cache / "universe" / "sp600.csv", index=False)
+    loaded = universe.load_universe(cache, indexes=("sp600",))
+    assert loaded["MOG.A"] == {"name": "Moog", "sector": "Industrials", "size": "small"}
+    assert loaded["AMC"]["sector"] == universe.UNIVERSE["AMC"]["sector"] and loaded["AMC"]["size"] == "small"
+    assert loaded["AAPL"]["size"] == "large" and len(loaded) == len(universe.UNIVERSE) + 2
+
+
+def test_size_features_are_price_free():
+    """log_revenue = TTM sales/share x share count; moving every price after
+    the period end must not change it (it's a size, not a valuation)."""
+    tickers, universe, prices, fundamentals = make_raw_data(n_tickers=2)
+    universe = {t: {**m, "size": "small"} for t, m in universe.items()}
+    as_of = [pd.Timestamp("2022-07-01")]
+    base = build_raw_panel(tickers, prices, fundamentals, universe, as_of).set_index("ticker")
+    moved = {t: df.assign(close_raw=np.where(df["date"] > pd.Timestamp("2022-03-31"), df["close_raw"] * 3, df["close_raw"]))
+             for t, df in prices.items()}
+    after = build_raw_panel(tickers, moved, fundamentals, universe, as_of).set_index("ticker")
+    t = tickers[0]
+    assert base.loc[t, "size_group"] == "small"
+    assert np.isclose(base.loc[t, "log_revenue"], after.loc[t, "log_revenue"])
+    assert np.isclose(base.loc[t, "log_book_value"], np.log(300.0))
+    assert not np.isclose(base.loc[t, "trailing_pe"], after.loc[t, "trailing_pe"])
+
+
+def test_r2_and_return_test_by_size_group():
+    panel = make_fair_value_panel(n_tickers=200, n_dates=5)  # a split needs >= 4 dates to be tested
+    panel["size_group"] = np.where(panel["ticker"].str[1:].astype(int) % 2 == 0, "large", "small")
+    out, _ = add_fair_value(panel)
+    r2 = r2_by_group(out)
+    assert set(r2.index.get_level_values("group")) == {"large", "small"} and (r2["r2"] > 0.3).all()
+    rng = np.random.default_rng(0)
+    out["fwd_return_1m"] = rng.normal(0, 0.05, len(out))
+    tests = gap_return_test(out, horizons=[1], by="size_group")
+    assert set(tests["group"]) == {"all", "large", "small"} and tests["p_value_fdr"].notna().all()
 
 
 # ---------------------------------------------------------------------------

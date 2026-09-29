@@ -33,6 +33,7 @@ from config import (
     FAIR_VALUE_MIN_GAIN,
     FAIR_VALUE_TARGETS,
     TRAIN_START,
+    UNIVERSE_INDEXES,
 )
 from data import DEFAULT_CACHE_DIR, collect, data_quality_report
 from fair_value import (
@@ -40,11 +41,12 @@ from fair_value import (
     coefficient_summary,
     compare_feature_sets,
     gap_return_test,
+    r2_by_group,
     summarize_diagnostics,
 )
 from features import add_percentile_scores, build_as_of_dates, build_raw_panel
 from screening import flag_fundamental_break, report_at, screen as screen_panel
-from universe import TICKERS, UNIVERSE
+from universe import load_universe
 
 OUTPUT_DIR = Path("real_data_output")
 PANEL_PATH = OUTPUT_DIR / "panel.parquet"
@@ -56,17 +58,24 @@ pd.set_option("display.max_columns", 40)
 def build(api_key: str | None = None, cache_dir: str | Path = DEFAULT_CACHE_DIR, force_refresh: bool = False,
           panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
     api_key = api_key or os.environ.get("FINNHUB_API_KEY")
-    prices, fundamentals = collect(TICKERS, api_key=api_key, cache_dir=cache_dir, force_refresh=force_refresh)
+    universe = load_universe(cache_dir, UNIVERSE_INDEXES)
+    tickers = list(universe)
+    sizes = pd.Series({t: m["size"] for t, m in universe.items()}).value_counts()
+    print(f"Universe: {len(tickers)} tickers ({', '.join(f'{k} {v}' for k, v in sizes.items())})")
+    prices, fundamentals = collect(tickers, api_key=api_key, cache_dir=cache_dir, force_refresh=force_refresh)
     data_quality_report(prices, fundamentals)
 
     as_of_dates = build_as_of_dates(TRAIN_START)
     print(f"\nBuilding point-in-time panel: {len(as_of_dates)} snapshots "
           f"({as_of_dates[0].date()} ~ {as_of_dates[-1].date()})...")
-    panel = add_percentile_scores(build_raw_panel(TICKERS, prices, fundamentals, UNIVERSE, as_of_dates))
+    panel = add_percentile_scores(build_raw_panel(tickers, prices, fundamentals, universe, as_of_dates))
     if panel.empty:
         raise RuntimeError("panel is empty — check that collection worked")
 
-    print(f"  {len(panel)} rows, {panel['ticker'].nunique()} tickers — share of rows missing:")
+    latest = panel[panel["as_of"] == panel["as_of"].max()]
+    print(f"  {len(panel)} rows, {panel['ticker'].nunique()} tickers; latest snapshot by size: "
+          + ", ".join(f"{k} {v}" for k, v in latest["size_group"].value_counts().items()))
+    print("  share of rows missing:")
     multiples = [spec["column"] for spec in FAIR_VALUE_TARGETS.values()]
     for col in [*multiples, *FAIR_VALUE_FEATURES, *FAIR_VALUE_FEATURE_CANDIDATES, "dividend_yield"]:
         missing = panel[col].isna().mean()
@@ -158,16 +167,26 @@ def evaluate(panel_path: str | Path = PANEL_PATH) -> dict[str, pd.DataFrame]:
 
     _report_ttm_reliability(panel)
 
-    tests = gap_return_test(panel)
+    by_size = "size_group" in panel.columns and panel["size_group"].nunique() > 1
+    if by_size:
+        print("\n=== 1b. Fit within each size group (out-of-fold R^2 vs. the group's own mean, mean per date) ===")
+        print(r2_by_group(panel)["r2"].unstack("group").round(3).to_string())
+
+    tests = gap_return_test(panel, by="size_group" if by_size else None)
     print("\n=== 4. Hypothesis test: did stocks called cheap later outperform? (not a model metric) ===")
     print("    ic = Spearman(cheapness, forward return) per date; spread = cheapest - most expensive quintile.")
     print("    Newey-West errors for overlapping horizons, BH-FDR across the whole table.")
     if tests.empty:
         print("    (not enough forward-return data)")
     else:
+        if by_size:
+            print("    group = within that size group only; survivorship bias: delisted small caps are missing (universe.py)")
         print(tests.round(4).to_string(index=False))
         n_sig = int(tests["significant_after_fdr"].sum())
         print(f"    {n_sig}/{len(tests)} significant after FDR")
+        if by_size:
+            per = tests.groupby("group")["significant_after_fdr"].agg(["sum", "size"])
+            print("    by group: " + ", ".join(f"{g} {int(r['sum'])}/{int(r['size'])}" for g, r in per.iterrows()))
     return {"summary": summary, "coefficients": coefs, "gap_return_test": tests}
 
 
@@ -211,7 +230,7 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
         else:
             row = match.iloc[0]
             rank = f"{row['cheapness_rank']:.0f}" if pd.notna(row["cheapness_rank"]) else "-"
-            print(f"{row['ticker']} ({row['sector']}) {date}: {row['valuation_label']} (저평가 순위 {rank}/100)")
+            print(f"{row['ticker']} ({row['sector']}, {row['size_group']}) {date}: {row['valuation_label']} (저평가 순위 {rank}/100)")
             print(row["explanation"])
             for col in ("meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason",
                         "fundamental_break_reason"):
@@ -221,6 +240,9 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
 
     counts = report["valuation_label"].value_counts()
     print(f"Screening report {date} ({len(report)} tickers): " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+    if report["size_group"].nunique() > 1:
+        mix = pd.crosstab(report["size_group"], report["valuation_label"])
+        print("    labels by size group:\n" + mix.to_string())
     pct = lambda s: s.map(lambda v: f"{v:+.0%}" if pd.notna(v) else "")
     table = report.assign(
         rank=report["cheapness_rank"].round(0),
@@ -229,7 +251,7 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
         **{spec["label"]: pct(report[f"{key}_gap"]) for key, spec in FAIR_VALUE_TARGETS.items()},
         quality=report["quality_score"].round(0),
     )
-    cols = ["ticker", "sector", "valuation_label", "rank", "gap", "agree",
+    cols = ["ticker", "sector", "size_group", "valuation_label", "rank", "gap", "agree",
             *[spec["label"] for spec in FAIR_VALUE_TARGETS.values()], "quality"]
     print("    (gap = combined; agree = views on the same side; per-multiple columns = actual vs. fair)")
     print("\n-- 저평가 상위 15 --")

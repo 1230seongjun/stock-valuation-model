@@ -111,6 +111,8 @@ FEATURE_LABELS_KO = {
     "dividend_growth_3y": "3년 배당성장률",
     "dividend_years_no_cut": "배당 무삭감 연수",
     "op_margin_avg_3y": "3년 평균 영업이익률",
+    "log_revenue": "매출 규모",
+    "log_book_value": "자본 규모",
     "roe_avg_3y": "3년 평균 ROE",
     "sector": "섹터",
 }
@@ -313,6 +315,31 @@ def compare_feature_sets(panel: pd.DataFrame, feature_sets: dict[str, list[str] 
     return pd.concat([baseline, table], axis=1).reindex(["train", "val", "test"], level="split")
 
 
+def r2_by_group(panel: pd.DataFrame, group_col: str = "size_group") -> pd.DataFrame:
+    """Out-of-fold R^2 of each multiple within each group (e.g. size_group),
+    mean per date, from the gaps add_fair_value left in `panel`: the model is
+    fitted on everyone, this asks how well it explains the multiples WITHIN
+    large / mid / small caps (R^2 against that group's own mean at that
+    date, so a group-wide level offset counts as unexplained)."""
+    rows = []
+    for key, spec in FAIR_VALUE_TARGETS.items():
+        gap = f"{key}_gap"
+        if gap not in panel.columns or spec["column"] not in panel.columns:  # panel built before this multiple
+            continue
+        df = panel.dropna(subset=[gap]).assign(y=lambda d: np.log(d[spec["column"]]))
+        for (as_of, group), g in df.groupby(["as_of", group_col]):
+            if len(g) < 10:
+                continue
+            sst = float(((g["y"] - g["y"].mean()) ** 2).sum())
+            if sst > 0:
+                rows.append({"target": key, "split": split_of(as_of), "group": group,
+                             "r2": 1 - float((g[gap] ** 2).sum()) / sst, "n": len(g)})
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows).groupby(["target", "split", "group"]).agg(r2=("r2", "mean"), rows_per_date=("n", "mean"))
+    return out.reindex(["train", "val", "test"], level="split")
+
+
 def summarize_diagnostics(diagnostics: pd.DataFrame) -> pd.DataFrame:
     """Mean per (multiple, split). The honest bar is r2_model vs.
     r2_sector_median: beating it means fundamentals explain multiples beyond
@@ -358,7 +385,8 @@ def _newey_west_mean_test(series: np.ndarray, lags: int) -> tuple[float, float, 
     return float(series.mean()), t_stat, p_value
 
 
-def gap_return_test(panel: pd.DataFrame, horizons: list[int] = HORIZONS_MONTHS, n_quantiles: int = 5) -> pd.DataFrame:
+def gap_return_test(panel: pd.DataFrame, horizons: list[int] = HORIZONS_MONTHS, n_quantiles: int = 5,
+                    by: str | None = None) -> pd.DataFrame:
     """Hypothesis test: did stocks the model called cheap (low valuation_gap)
     later outperform, WITHIN the same as_of? Per as_of it computes the
     Spearman IC between cheapness (-valuation_gap) and fwd_return_<h>m, and
@@ -368,7 +396,23 @@ def gap_return_test(panel: pd.DataFrame, horizons: list[int] = HORIZONS_MONTHS, 
 
     Cross-sectional per date, so market-wide drift cancels out (a strategy
     doesn't "work" just because stocks went up). Uses exactly the rows that
-    screening labels (every row with a valuation_gap; never loss-makers)."""
+    screening labels (every row with a valuation_gap; never loss-makers).
+
+    by="size_group": one more set of rows per group, each tested within
+    that group only (cheap small caps vs. expensive small caps), with a
+    "group" column; FDR still runs across the whole table, so testing more
+    groups makes each result harder to call significant, as it should."""
+    if by is not None:
+        parts = [gap_return_test(panel, horizons, n_quantiles).assign(group="all")]
+        for group, g in panel.groupby(by):
+            parts.append(gap_return_test(g, horizons, n_quantiles).assign(group=group))
+        parts = [p for p in parts if not p.empty]
+        if not parts:
+            return pd.DataFrame()
+        result = pd.concat(parts, ignore_index=True)
+        reject, p_adj, _, _ = multipletests(result["p_value"], method="fdr_bh")
+        result["p_value_fdr"], result["significant_after_fdr"] = p_adj, reject
+        return result
     df = panel.dropna(subset=["valuation_gap"]).copy()
     df["cheapness"] = -df["valuation_gap"]
     df["split"] = df["as_of"].map(split_of)

@@ -30,6 +30,9 @@ Derived indicators (see data.py for the raw fields):
     config.FAIR_VALUE_TARGETS "in_verdict")
   - eps_one_off_* / per_share_break_*: quarters inside the TTM window that
     make trailing figures unreliable (_add_fundamental_breaks)
+  - log_revenue / log_book_value: company size without the snapshot price
+    (_size_features); size_group: today's index membership (universe.py),
+    for splitting reports only
   - dividend_yield / dividend_growth_3y / dividend_years_no_cut: from actual
     dividend payments (see _dividend_features)
 """
@@ -65,7 +68,7 @@ _AS_OF_FUNDAMENTAL_KEYS = [k for k in FUNDAMENTAL_INDICATORS if k != "dividend_y
     # TTM-reliability checks (_add_fundamental_breaks)
     "eps_one_off_period", "eps_one_off_ratio", "per_share_break_period", "per_share_break_ratio",
     # raw components
-    "eps", "eps_ttm", "eps_avg_3y", "payout_ratio_ttm", "sales_per_share", "enterprise_value", "book_value",
+    "eps", "eps_ttm", "eps_avg_3y", "payout_ratio_ttm", "sales_per_share", "sps_ttm", "enterprise_value", "book_value",
 ]
 _ANOMALY_SIGNAL_KEYS = ["price_spike_5d", "volume_zscore_63d"]
 _DIVIDEND_KEYS = ["dividend_yield", "dividend_growth_3y", "dividend_years_no_cut"]
@@ -127,6 +130,7 @@ def add_fundamental_trends(fundamentals: pd.DataFrame) -> pd.DataFrame:
     ttm = df["sales_per_share"].rolling(4, min_periods=4).sum()
     consecutive = (df["period"] - df["period"].shift(3)) <= pd.Timedelta(days=300)
     df["_sps_ttm"] = ttm.where(consecutive)
+    df["sps_ttm"] = df["_sps_ttm"]
     df = _match_prior(df, "_sps_ttm", 3 * 365, "_sps_ttm_3y")
     ratio = df["_sps_ttm"] / df["_sps_ttm_3y"]
     df["revenue_cagr_3y"] = np.where((df["_sps_ttm"] > 0) & (df["_sps_ttm_3y"] > 0), ratio ** (1 / 3) - 1, np.nan)
@@ -225,7 +229,7 @@ def _as_of_fundamentals(fundamentals: pd.DataFrame, as_of: pd.Timestamp) -> dict
     return {k: row.get(k, np.nan) for k in _AS_OF_FUNDAMENTAL_KEYS} | {"fundamentals_period": row["period"]}
 
 
-def _rescale_multiples(row: dict, quoted: pd.DataFrame) -> None:
+def _rescale_multiples(row: dict, quoted: pd.DataFrame) -> float:
     """Move Finnhub's period-end multiples to the as_of price, in place
     (originals kept as *_reported). `quoted`: date + quoted price (close_raw)
     up to as_of. Both prices used are <= as_of, so no look-ahead.
@@ -234,15 +238,19 @@ def _rescale_multiples(row: dict, quoted: pd.DataFrame) -> None:
                        with the price: market cap = pb * book_value (both at
                        period end), net debt = EV - market cap, so
                        EV(as_of) / EV(period end) = 1 + mcap/EV * (ratio - 1).
-                       Falls back to x ratio if EV/book value are missing."""
+                       Falls back to x ratio if EV/book value are missing.
+    Returns the quoted price at the period end (NaN if unknown)."""
     for col in RESCALED_MULTIPLES:
         row[f"{col}_reported"] = row[col]
-    if not RESCALE_MULTIPLES_TO_AS_OF_PRICE or pd.isna(row["fundamentals_period"]) or pd.isna(row["price"]):
-        return
+    if pd.isna(row["fundamentals_period"]) or pd.isna(row["price"]):
+        return np.nan
     at_period = quoted[quoted["date"] <= row["fundamentals_period"]]
     if at_period.empty or at_period["price"].iloc[-1] <= 0:
-        return
-    ratio = row["price"] / at_period["price"].iloc[-1]
+        return np.nan
+    period_price = at_period["price"].iloc[-1]
+    if not RESCALE_MULTIPLES_TO_AS_OF_PRICE:
+        return period_price
+    ratio = row["price"] / period_price
     for col in PRICE_MULTIPLES:
         row[col] = row[col] * ratio
 
@@ -252,6 +260,24 @@ def _rescale_multiples(row: dict, quoted: pd.DataFrame) -> None:
     else:
         ev_factor = ratio
     row["ev_to_ebitda"] = row["ev_to_ebitda"] * ev_factor if ev_factor > 0 else np.nan
+    return period_price
+
+
+def _size_features(row: dict, period_price: float) -> dict[str, float]:
+    """Company size without the snapshot price (a market cap would carry
+    the price, like momentum — config FAIR_VALUE_FEATURE_CANDIDATES):
+      log_book_value — log total equity (Finnhub bookValue, millions); NaN
+                       for negative equity
+      log_revenue    — log TTM revenue = TTM sales/share x shares, shares =
+                       market cap / price, both at the fiscal period end
+                       (market cap = PBR x book value, as in the EV/EBITDA
+                       rescaling), so the price cancels out: it is a share
+                       count, not a valuation."""
+    book, pb, sps_ttm = row["book_value"], row["price_to_book_reported"], row["sps_ttm"]
+    out = {"log_book_value": np.log(book) if book > 0 else np.nan, "log_revenue": np.nan}
+    if pb > 0 and book > 0 and sps_ttm > 0 and period_price > 0:
+        out["log_revenue"] = np.log(sps_ttm * pb * book / period_price)
+    return out
 
 
 def _dividend_features(payments: pd.DataFrame, as_of: pd.Timestamp, price: float) -> dict[str, float]:
@@ -383,6 +409,7 @@ def build_raw_panel(
         )
         fund_df = lagged.get(ticker, pd.DataFrame())
         sector = universe.get(ticker, {}).get("sector", "Unknown")
+        size_group = universe.get(ticker, {}).get("size", "large")
 
         for as_of in as_of_dates:
             window = price_df[price_df["date"] <= as_of].tail(260)
@@ -393,9 +420,10 @@ def build_raw_panel(
             quoted_now = quoted[quoted["date"] <= as_of]
             price = quoted_now["price"].iloc[-1] if len(quoted_now) else np.nan
 
-            row = {"as_of": as_of, "ticker": ticker, "sector": sector, "price": price}
+            row = {"as_of": as_of, "ticker": ticker, "sector": sector, "size_group": size_group, "price": price}
             row.update(_as_of_fundamentals(fund_df, as_of))
-            _rescale_multiples(row, quoted_now)
+            period_price = _rescale_multiples(row, quoted_now)
+            row.update(_size_features(row, period_price))
             # already at the as_of price (no Finnhub period-end price involved)
             row["normalized_pe"] = price / (4 * row["eps_avg_3y"]) if row["eps_avg_3y"] > 0 else np.nan
             row.update(_dividend_features(payments, as_of, price))

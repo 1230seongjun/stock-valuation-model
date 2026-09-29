@@ -368,7 +368,7 @@ def screen(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 REPORT_COLUMNS = [
-    "ticker", "sector", "as_of", "valuation_label", "cheapness_rank", "valuation_gap_pct", "valuation_basis",
+    "ticker", "sector", "size_group", "as_of", "valuation_label", "cheapness_rank", "valuation_gap_pct", "valuation_basis",
     "n_gaps", "gap_agreement",
     "trailing_pe", "fair_pe", "price_to_book", "fair_pb", "price_to_sales", "fair_ps",
     "ev_to_ebitda", "fair_ev_ebitda", "price_to_fcf", "fair_pfcf", "normalized_pe", "fair_pe_norm",

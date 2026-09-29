@@ -19,7 +19,10 @@ CACHE: fetching the whole universe takes minutes (Finnhub free tier is 50
 calls/min), and a past quarter's fundamentals or a past day's price never
 change, so each ticker's raw response is stored under `cache_dir` and reused.
 The newest quarter / last few days CAN still change — pass
-force_refresh=True before a run whose conclusions matter. In Colab the cache
+force_refresh=True before a run whose conclusions matter. Cached prices
+older than PRICE_REFRESH_DAYS are re-fetched automatically (until
+2026-09-29 they never were, so a later build's "today" snapshot silently
+used the prices of the day the cache was made). In Colab the cache
 lives on local disk and is lost on a runtime restart unless cache_dir points
 into a mounted Google Drive.
 """
@@ -65,6 +68,8 @@ FINNHUB_FIELD_MAP = {
 }
 
 DEFAULT_CACHE_DIR = Path("data_cache")
+PRICE_REFRESH_DAYS = 3  # covers a weekend; a cache older than this is re-fetched
+_PROGRESS_EVERY = 200
 _FINNHUB_CALLS_PER_MIN = 50
 _MIN_INTERVAL_SEC = 60.0 / _FINNHUB_CALLS_PER_MIN
 _RETRY_WAITS_SEC = (5, 20, 60)  # waits between attempts; 4 attempts total
@@ -114,7 +119,8 @@ def fetch_price_history(ticker: str, period: str = "max") -> pd.DataFrame:
                   would be 1.67x too high.
       dividend  — cash dividend per share on its ex-date (0 on other days),
                   split-adjusted like close_raw."""
-    hist = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=False)
+    # class shares: Wikipedia/Finnhub write MOG.A, Yahoo writes MOG-A
+    hist = yf.Ticker(ticker.replace(".", "-")).history(period=period, interval="1d", auto_adjust=False)
     if hist.empty:
         return pd.DataFrame(columns=PRICE_COLUMNS)
     if "Dividends" not in hist.columns:
@@ -168,6 +174,12 @@ def _cache_path(cache_dir: str | Path, kind: str, ticker: str) -> Path:
     return Path(cache_dir) / kind / f"{ticker}.parquet"
 
 
+def _prices_are_recent(cached: pd.DataFrame, today: pd.Timestamp | None = None) -> bool:
+    today = (today or pd.Timestamp.today()).normalize()
+    last = pd.to_datetime(cached["date"]).max() if len(cached) else pd.NaT
+    return pd.notna(last) and (today - last).days <= PRICE_REFRESH_DAYS
+
+
 def _cache_is_current(cached: pd.DataFrame, required: list[str]) -> bool:
     """A file cached before a field was added (a new FINNHUB_FIELD_MAP key,
     or the dividend column on prices, both 2026-09-28) lacks that column, so
@@ -192,14 +204,21 @@ def collect(
     prices: dict[str, pd.DataFrame] = {}
     failed: list[str] = []
     print(f"Prices for {len(tickers)} tickers (yfinance, cache={cache_dir})...")
-    for ticker in tickers:
+    for i, ticker in enumerate(tickers, start=1):
+        if i % _PROGRESS_EVERY == 0:
+            print(f"  prices {i}/{len(tickers)}")
         path = _cache_path(cache_dir, "prices", ticker)
         if path.exists() and not force_refresh:
             cached = pd.read_parquet(path)
-            if _cache_is_current(cached, PRICE_COLUMNS):
+            # a delisted ticker's cache never becomes recent: re-fetching it
+            # returns the same history (or nothing, then the cache is kept)
+            if _cache_is_current(cached, PRICE_COLUMNS) and _prices_are_recent(cached):
                 prices[ticker] = cached
                 continue
         df = _with_retry(fetch_price_history, ticker, "yfinance", retry_all=True)
+        if df is not None and df.empty and path.exists():
+            prices[ticker] = pd.read_parquet(path)  # delisted since it was cached: keep its history
+            continue
         if df is None:
             failed.append(f"{ticker} (prices)")
             if path.exists():  # outdated cache still beats nothing for this run
@@ -213,7 +232,9 @@ def collect(
     fundamentals: dict[str, pd.DataFrame] = {}
     n_calls = 0
     print(f"Fundamentals for {len(tickers)} tickers (Finnhub, cache={cache_dir})...")
-    for ticker in tickers:
+    for i, ticker in enumerate(tickers, start=1):
+        if i % _PROGRESS_EVERY == 0:
+            print(f"  fundamentals {i}/{len(tickers)} ({n_calls} calls so far)")
         path = _cache_path(cache_dir, "fundamentals", ticker)
         if path.exists() and not force_refresh:
             cached = pd.read_parquet(path)
@@ -240,12 +261,16 @@ def collect(
     return prices, fundamentals
 
 
+_MAX_LISTED = 25  # tickers printed per issue; the rest are counted
+
+
 def data_quality_report(prices: dict[str, pd.DataFrame], fundamentals: dict[str, pd.DataFrame]) -> list[str]:
     """Surface (not fix) obvious collection problems. A "no price history"
     ticker has so far always meant a delisting/merger or a ticker rename —
     check that before assuming a bug (universe.py docstring)."""
     print("\n--- Data quality report ---")
-    flagged = []
+    flagged: list[str] = []
+    by_issue: dict[str, list[str]] = {}
     for ticker in sorted(prices.keys() | fundamentals.keys()):
         price_df, fund_df = prices.get(ticker), fundamentals.get(ticker)
         issues = []
@@ -266,7 +291,12 @@ def data_quality_report(prices: dict[str, pd.DataFrame], fundamentals: dict[str,
                 issues.append("implausible PER/PBR (<1 / <0.1) — check the Finnhub symbol")
         if issues:
             flagged.append(ticker)
-            print(f"  {ticker}: {', '.join(issues)}")
+            for issue in issues:
+                by_issue.setdefault(issue, []).append(ticker)
+    for issue, names in by_issue.items():
+        shown = ", ".join(names[:_MAX_LISTED])
+        more = f" ... (+{len(names) - _MAX_LISTED})" if len(names) > _MAX_LISTED else ""
+        print(f"  {issue}: {len(names)} — {shown}{more}")
     if not flagged:
         print("  no issues found")
     return flagged

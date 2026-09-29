@@ -101,6 +101,11 @@ earliest Train years rather than breaking anything.
 """
 from __future__ import annotations
 
+from io import StringIO
+from pathlib import Path
+
+import pandas as pd
+
 UNIVERSE: dict[str, dict[str, str]] = {
     # ---- Technology (34) ----
     "AAPL": {"name": "Apple", "sector": "Technology"},
@@ -425,6 +430,86 @@ SECTORS: list[str] = sorted({meta["sector"] for meta in UNIVERSE.values()})
 # for evaluating a filter, just as known interesting cases to look at.
 MEME_STOCK_WATCHLIST: list[str] = ["GME", "AMC", "KOSS", "BB"]
 VALUE_TRAP_WATCHLIST: list[str] = ["T", "VZ", "MO", "PM", "F", "M", "LUMN"]
+
+
+# ---- Mid/small-cap extension (2026-09-29) ---------------------------------
+# The 281 names above are the "large" core. Per user request the universe is
+# extended with the S&P MidCap 400 and SmallCap 600 constituents (~1,000
+# more), for statistical power and because published evidence that
+# fair-value residuals predict returns (Bartram & Grinblatt 2018) leans on
+# smaller, less efficiently priced stocks. Results are reported per
+# size_group as well as overall.
+#
+# SOURCE: Wikipedia's constituent tables, fetched once on the first build and
+# frozen as CSV under <cache_dir>/universe/ (delete the file to refresh), so
+# later runs use the same list. The cloud session that wrote this could not
+# reach Wikipedia; the column matching below is deliberately loose.
+#
+# LIMITS — read before trusting a return result from the extended universe:
+#   - survivorship: today's members only. Small caps delist far more often
+#     than large caps and yfinance has no history for most delisted tickers,
+#     so cheap stocks that later failed are missing — a return test on this
+#     universe is biased toward "cheap stocks did well". The fair-value fit
+#     (each date compared within itself) is much less affected.
+#   - size_group is today's index membership, used only to split reports,
+#     never as a model input (it is decided by market cap, i.e. price).
+#     Core names that aren't S&P 500 members (GME, AMC, KOSS, BB...) stay
+#     "large" unless the fetched lists place them in 400/600.
+INDEX_PAGES = {
+    "sp400": ("mid", "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"),
+    "sp600": ("small", "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies"),
+}
+# Wikipedia uses GICS names; the core list uses these two shorter ones.
+_GICS_TO_SECTOR = {"Information Technology": "Technology", "Health Care": "Healthcare"}
+
+
+def parse_constituents(html: str) -> pd.DataFrame:
+    """ticker / name / sector from the first table on a Wikipedia index page
+    that has a symbol and a GICS sector column. Tickers keep Wikipedia's
+    class-share dot (MOG.A; data.py maps it for yfinance)."""
+    for table in pd.read_html(StringIO(html)):
+        cols = {str(c).strip().lower(): c for c in table.columns}
+        symbol = next((cols[c] for c in cols if c in ("symbol", "ticker", "ticker symbol")), None)
+        sector = next((cols[c] for c in cols if "sector" in c), None)
+        name = next((cols[c] for c in cols if c in ("security", "company", "name")), None)
+        if symbol is None or sector is None:
+            continue
+        out = pd.DataFrame({
+            "ticker": table[symbol].astype(str).str.strip().str.upper(),
+            "name": table[name].astype(str).str.strip() if name is not None else "",
+            "sector": table[sector].astype(str).str.strip().replace(_GICS_TO_SECTOR),
+        })
+        return out[out["ticker"].str.match(r"^[A-Z][A-Z0-9.\-]*$")].drop_duplicates("ticker").reset_index(drop=True)
+    raise ValueError("no constituents table (symbol + sector columns) found")
+
+
+def _index_members(index: str, cache_dir: Path) -> pd.DataFrame:
+    path = Path(cache_dir) / "universe" / f"{index}.csv"
+    if path.exists():
+        return pd.read_csv(path)
+    import requests
+
+    _, url = INDEX_PAGES[index]
+    response = requests.get(url, headers={"User-Agent": "stock-valuation-model/1.0 (research)"}, timeout=30)
+    response.raise_for_status()
+    members = parse_constituents(response.text).assign(fetched=pd.Timestamp.today().date().isoformat())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    members.to_csv(path, index=False)
+    print(f"  {index}: {len(members)} constituents fetched from Wikipedia -> {path}")
+    return members
+
+
+def load_universe(cache_dir: str | Path, indexes: tuple[str, ...] = tuple(INDEX_PAGES)) -> dict[str, dict[str, str]]:
+    """The core UNIVERSE (size_group "large") plus each index's members.
+    A ticker in both keeps its core sector label but takes the index's
+    size_group."""
+    universe = {t: {**meta, "size": "large"} for t, meta in UNIVERSE.items()}
+    for index in indexes:
+        size, _ = INDEX_PAGES[index]
+        for row in _index_members(index, Path(cache_dir)).itertuples():
+            base = universe.get(row.ticker, {"name": row.name, "sector": row.sector})
+            universe[row.ticker] = {**base, "size": size}
+    return universe
 
 
 def tickers_by_sector(sector: str) -> list[str]:

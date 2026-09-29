@@ -72,6 +72,11 @@ VALUATION_INDICATORS = ["trailing_pe", "price_to_book", "price_to_sales", "ev_to
 QUALITY_INDICATORS = ["return_on_equity", "debt_to_equity", "operating_margin", "revenue_growth_yoy"]
 MOMENTUM_INDICATORS = ["ma50_vs_ma200", "pct_from_52w_high"]
 
+# ---- Universe --------------------------------------------------------------
+# Index pages (universe.INDEX_PAGES) added on top of the 281-name core list.
+# () = core only. See universe.py for the survivorship caveat.
+UNIVERSE_INDEXES = ("sp400", "sp600")
+
 # ---- Fair-value model (fair_value.py) -------------------------------------
 # Multiples the model learns to explain. Rows outside [min, max] are neither
 # trained on nor given a gap for that multiple:
@@ -192,7 +197,12 @@ FAIR_VALUE_FEATURES = [
 # single multiples (FAIR_VALUE_TARGETS extra_features); they stay here for
 # the others. op_margin_avg_3y / roe_avg_3y (3-year means, less exposed to a
 # one-off quarter) added 2026-09-29.
+# log_revenue / log_book_value (2026-09-29, with the mid/small-cap extension):
+# company size without the snapshot price — market cap is price-derived and
+# would explain away cheapness like momentum does (features._size_features).
 FAIR_VALUE_FEATURE_CANDIDATES = [
+    "log_revenue",
+    "log_book_value",
     "op_margin_avg_3y",
     "roe_avg_3y",
     "roic",
