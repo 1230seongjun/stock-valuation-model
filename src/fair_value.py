@@ -12,7 +12,9 @@ adjusts for that; this model does the same adjustment systematically.
 
 METHOD (per as_of date, per multiple in config.FAIR_VALUE_TARGETS):
   1. Cross-section = every stock at that as_of whose multiple is within the
-     config bounds [min, max] (outside = undefined, distorted or bad data).
+     config bounds [min, max] (outside = undefined, distorted or bad data),
+     minus the multiple's exclude_sectors (Financials for PSR, EV/EBITDA and
+     P/FCF — see config).
   2. Features = config.FAIR_VALUE_FEATURES, winsorized and median-imputed
      within that cross-section (+ a missing flag per feature), plus sector
      one-hot. Target = log(multiple).
@@ -183,7 +185,8 @@ def _fit_cross_section(
     col = spec["column"]
     if col not in cs.columns:  # panel built before this multiple existed
         return None
-    eligible = cs[(cs[col] >= spec["min"]) & (cs[col] <= spec["max"])]
+    in_scope = ~cs["sector"].isin(spec.get("exclude_sectors", ()))
+    eligible = cs[in_scope & (cs[col] >= spec["min"]) & (cs[col] <= spec["max"])]
     if len(eligible) < FAIR_VALUE_MIN_ROWS:
         return None
 

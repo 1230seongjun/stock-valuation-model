@@ -33,6 +33,14 @@ FLAGS (heuristics to prompt a second look, not verdicts):
     reason the model can't see.
   - transition_flag/type: snapshot where the label flipped 저평가 -> 고평가,
     attributed to price vs. EPS movement (classify_valuation_transition).
+  - report_lag_flag: the quoted price moved more than REPORT_LAG_MOVE_LIMIT
+    (log) since the fiscal quarter the fundamentals come from. The rescaled
+    multiples assume the business is unchanged since then; after a spin-off
+    the price already reflects the smaller company while the TTM figures
+    still include the spun-off part, so every multiple looks cheap at once
+    (suspected for HON on 2026-09-29: -82% with 5/5 views agreeing). Also
+    fires on a genuine crash/rally the statements haven't caught up with.
+    Label unchanged — it tells you to check the news first.
 """
 from __future__ import annotations
 
@@ -59,6 +67,10 @@ VALUE_TRAP_WEAK_GROWTH_PERCENTILE = 40.0
 # |log change| between consecutive snapshots that counts as "this moved".
 TRANSITION_PRICE_THRESHOLD = 0.15
 TRANSITION_EARNINGS_THRESHOLD = 0.15
+
+# |log(price now / price at the fundamentals' period end)| above this
+# (~ -33% / +49%) sets report_lag_flag. A heuristic, not tuned on any split.
+REPORT_LAG_MOVE_LIMIT = 0.4
 
 # Drivers smaller than this (log units, ~5%) are left out of explanations.
 MIN_DRIVER_EFFECT = 0.05
@@ -136,6 +148,30 @@ def flag_value_trap(panel: pd.DataFrame, lookback_periods: int = VALUE_TRAP_LOOK
         f"{VALUE_TRAP_WEAK_GROWTH_PERCENTILE:.0f}% 이내 — 모델이 못 보는 이유로 계속 싼 것일 수 있음(밸류트랩 후보)",
         "",
     )
+    return df
+
+
+def flag_report_lag(panel: pd.DataFrame, limit: float = REPORT_LAG_MOVE_LIMIT) -> pd.DataFrame:
+    """report_lag_flag (see module docstring). The price move since the
+    fundamentals' period end is read back from the rescaling itself: every
+    price multiple was multiplied by the same price ratio, so rescaled /
+    reported recovers it (first multiple that has both). A panel without
+    *_reported columns (built before rescaling) is left unflagged."""
+    df = panel.copy()
+    move = pd.Series(np.nan, index=df.index)
+    for col in ("price_to_book", "price_to_sales", "trailing_pe", "price_to_fcf"):
+        if f"{col}_reported" in df.columns:
+            ratio = df[col] / df[f"{col}_reported"]
+            move = move.fillna(np.log(ratio.where(ratio > 0)))
+    df["price_move_since_report"] = np.expm1(move)
+    df["report_lag_flag"] = (move.abs() > limit).fillna(False).astype(bool)
+    period = df.get("fundamentals_period", pd.Series(pd.NaT, index=df.index))
+    df["report_lag_reason"] = [
+        f"마지막 재무 기준일({pd.Timestamp(p).date() if pd.notna(p) else '?'}) 이후 주가 {m:+.0%} — "
+        "분사·인수합병·실적 충격이 아직 재무 지표에 반영되지 않았을 수 있음 (배수 괴리가 과장될 수 있으니 뉴스 먼저 확인)"
+        if hit else ""
+        for hit, p, m in zip(df["report_lag_flag"], period, df["price_move_since_report"])
+    ]
     return df
 
 
@@ -257,6 +293,8 @@ def explain(row: pd.Series) -> str:
                 f"{spec['label']} {actual:.1f}배 (적정 {fair:.1f}배, {np.expm1(gap):+.0%}){excluded} — 적정 "
                 f"{spec['label']}{particle} {_driver_text(row, key)}"
             )
+        elif row.get("sector") in spec.get("exclude_sectors", ()):
+            continue  # one summary line below instead of one per multiple
         elif pd.isna(actual) or actual <= 0:
             why = "적자라 계산 불가" if key == "pe" and row.get("loss_flag") else "값 없음(적자·자본잠식 또는 데이터 누락)"
             lines.append(f"{spec['label']}: {why}")
@@ -273,6 +311,9 @@ def explain(row: pd.Series) -> str:
             lines.append(f"{spec['label']} {actual:.2f}배: 비정상적으로 작은 값 — 데이터 오류 가능성")
         else:
             lines.append(f"{spec['label']}: 같은 시점 비교 종목 부족")
+    skipped = [spec["label"] for spec in FAIR_VALUE_TARGETS.values() if row.get("sector") in spec.get("exclude_sectors", ())]
+    if skipped:
+        lines.append(f"{'·'.join(skipped)}: 금융업은 매출·EBITDA·현금흐름의 의미가 달라 비교하지 않음 (PER·PBR로만 판단)")
     if row.get("loss_flag"):
         lines.append(
             "최근 12개월 적자 — 일회성 손상인지 구조적 부진인지 재무 지표만으로 구분할 수 없어 판단을 보류함 "
@@ -294,6 +335,7 @@ def screen(panel: pd.DataFrame) -> pd.DataFrame:
     df = add_labels(df)
     df = flag_meme_stock(df)
     df = flag_value_trap(df)
+    df = flag_report_lag(df)
     return classify_valuation_transition(df)
 
 
@@ -306,7 +348,8 @@ REPORT_COLUMNS = [
     "dividend_yield", "dividend_years_no_cut",
     "sector_valuation_rank", "quality_score",
     "momentum_score", "loss_flag", "meme_flag", "value_trap_flag", "transition_flag", "transition_type",
-    "meme_reason", "value_trap_reason", "transition_reason", "explanation",
+    "report_lag_flag", "price_move_since_report",
+    "meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason", "explanation",
 ]
 
 

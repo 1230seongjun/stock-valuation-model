@@ -89,12 +89,21 @@ MOMENTUM_INDICATORS = ["ma50_vs_ma200", "pct_from_52w_high"]
 # gain inflated net income, not EBITDA); P/FCF checks earnings against cash.
 # EV/Sales (~PSR) and P/TBV (~PBR, 66 quarters, negative for goodwill-heavy
 # firms) were left out so no single angle is counted twice.
+# exclude_sectors (2026-09-29): for banks, brokers and insurers "sales"
+# (interest + fee income), EBITDA (interest is the business) and FCF (loans
+# and deposits run through operating cash flow) don't mean what they do for
+# other companies. On the 2026-09-29 panel GS came out PSR +277% / P/FCF
+# +395% "고평가" while its PER/PBR gaps were -22% / -4%; AXP PSR +283%.
+# Financials are judged on PER and PBR only.
 FAIR_VALUE_TARGETS = {
     "pe": {"column": "trailing_pe", "min": 1.0, "max": 100.0, "label": "PER"},
     "pb": {"column": "price_to_book", "min": 0.1, "max": 20.0, "label": "PBR"},
-    "ps": {"column": "price_to_sales", "min": 0.05, "max": 40.0, "label": "PSR"},
-    "ev_ebitda": {"column": "ev_to_ebitda", "min": 1.0, "max": 60.0, "label": "EV/EBITDA"},
-    "pfcf": {"column": "price_to_fcf", "min": 1.0, "max": 100.0, "label": "P/FCF"},
+    "ps": {"column": "price_to_sales", "min": 0.05, "max": 40.0, "label": "PSR",
+           "exclude_sectors": ("Financials",)},
+    "ev_ebitda": {"column": "ev_to_ebitda", "min": 1.0, "max": 60.0, "label": "EV/EBITDA",
+                  "exclude_sectors": ("Financials",)},
+    "pfcf": {"column": "price_to_fcf", "min": 1.0, "max": 100.0, "label": "P/FCF",
+             "exclude_sectors": ("Financials",)},
 }
 
 # Finnhub's quarterly multiples are computed at the fiscal period-end price,
@@ -123,6 +132,17 @@ RESCALE_MULTIPLES_TO_AS_OF_PRICE = True
 # on), with in-sample R^2 0.84 vs 0.54 out-of-fold (overfitting). Ridge stays:
 # same Val performance, stable economically-signed coefficients. Revisit if
 # the feature set grows (nonlinear models gain more with more features).
+#
+# 2026-09-29 compare-features (92 snapshots, each candidate added alone to
+# the 6 original features): only gross_margin, current_ratio and sga_to_sales
+# raised out-of-fold R^2 on Train AND Val for all five multiples, so they
+# were moved in. Change in R^2 train/val:
+#                 PER          PBR          PSR          EV/EBITDA    P/FCF
+#   gross_margin  +.020/+.014  +.014/+.006  +.139/+.118  +.044/+.039  +.007/+.011
+#   current_ratio +.002/+.004  +.004/+.003  +.027/+.035  +.033/+.039  +.020/+.022
+#   sga_to_sales  +.024/+.025  +.021/+.022  +.062/+.067  +.036/+.042  +.005/+.006
+# The rest stay candidates and get re-tested on top of this set (their
+# overlap with these three is unknown until then).
 FAIR_VALUE_FEATURES = [
     "return_on_equity",
     "operating_margin",
@@ -130,6 +150,9 @@ FAIR_VALUE_FEATURES = [
     "debt_to_equity",
     "payout_ratio_ttm",
     "volatility_63d",
+    "gross_margin",
+    "current_ratio",
+    "sga_to_sales",
 ]
 
 # Added 2026-09-28 (Finnhub statement ratios + trend + dividend history),
@@ -138,14 +161,17 @@ FAIR_VALUE_FEATURES = [
 # of the dividend ones is dividend_yield (a price drop raises the yield, the
 # same problem as momentum). dividend_growth_3y / dividend_years_no_cut
 # capture the premium the market pays for a reliable, growing dividend.
+# 2026-09-29 first round, alone on top of the original 6 (train/val):
+#   asset_turnover  PSR +.146/+.157 but PER -.006/+.001, P/FCF -.005/+.001
+#   fcf_margin      helps 4 of 5; PER -.002/-.008
+#   roic            PBR/PER up, others ~0 or slightly down
+#   revenue_cagr_3y, dividend_growth_3y, dividend_years_no_cut: ~0 or down
+#   net_debt_to_capital, op_margin_volatility: mixed
 FAIR_VALUE_FEATURE_CANDIDATES = [
     "roic",
-    "gross_margin",
     "fcf_margin",
     "net_debt_to_capital",
-    "current_ratio",
     "asset_turnover",
-    "sga_to_sales",
     "revenue_cagr_3y",
     "op_margin_volatility",
     "dividend_growth_3y",

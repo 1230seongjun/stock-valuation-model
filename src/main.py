@@ -142,7 +142,7 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
             rank = f"{row['cheapness_rank']:.0f}" if pd.notna(row["cheapness_rank"]) else "-"
             print(f"{row['ticker']} ({row['sector']}) {date}: {row['valuation_label']} (저평가 순위 {rank}/100)")
             print(row["explanation"])
-            for col in ("meme_reason", "value_trap_reason", "transition_reason"):
+            for col in ("meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason"):
                 if row[col]:
                     print(f"※ {row[col]}")
         return report
@@ -167,7 +167,8 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
 
     for flag, reason, title in [("meme_flag", "meme_reason", "급등락·거래량 이상"),
                                 ("value_trap_flag", "value_trap_reason", "밸류트랩 후보"),
-                                ("transition_flag", "transition_reason", "저평가→고평가 전환")]:
+                                ("transition_flag", "transition_reason", "저평가→고평가 전환"),
+                                ("report_lag_flag", "report_lag_reason", "재무 기준일 이후 주가 급변")]:
         hits = report[report[flag]]
         if not hits.empty:
             print(f"\n-- {title} ({len(hits)}) --")
@@ -182,7 +183,21 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
     return report
 
 
-VERIFY_TICKERS = ["AAPL", "MSFT", "JPM", "XOM", "KO", "TSLA"]
+# HON: suspected spin-off mismatch on 2026-09-29 (screening.flag_report_lag).
+VERIFY_TICKERS = ["AAPL", "MSFT", "JPM", "XOM", "KO", "TSLA", "HON"]
+
+
+def _yf_trailing_fcf(ticker) -> float | None:
+    """Operating cash flow - capex over the last 4 reported quarters, from
+    yfinance's cash-flow statement. Not info["freeCashflow"]: that is
+    Yahoo's *levered* FCF (after interest, a different definition), which on
+    2026-09-29 put MSFT's P/FCF at 229 and KO's at 72 against ~57 / ~26."""
+    try:
+        cf = ticker.quarterly_cashflow
+        fcf = cf.loc["Free Cash Flow"].dropna().iloc[:4]
+    except Exception:  # noqa: BLE001 — missing statement or row: no reference value
+        return None
+    return float(fcf.sum()) if len(fcf) == 4 else None
 
 
 def verify_multiples(tickers: list[str] = VERIFY_TICKERS, panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
@@ -205,9 +220,10 @@ def verify_multiples(tickers: list[str] = VERIFY_TICKERS, panel_path: str | Path
     latest = panel[panel["as_of"] == as_of].set_index("ticker")
     rows = []
     for ticker in tickers:
-        info = yf.Ticker(ticker).info
+        yf_ticker = yf.Ticker(ticker)
+        info = yf_ticker.info
         row = latest.loc[ticker] if ticker in latest.index else pd.Series(dtype=float)
-        mcap, fcf = info.get("marketCap"), info.get("freeCashflow")
+        mcap, fcf = info.get("marketCap"), _yf_trailing_fcf(yf_ticker)
         yf_values = {
             "trailing_pe": info.get("trailingPE"),
             "price_to_book": info.get("priceToBook"),

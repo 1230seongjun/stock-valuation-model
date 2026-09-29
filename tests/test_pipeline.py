@@ -30,7 +30,15 @@ from features import (
     build_as_of_dates,
     build_raw_panel,
 )
-from screening import add_labels, classify_valuation_transition, flag_meme_stock, flag_value_trap, report_at, screen
+from screening import (
+    add_labels,
+    classify_valuation_transition,
+    flag_meme_stock,
+    flag_report_lag,
+    flag_value_trap,
+    report_at,
+    screen,
+)
 
 SECTORS = ["Technology", "Healthcare", "Financials", "Utilities"]
 SECTOR_EFFECT = {"Technology": 0.4, "Healthcare": 0.2, "Financials": -0.3, "Utilities": -0.1}
@@ -141,6 +149,14 @@ def _labelled(panel: pd.DataFrame) -> pd.DataFrame:
         if f"{col}_pct" not in df.columns:
             df[f"{col}_pct"] = 50.0
     return add_labels(df)
+
+
+def screen_ready(fitted: pd.DataFrame) -> pd.DataFrame:
+    """A make_fair_value_panel after add_fair_value, with every column
+    report_at reads (labels, flags) filled in."""
+    df = _labelled(fitted)
+    df["price_spike_5d"], df["volume_zscore_63d"], df["revenue_growth_yoy_pct"] = 0.0, 0.0, 50.0
+    return classify_valuation_transition(flag_report_lag(flag_value_trap(flag_meme_stock(df))))
 
 
 # ---------------------------------------------------------------------------
@@ -309,8 +325,21 @@ def test_fair_value_recovers_planted_mispricing():
     assert (cheap["valuation_label"] == "저평가").mean() > 0.8
     assert (rich["valuation_label"] == "고평가").mean() > 0.8
     assert np.isclose(np.expm1(cheap["valuation_gap"]).median(), np.expm1(-0.6), atol=0.1)
-    # every multiple was mispriced the same way, so every view should agree
-    assert (cheap["n_gaps"] == 5).all() and cheap["gap_agreement"].mean() > 0.95
+    # every multiple was mispriced the same way, so every view should agree;
+    # Financials are only judged on PER/PBR (config exclude_sectors)
+    financial = cheap["sector"] == "Financials"
+    assert (cheap.loc[~financial, "n_gaps"] == 5).all() and (cheap.loc[financial, "n_gaps"] == 2).all()
+    assert cheap["gap_agreement"].mean() > 0.95
+
+
+def test_financials_skip_sales_ebitda_fcf_multiples():
+    out, _ = add_fair_value(make_fair_value_panel(n_dates=1))
+    fin = out[out["sector"] == "Financials"]
+    assert fin[["ps_gap", "ev_ebitda_gap", "pfcf_gap"]].isna().all().all()
+    assert fin["pe_gap"].notna().all() and (fin["valuation_basis"] == "PER+PBR").all()
+    report = report_at(screen_ready(out))
+    text = report.loc[report["sector"] == "Financials", "explanation"].iloc[0]
+    assert "금융업" in text and "PSR 값 없음" not in text
 
 
 def test_fair_value_is_out_of_fold():
@@ -335,24 +364,25 @@ def test_contributions_add_up():
 
 
 def test_out_of_range_multiples_get_no_gap():
+    # all non-Financials tickers (i % 4 != 2), so every multiple applies
     panel = make_fair_value_panel(n_dates=1)
-    panel.loc[panel["ticker"] == "T050", "trailing_pe"] = 400.0   # above max
+    panel.loc[panel["ticker"] == "T049", "trailing_pe"] = 400.0   # above max
     panel.loc[panel["ticker"] == "T051", "price_to_book"] = 0.01  # below min (data error)
-    panel.loc[panel["ticker"] == "T052", ["trailing_pe", "eps"]] = [np.nan, -1.0]  # loss, other multiples usable
-    panel.loc[panel["ticker"] == "T053", ["trailing_pe", "eps", "price_to_sales"]] = [np.nan, -1.0, np.nan]
-    panel.loc[panel["ticker"] == "T054", "price_to_sales"] = 90.0  # above PSR max
+    panel.loc[panel["ticker"] == "T053", ["trailing_pe", "eps"]] = [np.nan, -1.0]  # loss, other multiples usable
+    panel.loc[panel["ticker"] == "T055", ["trailing_pe", "eps", "price_to_sales"]] = [np.nan, -1.0, np.nan]
+    panel.loc[panel["ticker"] == "T057", "price_to_sales"] = 90.0  # above PSR max
     out, _ = add_fair_value(panel)
     out = _labelled(out).set_index("ticker")
-    assert pd.isna(out.loc["T050", "pe_gap"]) and pd.notna(out.loc["T050", "pb_gap"])
-    assert out.loc["T050", "valuation_basis"] == "PBR+PSR+EV/EBITDA+P/FCF" and out.loc["T050", "n_gaps"] == 4
+    assert pd.isna(out.loc["T049", "pe_gap"]) and pd.notna(out.loc["T049", "pb_gap"])
+    assert out.loc["T049", "valuation_basis"] == "PBR+PSR+EV/EBITDA+P/FCF" and out.loc["T049", "n_gaps"] == 4
     assert pd.isna(out.loc["T051", "pb_gap"])
-    assert pd.isna(out.loc["T054", "ps_gap"]) and "PSR" not in out.loc["T054", "valuation_basis"]
+    assert pd.isna(out.loc["T057", "ps_gap"]) and "PSR" not in out.loc["T057", "valuation_basis"]
     # loss-makers get no verdict, even when other multiples' gaps exist (kept for reference)
-    for t in ("T052", "T053"):
+    for t in ("T053", "T055"):
         row = out.loc[t]
         assert row["loss_flag"] and row["valuation_label"] == "판단 보류(적자)"
         assert pd.isna(row["valuation_gap"]) and pd.isna(row["cheapness_rank"])
-    assert pd.notna(out.loc["T052", "ps_gap"]) and pd.notna(out.loc["T052", "pb_gap"])
+    assert pd.notna(out.loc["T053", "ps_gap"]) and pd.notna(out.loc["T053", "pb_gap"])
 
 
 def test_compare_feature_sets():
@@ -437,6 +467,24 @@ def test_value_trap_and_meme_flags():
     assert not trapped.loc[("FRESH", dates[-1]), "value_trap_flag"], "newly cheap is not a trap"
     memes = flag_meme_stock(panel)
     assert memes["meme_flag"].sum() == 1 and "급등" in memes.loc[memes["meme_flag"], "meme_reason"].iloc[0]
+
+
+def test_report_lag_flag():
+    """Price move since the fundamentals' quarter, read back from rescaled /
+    reported multiples: a spin-off-sized drop is flagged, a normal move not."""
+    panel = pd.DataFrame({
+        "ticker": ["SPIN", "CALM", "OLD"],
+        "fundamentals_period": pd.to_datetime(["2026-06-30"] * 3),
+        "price_to_book": [1.0, 2.2, 3.0],
+        "price_to_book_reported": [2.5, 2.0, np.nan],   # OLD: no reported value to compare
+        "trailing_pe": [8.0, 22.0, 15.0],
+        "trailing_pe_reported": [20.0, 20.0, 15.0],
+    })
+    out = flag_report_lag(panel).set_index("ticker")
+    assert out.loc["SPIN", "report_lag_flag"] and np.isclose(out.loc["SPIN", "price_move_since_report"], -0.6)
+    assert "2026-06-30" in out.loc["SPIN", "report_lag_reason"] and "-60%" in out.loc["SPIN", "report_lag_reason"]
+    assert not out.loc["CALM", "report_lag_flag"] and out.loc["CALM", "report_lag_reason"] == ""
+    assert not out.loc["OLD", "report_lag_flag"] and np.isclose(out.loc["OLD", "price_move_since_report"], 0.0)
 
 
 def test_end_to_end():
