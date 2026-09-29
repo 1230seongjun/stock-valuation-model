@@ -176,6 +176,41 @@ def test_revenue_growth_and_trends():
     assert vol.iloc[:7].isna().all() and np.isclose(vol.iloc[-1], np.std(margin[-12:], ddof=1))
 
 
+def test_fundamental_breaks_hon_2026():
+    """HON's Finnhub quarters as fetched on 2026-09-29 (first two quarters
+    filled in): a one-off charge in Q4 2025, a one-off gain in Q2 2026 and
+    sales/share doubling in Q1 2026. A seasonal retailer's big Q4 is not a
+    break."""
+    periods = pd.date_range("2023-09-30", periods=12, freq="QE")
+    eps = [2.27, 2.60, 2.2281, 2.3601, 2.1602, 1.9624, 2.2234, 2.4497, 2.8569, 0.4619, 2.5721, 17.8343]
+    sps = [14.0, 14.6, 13.8669, 14.6393, 14.8723, 14.0027, 15.0714, 16.1523, 16.2930, 15.2803, 28.6435, 30.5053]
+    hon = add_fundamental_trends(pd.DataFrame({"period": periods, "eps": eps, "sales_per_share": sps,
+                                               "operating_margin": 0.2})).set_index("period")
+    q2_26, q1_26, q4_25, q3_25 = (pd.Timestamp(d) for d in ("2026-06-30", "2026-03-31", "2025-12-31", "2025-09-30"))
+    assert hon.loc[q2_26, "eps_one_off_period"] == q2_26 and np.isclose(hon.loc[q2_26, "eps_one_off_ratio"], 17.8343 / 2.4497)
+    assert hon.loc[q2_26, "per_share_break_period"] == q1_26 and np.isclose(hon.loc[q2_26, "per_share_break_ratio"], 28.6435 / 15.0714)
+    assert hon.loc[q4_25, "eps_one_off_period"] == q4_25 and pd.isna(hon.loc[q4_25, "per_share_break_period"])
+    assert pd.isna(hon.loc[q3_25, "eps_one_off_period"]) and pd.isna(hon.loc[q3_25, "per_share_break_period"])
+
+    retail_periods = pd.date_range("2018-03-31", periods=24, freq="QE")
+    growth = 1.02 ** np.arange(24)
+    retail = add_fundamental_trends(pd.DataFrame({
+        "period": retail_periods, "eps": np.tile([0.3, 0.4, 0.2, 2.0], 6) * growth,
+        "sales_per_share": np.tile([8.0, 8.5, 8.0, 14.0], 6) * growth, "operating_margin": 0.05}))
+    assert retail["eps_one_off_period"].isna().all() and retail["per_share_break_period"].isna().all()
+
+
+def test_normalized_pe_uses_3y_average_eps():
+    tickers, universe, prices, fundamentals = make_raw_data(n_tickers=2)
+    as_of = pd.Timestamp("2022-07-01")
+    panel = build_raw_panel(tickers, prices, fundamentals, universe, [as_of]).set_index("ticker")
+    fund = fundamentals[tickers[0]]
+    known = fund[fund["period"] + pd.Timedelta(days=45) <= as_of].tail(12)
+    row = panel.loc[tickers[0]]
+    assert np.isclose(row["normalized_pe"], row["price"] / (4 * known["eps"].mean()))
+    assert np.isclose(row["eps_ttm"], known["eps"].tail(4).sum())
+
+
 def test_as_of_dates_include_today():
     today = pd.Timestamp("2026-09-23")
     dates = build_as_of_dates(pd.Timestamp("2026-01-01"), today)
@@ -383,6 +418,36 @@ def test_out_of_range_multiples_get_no_gap():
         assert row["loss_flag"] and row["valuation_label"] == "판단 보류(적자)"
         assert pd.isna(row["valuation_gap"]) and pd.isna(row["cheapness_rank"])
     assert pd.notna(out.loc["T053", "ps_gap"]) and pd.notna(out.loc["T053", "pb_gap"])
+
+
+def test_per_multiple_features_and_reference_view():
+    """extra_features reach only their own multiple; pe_norm (in_verdict
+    False) gets a gap but stays out of the combined verdict."""
+    panel = make_fair_value_panel(n_dates=1)
+    rng = np.random.default_rng(3)
+    panel["fcf_margin"] = rng.normal(0.1, 0.03, len(panel))
+    panel["normalized_pe"] = panel["trailing_pe"] * rng.uniform(0.8, 1.2, len(panel))
+    out, _ = add_fair_value(panel)
+    non_fin = out["sector"] != "Financials"  # P/FCF skips Financials
+    assert out.loc[non_fin, "pfcf_contrib_fcf_margin"].notna().all() and "pe_contrib_fcf_margin" not in out.columns
+    assert out["pe_norm_gap"].notna().mean() > 0.9
+    assert not out["valuation_basis"].str.contains("정규화").any() and out["n_gaps"].max() == 5
+    text = report_at(screen_ready(out))["explanation"].iloc[0]
+    assert "정규화 PER" in text and "참고용, 종합 판단 제외" in text
+
+
+def test_rank_transform_caps_an_extreme_value():
+    """With rank features one absurd ROE moves a fair multiple no further
+    than the highest ordinary ROE would, and the model still fits."""
+    panel = make_fair_value_panel(n_dates=1)
+    panel.loc[panel["ticker"] == "T100", "return_on_equity"] = 50.0  # buyback-shrunk equity
+    ranked, diag = add_fair_value(panel, transform="rank")
+    contrib = ranked.set_index("ticker")["pb_contrib_return_on_equity"]
+    # coefficients differ slightly per out-of-fold fold, hence the tolerance
+    assert contrib["T100"] <= contrib.drop("T100").max() + 0.05
+    assert summarize_diagnostics(diag).loc["pb", "r2_model"].mean() > 0.5
+    table = compare_feature_sets(panel, {"current": FAIR_VALUE_FEATURES, "rank": (FAIR_VALUE_FEATURES, "rank")})
+    assert {"current", "rank"} <= set(table.columns)
 
 
 def test_compare_feature_sets():

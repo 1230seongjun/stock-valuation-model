@@ -35,12 +35,16 @@ FLAGS (heuristics to prompt a second look, not verdicts):
     attributed to price vs. EPS movement (classify_valuation_transition).
   - report_lag_flag: the quoted price moved more than REPORT_LAG_MOVE_LIMIT
     (log) since the fiscal quarter the fundamentals come from. The rescaled
-    multiples assume the business is unchanged since then; after a spin-off
-    the price already reflects the smaller company while the TTM figures
-    still include the spun-off part, so every multiple looks cheap at once
-    (suspected for HON on 2026-09-29: -82% with 5/5 views agreeing). Also
-    fires on a genuine crash/rally the statements haven't caught up with.
+    multiples assume the business is unchanged since then; a crash/rally
+    the statements haven't caught up with, or a spin-off after the quarter
+    end, breaks that (2026-09-29: ORCL -39%, KLAC -38%, GLW -39%, AMC +55%).
     Label unchanged — it tells you to check the news first.
+  - fundamental_break_flag: a quarter inside the TTM window with a one-off
+    EPS or a per-share break (features._add_fundamental_breaks) — the TTM
+    multiples mix incomparable quarters. Found on HON 2026-09-29 (one-off
+    gain + sales/share doubling made all 5 views -77%); first suspected to
+    be a spin-off price drop, which verify-multiples ruled out. Label
+    unchanged for now; evaluate reports how often it hits the tails.
 """
 from __future__ import annotations
 
@@ -56,7 +60,7 @@ from config import (
     QUALITY_INDICATORS,
     VALUATION_INDICATORS,
 )
-from fair_value import FEATURE_LABELS_KO, add_fair_value, loss_flag
+from fair_value import FEATURE_LABELS_KO, add_fair_value, loss_flag, target_features
 
 PRICE_SPIKE_THRESHOLD = 0.15
 VOLUME_ZSCORE_THRESHOLD = 3.0
@@ -175,6 +179,27 @@ def flag_report_lag(panel: pd.DataFrame, limit: float = REPORT_LAG_MOVE_LIMIT) -
     return df
 
 
+def flag_fundamental_break(panel: pd.DataFrame) -> pd.DataFrame:
+    """fundamental_break_flag + reason (see module docstring) from the
+    *_period / *_ratio columns features.py adds. A panel built before those
+    existed is left unflagged."""
+    df = panel.copy()
+    reasons = []
+    for _, row in df.iterrows():
+        parts = []
+        when, ratio = row.get("eps_one_off_period"), row.get("eps_one_off_ratio")
+        if pd.notna(when):
+            size = f"전년 같은 분기의 {ratio:.1f}배" if pd.notna(ratio) and ratio > 0 else "전년 같은 분기와 부호가 반대(적자)"
+            parts.append(f"{pd.Timestamp(when).date()} 분기 EPS가 평소와 크게 다름({size}) — 일회성 손익 의심")
+        when, ratio = row.get("per_share_break_period"), row.get("per_share_break_ratio")
+        if pd.notna(when):
+            parts.append(f"{pd.Timestamp(when).date()} 분기 주당매출이 전년 대비 {ratio:.1f}배로 급변 — 분사·인수합병·주식 수 기준 변경·데이터 오류 의심")
+        reasons.append(" / ".join(parts) + (" (최근 12개월 배수가 서로 다른 분기를 섞고 있어 괴리를 그대로 믿기 어려움)" if parts else ""))
+    df["fundamental_break_reason"] = reasons
+    df["fundamental_break_flag"] = df["fundamental_break_reason"] != ""
+    return df
+
+
 def _log_change(prev: float, cur: float) -> float:
     """ln(cur/prev), NaN when either side is missing or non-positive (a loss
     or a sign flip has no meaningful log change)."""
@@ -253,9 +278,8 @@ def classify_valuation_transition(
 def _driver_text(row: pd.Series, key: str) -> str:
     """'ROE +22%, 매출성장률 +9% / 변동성 -12%' — how each fundamental moved
     this stock's fair multiple vs. the average stock at that date."""
-    effects = {
-        driver: row.get(f"{key}_contrib_{driver}", np.nan) for driver in [*FAIR_VALUE_FEATURES, "sector"]
-    }
+    drivers = [*target_features(FAIR_VALUE_TARGETS[key], FAIR_VALUE_FEATURES), "sector"]
+    effects = {driver: row.get(f"{key}_contrib_{driver}", np.nan) for driver in drivers}
     effects = {d: v for d, v in effects.items() if pd.notna(v) and abs(v) >= MIN_DRIVER_EFFECT}
     if not effects:
         return "평균적인 종목과 비슷"
@@ -288,6 +312,8 @@ def explain(row: pd.Series) -> str:
         actual, fair, gap = row.get(spec["column"]), row.get(f"fair_{key}"), row.get(f"{key}_gap")
         if pd.notna(gap):
             excluded = " [적자라 참고용]" if row.get("loss_flag") else ""
+            if not spec.get("in_verdict", True):
+                excluded = " [참고용, 종합 판단 제외]"
             particle = "를" if spec["label"].endswith(("EBITDA", "FCF")) else "을"  # 에이/에프 end in a vowel
             lines.append(
                 f"{spec['label']} {actual:.1f}배 (적정 {fair:.1f}배, {np.expm1(gap):+.0%}){excluded} — 적정 "
@@ -305,6 +331,7 @@ def explain(row: pd.Series) -> str:
                 "ps": "매출 대비 가격이 너무 높아",
                 "ev_ebitda": "EBITDA가 너무 작아",
                 "pfcf": "잉여현금흐름이 너무 작아",
+                "pe_norm": "3년 평균 이익이 너무 작아",
             }.get(key, "기준 범위를 벗어나")
             lines.append(f"{spec['label']} {actual:.0f}배: {base} 배수로 비교하기 어려움")
         elif actual < spec["min"]:
@@ -336,6 +363,7 @@ def screen(panel: pd.DataFrame) -> pd.DataFrame:
     df = flag_meme_stock(df)
     df = flag_value_trap(df)
     df = flag_report_lag(df)
+    df = flag_fundamental_break(df)
     return classify_valuation_transition(df)
 
 
@@ -343,13 +371,14 @@ REPORT_COLUMNS = [
     "ticker", "sector", "as_of", "valuation_label", "cheapness_rank", "valuation_gap_pct", "valuation_basis",
     "n_gaps", "gap_agreement",
     "trailing_pe", "fair_pe", "price_to_book", "fair_pb", "price_to_sales", "fair_ps",
-    "ev_to_ebitda", "fair_ev_ebitda", "price_to_fcf", "fair_pfcf",
-    "pe_gap", "pb_gap", "ps_gap", "ev_ebitda_gap", "pfcf_gap",
+    "ev_to_ebitda", "fair_ev_ebitda", "price_to_fcf", "fair_pfcf", "normalized_pe", "fair_pe_norm",
+    "pe_gap", "pb_gap", "ps_gap", "ev_ebitda_gap", "pfcf_gap", "pe_norm_gap",
     "dividend_yield", "dividend_years_no_cut",
     "sector_valuation_rank", "quality_score",
     "momentum_score", "loss_flag", "meme_flag", "value_trap_flag", "transition_flag", "transition_type",
-    "report_lag_flag", "price_move_since_report",
-    "meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason", "explanation",
+    "report_lag_flag", "price_move_since_report", "fundamental_break_flag",
+    "meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason", "fundamental_break_reason",
+    "explanation",
 ]
 
 

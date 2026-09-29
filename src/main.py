@@ -27,11 +27,23 @@ from pathlib import Path
 
 import pandas as pd
 
-from config import FAIR_VALUE_FEATURE_CANDIDATES, FAIR_VALUE_FEATURES, FAIR_VALUE_TARGETS, TRAIN_START
+from config import (
+    FAIR_VALUE_FEATURE_CANDIDATES,
+    FAIR_VALUE_FEATURES,
+    FAIR_VALUE_MIN_GAIN,
+    FAIR_VALUE_TARGETS,
+    TRAIN_START,
+)
 from data import DEFAULT_CACHE_DIR, collect, data_quality_report
-from fair_value import add_fair_value, coefficient_summary, compare_feature_sets, gap_return_test, summarize_diagnostics
+from fair_value import (
+    add_fair_value,
+    coefficient_summary,
+    compare_feature_sets,
+    gap_return_test,
+    summarize_diagnostics,
+)
 from features import add_percentile_scores, build_as_of_dates, build_raw_panel
-from screening import report_at, screen as screen_panel
+from screening import flag_fundamental_break, report_at, screen as screen_panel
 from universe import TICKERS, UNIVERSE
 
 OUTPUT_DIR = Path("real_data_output")
@@ -62,11 +74,27 @@ def build(api_key: str | None = None, cache_dir: str | Path = DEFAULT_CACHE_DIR,
         print(f"    {col:24s} {missing:6.1%}{warn}")
     print(f"    dividend payers in latest snapshot: "
           f"{(panel.loc[panel['as_of'] == panel['as_of'].max(), 'dividend_yield'] > 0).mean():.0%}")
+    _check_eps_basis(panel)
 
     Path(panel_path).parent.mkdir(parents=True, exist_ok=True)
     panel.to_parquet(panel_path)
     print(f"  saved {panel_path}")
     return panel
+
+
+def _check_eps_basis(panel: pd.DataFrame) -> None:
+    """normalized_pe is built from Finnhub's quarterly EPS and yfinance's
+    quoted price. If both are on the same share basis, price / (sum of the
+    last 4 quarterly EPS) matches Finnhub's own peTTM (rescaled to the same
+    price); a stock split one side doesn't adjust for would show up here."""
+    ok = (panel["eps_ttm"] > 0) & (panel["trailing_pe"] > 0)
+    ratio = (panel.loc[ok, "price"] / panel.loc[ok, "eps_ttm"]) / panel.loc[ok, "trailing_pe"]
+    if ratio.empty:
+        return
+    close = ((ratio - 1).abs() <= 0.15).mean()
+    print(f"  EPS basis check: price / TTM EPS vs. Finnhub PER — median ratio {ratio.median():.2f}, "
+          f"{close:.0%} of rows within 15%"
+          + ("  <- check splits / share basis before trusting normalized_pe" if close < 0.8 else ""))
 
 
 def _load(panel_path: str | Path) -> pd.DataFrame:
@@ -77,14 +105,18 @@ def _load(panel_path: str | Path) -> pd.DataFrame:
 
 
 def compare_features(panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
-    """Out-of-fold R^2 of each multiple for: the current features, current +
-    each candidate alone, and current + all candidates. Keep a candidate only
-    if it helps on train AND val (test is for the final report)."""
+    """Out-of-fold R^2 of each multiple for: the current features (each
+    multiple with its extra_features), current + each candidate alone,
+    current + all candidates, and the current features rank-transformed.
+    Keep a candidate (for all multiples, or as one multiple's extra) only if
+    it gains >= FAIR_VALUE_MIN_GAIN on train AND val — the last table lists
+    those. Test is for the final report."""
     panel = _load(panel_path)
     candidates = [c for c in FAIR_VALUE_FEATURE_CANDIDATES if c in panel.columns]
     sets = {"current": FAIR_VALUE_FEATURES}
     sets.update({f"+{c}": [*FAIR_VALUE_FEATURES, c] for c in candidates})
     sets["+all"] = [*FAIR_VALUE_FEATURES, *candidates]
+    sets["rank_transform"] = (FAIR_VALUE_FEATURES, "rank")
     print(f"Comparing {len(sets)} feature sets on {panel['as_of'].nunique()} snapshots (takes a few minutes)...")
     table = compare_feature_sets(panel, sets)
     delta = table.drop(columns=["sector_median", "current"]).sub(table["current"], axis=0)
@@ -92,6 +124,17 @@ def compare_features(panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
     print(table.round(3).T.to_string())
     print("\n=== change vs. current features (positive = helps) ===")
     print(delta.round(3).T.to_string())
+
+    print(f"\n=== meets the bar (>= +{FAIR_VALUE_MIN_GAIN} on train AND val), per multiple ===")
+    hits = []
+    for name in delta.columns:
+        for key in FAIR_VALUE_TARGETS:
+            if key not in delta.index.get_level_values(0):
+                continue
+            tr, va = delta.loc[(key, "train"), name], delta.loc[(key, "val"), name]
+            if tr >= FAIR_VALUE_MIN_GAIN and va >= FAIR_VALUE_MIN_GAIN:
+                hits.append(f"    {name:24s} {FAIR_VALUE_TARGETS[key]['label']:10s} {tr:+.3f} / {va:+.3f}")
+    print("\n".join(hits) if hits else "    (none)")
     return table
 
 
@@ -113,6 +156,8 @@ def evaluate(panel_path: str | Path = PANEL_PATH) -> dict[str, pd.DataFrame]:
     print("    same_sign_share = share of dates with the same sign as the mean")
     print(coefs.pivot(index="feature", columns="target", values=["mean_coef", "same_sign_share"]).round(2).to_string())
 
+    _report_ttm_reliability(panel)
+
     tests = gap_return_test(panel)
     print("\n=== 4. Hypothesis test: did stocks called cheap later outperform? (not a model metric) ===")
     print("    ic = Spearman(cheapness, forward return) per date; spread = cheapest - most expensive quintile.")
@@ -124,6 +169,32 @@ def evaluate(panel_path: str | Path = PANEL_PATH) -> dict[str, pd.DataFrame]:
         n_sig = int(tests["significant_after_fdr"].sum())
         print(f"    {n_sig}/{len(tests)} significant after FDR")
     return {"summary": summary, "coefficients": coefs, "gap_return_test": tests}
+
+
+def _report_ttm_reliability(panel: pd.DataFrame) -> None:
+    """Evidence for two open decisions (2026-09-29): should a
+    fundamental_break_flag row get a verdict at all, and should the
+    normalized PER (3-year EPS) replace PER? Tails = cheapest / most
+    expensive 20% by valuation_gap within each as_of, like the labels."""
+    print("\n=== 2b. Trailing-12-month reliability ===")
+    if "eps_one_off_period" not in panel.columns:
+        print("    (panel built before the break checks — rebuild)")
+        return
+    df = flag_fundamental_break(panel[panel["valuation_gap"].notna()])
+    rank = df.groupby("as_of")["valuation_gap"].rank(pct=True)
+    tail = pd.Series("middle", index=df.index).mask(rank <= 0.2, "cheap 20%").mask(rank > 0.8, "expensive 20%")
+    share = df.groupby(tail)["fundamental_break_flag"].mean()
+    print("    share of labelled rows with a fundamental break (one-off EPS / per-share break in the TTM window):")
+    print("    " + ", ".join(f"{k} {v:.1%}" for k, v in share.items())
+          + f"  (all {df['fundamental_break_flag'].mean():.1%})")
+    if "pe_norm_gap" in df.columns:
+        both = df.dropna(subset=["pe_gap", "pe_norm_gap"])
+        for name, g in (("flagged", both[both["fundamental_break_flag"]]), ("not flagged", both[~both["fundamental_break_flag"]])):
+            if len(g):
+                print(f"    {name:12s} n={len(g):5d}  mean |gap| PER {g['pe_gap'].abs().mean():.2f}"
+                      f" vs normalized PER {g['pe_norm_gap'].abs().mean():.2f}  (log units)")
+        corr = both.groupby("as_of").apply(lambda g: g["pe_gap"].corr(g["pe_norm_gap"], method="spearman")).mean()
+        print(f"    mean per-date Spearman(PER gap, normalized PER gap): {corr:.2f}")
 
 
 def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker: str | None = None,
@@ -142,7 +213,8 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
             rank = f"{row['cheapness_rank']:.0f}" if pd.notna(row["cheapness_rank"]) else "-"
             print(f"{row['ticker']} ({row['sector']}) {date}: {row['valuation_label']} (저평가 순위 {rank}/100)")
             print(row["explanation"])
-            for col in ("meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason"):
+            for col in ("meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason",
+                        "fundamental_break_reason"):
                 if row[col]:
                     print(f"※ {row[col]}")
         return report
@@ -168,7 +240,8 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
     for flag, reason, title in [("meme_flag", "meme_reason", "급등락·거래량 이상"),
                                 ("value_trap_flag", "value_trap_reason", "밸류트랩 후보"),
                                 ("transition_flag", "transition_reason", "저평가→고평가 전환"),
-                                ("report_lag_flag", "report_lag_reason", "재무 기준일 이후 주가 급변")]:
+                                ("report_lag_flag", "report_lag_reason", "재무 기준일 이후 주가 급변"),
+                                ("fundamental_break_flag", "fundamental_break_reason", "최근 12개월 재무 단절")]:
         hits = report[report[flag]]
         if not hits.empty:
             print(f"\n-- {title} ({len(hits)}) --")
@@ -183,7 +256,8 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
     return report
 
 
-# HON: suspected spin-off mismatch on 2026-09-29 (screening.flag_report_lag).
+# HON: all 5 views -77% on 2026-09-29 — a one-off gain + per-share break in
+# Finnhub's data (screening.flag_fundamental_break); prices matched yfinance.
 VERIFY_TICKERS = ["AAPL", "MSFT", "JPM", "XOM", "KO", "TSLA", "HON"]
 
 

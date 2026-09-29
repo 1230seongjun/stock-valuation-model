@@ -81,6 +81,7 @@ from statsmodels.stats.multitest import multipletests
 
 from config import (
     FAIR_VALUE_CV_FOLDS,
+    FAIR_VALUE_FEATURE_TRANSFORM,
     FAIR_VALUE_FEATURES,
     FAIR_VALUE_MIN_ROWS,
     FAIR_VALUE_TARGETS,
@@ -109,6 +110,8 @@ FEATURE_LABELS_KO = {
     "op_margin_volatility": "이익률 변동성",
     "dividend_growth_3y": "3년 배당성장률",
     "dividend_years_no_cut": "배당 무삭감 연수",
+    "op_margin_avg_3y": "3년 평균 영업이익률",
+    "roe_avg_3y": "3년 평균 ROE",
     "sector": "섹터",
 }
 
@@ -142,17 +145,29 @@ def split_of(as_of: pd.Timestamp) -> str:
     return "test"
 
 
+def target_features(spec: dict, base: list[str] = FAIR_VALUE_FEATURES) -> list[str]:
+    """The features one multiple is fitted on: `base` plus that multiple's
+    extra_features (config.FAIR_VALUE_TARGETS), without duplicates."""
+    return [*base, *(f for f in spec.get("extra_features", ()) if f not in base)]
+
+
 def _prepare_features(
-    cross_section: pd.DataFrame, sectors: list[str], features: list[str] = FAIR_VALUE_FEATURES
+    cross_section: pd.DataFrame, sectors: list[str], features: list[str] = FAIR_VALUE_FEATURES,
+    transform: str = FAIR_VALUE_FEATURE_TRANSFORM,
 ) -> tuple[pd.DataFrame, dict[str, list[str]]]:
     """Design matrix for one as_of cross-section + a map from each reported
     driver ("return_on_equity", ..., "sector") to its underlying columns.
-    A feature the panel doesn't have (built before it existed) is skipped."""
+    A feature the panel doesn't have (built before it existed) is skipped.
+    transform: "winsor" clips to the config quantiles, "rank" replaces each
+    value by its percentile in this cross-section (config
+    FAIR_VALUE_FEATURE_TRANSFORM)."""
     X = pd.DataFrame(index=cross_section.index)
     groups: dict[str, list[str]] = {}
     for feat in (f for f in features if f in cross_section.columns):
         raw = cross_section[feat].astype(float)
-        if raw.notna().sum() >= 3:
+        if transform == "rank":
+            raw = raw.rank(pct=True)
+        elif raw.notna().sum() >= 3:
             lo, hi = raw.quantile([FAIR_VALUE_WINSOR_QUANTILE, 1 - FAIR_VALUE_WINSOR_QUANTILE])
             raw = raw.clip(lo, hi)
         median = raw.median()
@@ -177,7 +192,8 @@ def _fit_ridge(X: pd.DataFrame, y: pd.Series) -> tuple[RidgeCV, pd.Series, pd.Se
 
 
 def _fit_cross_section(
-    cs: pd.DataFrame, key: str, spec: dict, sectors: list[str], features: list[str] = FAIR_VALUE_FEATURES
+    cs: pd.DataFrame, key: str, spec: dict, sectors: list[str], features: list[str] = FAIR_VALUE_FEATURES,
+    transform: str = FAIR_VALUE_FEATURE_TRANSFORM,
 ) -> tuple[pd.DataFrame, dict] | None:
     """Out-of-fold fair multiple + per-driver contributions for one as_of and
     one multiple, plus diagnostics (Ridge vs. sector-median baseline on the
@@ -190,7 +206,7 @@ def _fit_cross_section(
     if len(eligible) < FAIR_VALUE_MIN_ROWS:
         return None
 
-    X, groups = _prepare_features(eligible, sectors, features)
+    X, groups = _prepare_features(eligible, sectors, features, transform)
     y = np.log(eligible[col].astype(float))
     pred = pd.Series(np.nan, index=eligible.index)
     baseline = pd.Series(np.nan, index=eligible.index)
@@ -232,12 +248,16 @@ def _fit_cross_section(
     return out, diag
 
 
-def add_fair_value(panel: pd.DataFrame, features: list[str] = FAIR_VALUE_FEATURES) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Adds fair_<m>, <m>_gap, <m>_contrib_<driver> for each multiple, plus
-    the combined verdict: valuation_gap (mean gap), n_gaps, valuation_basis
-    and gap_agreement (share of the available views pointing the same way as
-    valuation_gap — 1.0 = every multiple agrees). Returns (panel,
-    diagnostics), one diagnostics row per (as_of, multiple) that could be fit."""
+def add_fair_value(
+    panel: pd.DataFrame, features: list[str] = FAIR_VALUE_FEATURES, transform: str = FAIR_VALUE_FEATURE_TRANSFORM
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Adds fair_<m>, <m>_gap, <m>_contrib_<driver> for each multiple
+    (fitted on target_features(spec, features)), plus the combined verdict
+    over the multiples with in_verdict (default True): valuation_gap (mean
+    gap), n_gaps, valuation_basis and gap_agreement (share of the available
+    views pointing the same way as valuation_gap — 1.0 = every multiple
+    agrees). Returns (panel, diagnostics), one diagnostics row per (as_of,
+    multiple) that could be fit."""
     df = panel.reset_index(drop=True)
     sectors = sorted(df["sector"].dropna().unique())
     pieces: dict[str, list[pd.DataFrame]] = {key: [] for key in FAIR_VALUE_TARGETS}
@@ -245,7 +265,7 @@ def add_fair_value(panel: pd.DataFrame, features: list[str] = FAIR_VALUE_FEATURE
 
     for as_of, cs in df.groupby("as_of"):
         for key, spec in FAIR_VALUE_TARGETS.items():
-            result = _fit_cross_section(cs, key, spec, sectors, features)
+            result = _fit_cross_section(cs, key, spec, sectors, target_features(spec, features), transform)
             if result is None:
                 continue
             out, diag = result
@@ -253,31 +273,37 @@ def add_fair_value(panel: pd.DataFrame, features: list[str] = FAIR_VALUE_FEATURE
             diagnostics.append({"as_of": as_of, "split": split_of(as_of), **diag})
 
     for key, frames in pieces.items():
-        cols = [f"fair_{key}", f"{key}_gap"] + [f"{key}_contrib_{d}" for d in [*features, "sector"]]
+        drivers = [*target_features(FAIR_VALUE_TARGETS[key], features), "sector"]
+        cols = [f"fair_{key}", f"{key}_gap"] + [f"{key}_contrib_{d}" for d in drivers]
         fitted = pd.concat(frames) if frames else pd.DataFrame(columns=cols, dtype=float)
         df = df.drop(columns=[c for c in cols if c in df.columns]).join(fitted.reindex(columns=cols))
 
+    df = df.copy()  # defragment after the per-multiple joins
     df["loss_flag"] = loss_flag(df)
-    gaps = df[[f"{key}_gap" for key in FAIR_VALUE_TARGETS]].copy()
+    verdict = {k: s for k, s in FAIR_VALUE_TARGETS.items() if s.get("in_verdict", True)}
+    gaps = df[[f"{key}_gap" for key in verdict]].copy()
     gaps.loc[df["loss_flag"]] = np.nan  # no verdict for loss-makers, see loss_flag
     df["valuation_gap"] = gaps.mean(axis=1, skipna=True)
     df["n_gaps"] = gaps.notna().sum(axis=1)
     same_side = np.sign(gaps).eq(np.sign(df["valuation_gap"]), axis=0) & gaps.notna()
     df["gap_agreement"] = (same_side.sum(axis=1) / df["n_gaps"]).where(df["n_gaps"] > 0)
-    labels = [spec["label"] for spec in FAIR_VALUE_TARGETS.values()]
+    labels = [spec["label"] for spec in verdict.values()]
     df["valuation_basis"] = gaps.notna().apply(
         lambda row: "+".join(lbl for lbl, has in zip(labels, row) if has), axis=1
     )
     return df, pd.DataFrame(diagnostics)
 
 
-def compare_feature_sets(panel: pd.DataFrame, feature_sets: dict[str, list[str]]) -> pd.DataFrame:
+def compare_feature_sets(panel: pd.DataFrame, feature_sets: dict[str, list[str] | tuple[list[str], str]]) -> pd.DataFrame:
     """Out-of-fold R^2 per (feature set, multiple, split), same folds and
-    bounds for every set — how model features are chosen. Decide on the
-    train/val columns only; test is for the final report."""
+    bounds for every set — how model features are chosen. A set is a
+    feature list (each multiple's extra_features are added to it) or
+    (features, transform). Decide on the train/val columns only; test is for
+    the final report."""
     rows = []
-    for name, features in feature_sets.items():
-        _, diag = add_fair_value(panel, features)
+    for name, spec in feature_sets.items():
+        features, transform = spec if isinstance(spec, tuple) else (spec, FAIR_VALUE_FEATURE_TRANSFORM)
+        _, diag = add_fair_value(panel, features, transform)
         if diag.empty:
             continue
         summary = diag.groupby(["target", "split"])["r2_model"].mean().rename(name)

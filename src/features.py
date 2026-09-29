@@ -23,6 +23,13 @@ Derived indicators (see data.py for the raw fields):
   - revenue_cagr_3y: 3-year CAGR of trailing-12-month sales per share
   - op_margin_volatility: std of quarterly operating margin, last 12 quarters
     (a one-off gain/charge or a cyclical business shows up here)
+  - op_margin_avg_3y / roe_avg_3y: 12-quarter means (candidate features)
+  - normalized_pe: as_of price / (4 x mean quarterly EPS of the last 12
+    quarters) — PER on 3-year average earnings, so one quarter's one-off
+    gain or charge weighs 1/12 instead of 1/4 (a reference view, see
+    config.FAIR_VALUE_TARGETS "in_verdict")
+  - eps_one_off_* / per_share_break_*: quarters inside the TTM window that
+    make trailing figures unreliable (_add_fundamental_breaks)
   - dividend_yield / dividend_growth_3y / dividend_years_no_cut: from actual
     dividend payments (see _dividend_features)
 """
@@ -54,9 +61,11 @@ _AS_OF_FUNDAMENTAL_KEYS = [k for k in FUNDAMENTAL_INDICATORS if k != "dividend_y
     "roic", "roa", "gross_margin", "net_margin", "fcf_margin", "net_debt_to_capital",
     "current_ratio", "asset_turnover", "sga_to_sales",
     # trend features (add_fundamental_trends)
-    "revenue_cagr_3y", "op_margin_volatility",
+    "revenue_cagr_3y", "op_margin_volatility", "op_margin_avg_3y", "roe_avg_3y",
+    # TTM-reliability checks (_add_fundamental_breaks)
+    "eps_one_off_period", "eps_one_off_ratio", "per_share_break_period", "per_share_break_ratio",
     # raw components
-    "eps", "payout_ratio_ttm", "sales_per_share", "enterprise_value", "book_value",
+    "eps", "eps_ttm", "eps_avg_3y", "payout_ratio_ttm", "sales_per_share", "enterprise_value", "book_value",
 ]
 _ANOMALY_SIGNAL_KEYS = ["price_spike_5d", "volume_zscore_63d"]
 _DIVIDEND_KEYS = ["dividend_yield", "dividend_growth_3y", "dividend_years_no_cut"]
@@ -123,7 +132,78 @@ def add_fundamental_trends(fundamentals: pd.DataFrame) -> pd.DataFrame:
     df["revenue_cagr_3y"] = np.where((df["_sps_ttm"] > 0) & (df["_sps_ttm_3y"] > 0), ratio ** (1 / 3) - 1, np.nan)
 
     df["op_margin_volatility"] = df["operating_margin"].rolling(12, min_periods=8).std()
+
+    # 3-year averages: a one-off quarter weighs 1/12 instead of 1/4
+    if "return_on_equity" not in df.columns:
+        df["return_on_equity"] = np.nan
+    df["op_margin_avg_3y"] = df["operating_margin"].rolling(12, min_periods=8).mean()
+    df["roe_avg_3y"] = df["return_on_equity"].rolling(12, min_periods=8).mean()
+    eps = df["eps"] if "eps" in df.columns else pd.Series(np.nan, index=df.index)
+    df["eps_ttm"] = eps.rolling(4, min_periods=4).sum().where(consecutive)
+    consecutive_3y = (df["period"] - df["period"].shift(11)) <= pd.Timedelta(days=3 * 365)
+    df["eps_avg_3y"] = eps.rolling(12, min_periods=12).mean().where(consecutive_3y)
+
+    df = _add_fundamental_breaks(df.assign(eps=eps))
     return df.drop(columns=["_sps_1y", "_sps_ttm", "_sps_ttm_3y"])
+
+
+# A quarter counts as a break when it is off by this factor against BOTH of
+# its references (see _add_fundamental_breaks). Heuristics, not tuned on any
+# split; evaluate prints how many rows they catch.
+EPS_ONE_OFF_FACTOR = 3.0
+PER_SHARE_BREAK_FACTOR = 1.5
+
+
+def _add_fundamental_breaks(df: pd.DataFrame) -> pd.DataFrame:
+    """Quarters that make trailing-12-month figures unreliable, found on
+    2026-09-29 for HON: Q2 2026 EPS 17.83 vs ~2.2-2.9 normally (a one-off
+    gain, operating margin 77%) and sales/share doubling from Q1 2026 while
+    the price didn't move (per-share basis change or data error). Together
+    they made every multiple look cheap at once (-77%, 5/5 views agreeing).
+      one-off EPS      — quarter EPS vs. the median of the 8 quarters before
+                         it AND vs. the same quarter a year earlier, both
+                         beyond x3 (or below x1/3, including a loss).
+                         Needing both keeps seasonal businesses (a retailer's
+                         Q4) from being flagged every year.
+      per-share break  — quarter sales/share vs. the previous quarter AND
+                         vs. a year earlier, both beyond x1.5 or x1/1.5
+                         (spin-off, merger, share-count change, data error;
+                         also a genuinely explosive quarter like NVDA 2023,
+                         where trailing multiples mislead as well).
+    For each row: the latest such quarter within its TTM window (itself and
+    the 3 quarters before, if they span <= 300 days) as *_period / *_ratio
+    (ratio vs. a year earlier), NaT/NaN if none. Uses only this row's and
+    earlier periods, like the other trends."""
+    df = _match_prior(df, "eps", 365, "_eps_1y")
+    df = _match_prior(df, "sales_per_share", 365, "_sps_yoy")
+    eps, sps = df["eps"], df["sales_per_share"]
+
+    median_8q = eps.shift(1).rolling(8, min_periods=6).median()
+    vs_median = eps / median_8q.where(median_8q > 0)
+    vs_year = eps / df["_eps_1y"].where(df["_eps_1y"] > 0)
+    off = lambda r: (r > EPS_ONE_OFF_FACTOR) | (r < 1 / EPS_ONE_OFF_FACTOR)
+    eps_hit = (off(vs_median) & off(vs_year)).to_numpy()
+
+    prev_q = sps.shift(1)
+    vs_prev = sps / prev_q.where(prev_q > 0)
+    sps_vs_year = sps / df["_sps_yoy"].where(df["_sps_yoy"] > 0)
+    jump = lambda r: (r > PER_SHARE_BREAK_FACTOR) | (r < 1 / PER_SHARE_BREAK_FACTOR)
+    sps_hit = (jump(vs_prev) & jump(sps_vs_year)).to_numpy()
+
+    periods = df["period"].to_numpy()
+    for name, hits, ratios in (("eps_one_off", eps_hit, vs_year.to_numpy()),
+                               ("per_share_break", sps_hit, sps_vs_year.to_numpy())):
+        when, ratio = [pd.NaT] * len(df), [np.nan] * len(df)
+        for i in range(len(df)):
+            for j in range(i, max(i - 4, -1), -1):  # this quarter back to 3 before
+                if periods[i] - periods[j] > np.timedelta64(300, "D"):
+                    break
+                if hits[j]:
+                    when[i], ratio[i] = periods[j], ratios[j]
+                    break
+        df[f"{name}_period"] = pd.to_datetime(when)
+        df[f"{name}_ratio"] = ratio
+    return df.drop(columns=["_eps_1y", "_sps_yoy"])
 
 
 def apply_reporting_lag(fundamentals: pd.DataFrame, lag_days: int = REPORTING_LAG_DAYS) -> pd.DataFrame:
@@ -316,6 +396,8 @@ def build_raw_panel(
             row = {"as_of": as_of, "ticker": ticker, "sector": sector, "price": price}
             row.update(_as_of_fundamentals(fund_df, as_of))
             _rescale_multiples(row, quoted_now)
+            # already at the as_of price (no Finnhub period-end price involved)
+            row["normalized_pe"] = price / (4 * row["eps_avg_3y"]) if row["eps_avg_3y"] > 0 else np.nan
             row.update(_dividend_features(payments, as_of, price))
             row.update(_technicals_asof(close, volume))
             row.update(_anomaly_signals_asof(close, volume))
@@ -323,7 +405,11 @@ def build_raw_panel(
                 row[f"fwd_return_{h}m"] = _forward_log_return(price_df, as_of, close.iloc[-1], h)
             rows.append(row)
 
-    return pd.DataFrame(rows)
+    panel = pd.DataFrame(rows)
+    for col in ("eps_one_off_period", "per_share_break_period"):  # all-NaT vs. mixed rows infer different units
+        if col in panel.columns:
+            panel[col] = pd.to_datetime(panel[col]).astype("datetime64[ns]")
+    return panel
 
 
 def add_percentile_scores(panel: pd.DataFrame) -> pd.DataFrame:

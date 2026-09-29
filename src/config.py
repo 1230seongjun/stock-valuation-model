@@ -95,16 +95,37 @@ MOMENTUM_INDICATORS = ["ma50_vs_ma200", "pct_from_52w_high"]
 # other companies. On the 2026-09-29 panel GS came out PSR +277% / P/FCF
 # +395% "고평가" while its PER/PBR gaps were -22% / -4%; AXP PSR +283%.
 # Financials are judged on PER and PBR only.
+# extra_features (2026-09-29): features used for that multiple only, on top
+# of FAIR_VALUE_FEATURES — a candidate that clearly helps one multiple can be
+# irrelevant to another (FCF margin says a lot about P/FCF, little about
+# PBR). Same rule as for FAIR_VALUE_FEATURES, per multiple, with a minimum
+# gain so tiny noise-level wins aren't collected: out-of-fold R^2 up by at
+# least FAIR_VALUE_MIN_GAIN on Train AND Val, second-round compare-features
+# of 2026-09-29 (base = the 9 FAIR_VALUE_FEATURES, Financials excluded):
+#   P/FCF  + fcf_margin            +.046/+.026
+#   PSR    + asset_turnover        +.078/+.088
+#   PBR    + asset_turnover        +.015/+.033
+#   PBR    + net_debt_to_capital   +.012/+.026
+# Just short: asset_turnover for EV/EBITDA (+.008/+.005), roic for PER
+# (+.009/+.016) and PBR (+.007/+.015).
+# in_verdict=False: shown in the report, left out of valuation_gap (the
+# combined verdict). pe_norm (PER on 3-year average EPS, 2026-09-29) is a
+# candidate replacement for PER that one-off quarters distort less; whether
+# it replaces PER is decided from the reference runs, not assumed.
 FAIR_VALUE_TARGETS = {
     "pe": {"column": "trailing_pe", "min": 1.0, "max": 100.0, "label": "PER"},
-    "pb": {"column": "price_to_book", "min": 0.1, "max": 20.0, "label": "PBR"},
+    "pb": {"column": "price_to_book", "min": 0.1, "max": 20.0, "label": "PBR",
+           "extra_features": ("asset_turnover", "net_debt_to_capital")},
     "ps": {"column": "price_to_sales", "min": 0.05, "max": 40.0, "label": "PSR",
-           "exclude_sectors": ("Financials",)},
+           "exclude_sectors": ("Financials",), "extra_features": ("asset_turnover",)},
     "ev_ebitda": {"column": "ev_to_ebitda", "min": 1.0, "max": 60.0, "label": "EV/EBITDA",
                   "exclude_sectors": ("Financials",)},
     "pfcf": {"column": "price_to_fcf", "min": 1.0, "max": 100.0, "label": "P/FCF",
-             "exclude_sectors": ("Financials",)},
+             "exclude_sectors": ("Financials",), "extra_features": ("fcf_margin",)},
+    "pe_norm": {"column": "normalized_pe", "min": 1.0, "max": 100.0, "label": "정규화 PER",
+                "in_verdict": False},
 }
+FAIR_VALUE_MIN_GAIN = 0.01
 
 # Finnhub's quarterly multiples are computed at the fiscal period-end price,
 # but a snapshot is 45-135 days later. When True, features.build_raw_panel
@@ -167,7 +188,13 @@ FAIR_VALUE_FEATURES = [
 #   roic            PBR/PER up, others ~0 or slightly down
 #   revenue_cagr_3y, dividend_growth_3y, dividend_years_no_cut: ~0 or down
 #   net_debt_to_capital, op_margin_volatility: mixed
+# Second round: fcf_margin, asset_turnover and net_debt_to_capital went into
+# single multiples (FAIR_VALUE_TARGETS extra_features); they stay here for
+# the others. op_margin_avg_3y / roe_avg_3y (3-year means, less exposed to a
+# one-off quarter) added 2026-09-29.
 FAIR_VALUE_FEATURE_CANDIDATES = [
+    "op_margin_avg_3y",
+    "roe_avg_3y",
     "roic",
     "fcf_margin",
     "net_debt_to_capital",
@@ -180,6 +207,12 @@ FAIR_VALUE_FEATURE_CANDIDATES = [
 
 FAIR_VALUE_CV_FOLDS = 5             # out-of-fold by ticker within each as_of
 FAIR_VALUE_WINSOR_QUANTILE = 0.02   # clip each feature to [2%, 98%] per as_of
+# "winsor": raw values clipped as above. "rank": each feature replaced by its
+# percentile within the as_of cross-section, so one extreme value (AAPL's
+# buyback-inflated ROE drove its fair PSR +108% on 2026-09-29) can move a
+# fair multiple no more than the most extreme rank. compare-features runs
+# both; switch only if rank helps on Train and Val.
+FAIR_VALUE_FEATURE_TRANSFORM = "winsor"
 FAIR_VALUE_MIN_ROWS = 50            # skip an as_of with fewer usable rows
 RIDGE_ALPHAS = [0.01, 0.1, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0]
 
