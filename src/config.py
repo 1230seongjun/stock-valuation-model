@@ -248,6 +248,13 @@ FAIR_VALUE_MIN_GAIN = 0.01
 # Learning curve (random ticker subsets, same model): Val R^2 75% -> 100% of
 # tickers +.002 (PSR) to +.019 (P/FCF) — flattening, sample size is not the
 # main limit; more dates add no training rows (each date is fitted alone).
+# Large errors (|residual| > .8, criteria fixed in advance: RR >= 1.5 in Val
+# AND Test, >= 5% of rows): per-share sales jump 1.8/2.1, loss 1.9/2.1, ROE
+# bottom 20% 1.5/1.6; turnaround, top growth, 1-2 multiples ~1.5 (borderline);
+# one-off EPS 1.4/1.5; small caps 1.2. 39% of large errors carry no flag.
+# Confidence score (logistic on flags + high-error sectors, fitted on Train):
+# low-confidence group's large-error rate 1.7-2.0x the rest in Val/Test, AUC
+# .62 — below the pre-set 2x, so no confidence rating; flags stay warnings.
 
 # Finnhub's quarterly multiples are computed at the fiscal period-end price,
 # but a snapshot is 45-135 days later. When True, features.build_raw_panel
