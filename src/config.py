@@ -220,6 +220,34 @@ FAIR_VALUE_TARGETS = {
                 "in_verdict": False, "extra_features": ("log_book_value", "roe_avg_3y")},
 }
 FAIR_VALUE_MIN_GAIN = 0.01
+# Tried and rejected 2026-09-30 (judged on R^2, Spearman, stability and
+# top-20% overlap, not R^2 alone):
+#   - within-(date, sector) percentiles of the common features, added
+#     (all within +-.005) or instead of the global ones (PER -.034/-.033):
+#     sector one-hots on date-ranked features already carry it.
+#   - combined gap from standardized residuals (gap / 1.4826 MAD per date and
+#     multiple): mean of z keeps 95% of the cheap 20%, median of z 83%, but
+#     neither moves stability (val rank corr .892 -> .892/.888) or the
+#     fundamental-break share in the tails (31%); per-multiple error scales
+#     are already alike (.37-.49 log).
+#   - trajectory candidates (revenue growth acceleration, TTM revenue growth
+#     and its acceleration, 1-year operating / gross margin change): each
+#     alone within +-.005 on every multiple (below).
+#   - linear calibration of the out-of-fold prediction (y = a + b * pred on
+#     Train): b = .97-.99, MAE unchanged, 98% of labels the same.
+#   - quadratic calibration (same, fitted on Train out-of-fold predictions):
+#     only PSR's outer-5% bias shrinks consistently (-.11/-.21 -> -.07/+.04 in
+#     all splits); MAE -.002 at most, EV/EBITDA Val worse. Not worth a rule.
+# Group ablation (val R^2 lost): profitability PER .140, PBR .117, PSR .073;
+# growth <= .011 anywhere. All candidates at once: +.02 to +.06 on every
+# multiple incl. Train — many small signals the one-at-a-time rule can't see.
+# Not pursued (2026-09-30): Val has been used for many selections already, and
+# searching bundles for small gains would fit Val rather than find structure.
+# Growth left in the residual: per-date out-of-fold Ridge of each residual on
+# 9 growth variables, R^2 Train <= 0, Test <= .009 (Val up to .039, PSR only).
+# Learning curve (random ticker subsets, same model): Val R^2 75% -> 100% of
+# tickers +.002 (PSR) to +.019 (P/FCF) — flattening, sample size is not the
+# main limit; more dates add no training rows (each date is fitted alone).
 
 # Finnhub's quarterly multiples are computed at the fiscal period-end price,
 # but a snapshot is 45-135 days later. When True, features.build_raw_panel
@@ -323,6 +351,13 @@ FAIR_VALUE_FEATURE_CANDIDATES = [
     # can the model tell a one-off ROE/EPS jump from a durably high ROE?
     "roe_spike",
     "eps_spike",
+    # trajectory (2026-09-30, features._add_trajectory): improving or
+    # deteriorating growth and margins, the past-data proxy for expectations
+    "revenue_growth_accel",
+    "revenue_growth_ttm",
+    "revenue_growth_ttm_accel",
+    "op_margin_change_1y",
+    "gross_margin_change_1y",
     # removed from FAIR_VALUE_FEATURES 2026-09-30 (see there), candidates again
     "current_ratio",
     "sga_to_sales",

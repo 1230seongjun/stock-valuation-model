@@ -135,6 +135,11 @@ FEATURE_LABELS_KO = {
     "eps_spike": "이익의 평소 대비 급등",
     "sector": "섹터",
     "industry": "세부 업종",
+    "revenue_growth_accel": "매출성장 가속도",
+    "revenue_growth_ttm": "12개월 매출성장률",
+    "revenue_growth_ttm_accel": "12개월 매출성장 가속도",
+    "op_margin_change_1y": "영업이익률 1년 변화",
+    "gross_margin_change_1y": "매출총이익률 1년 변화",
 }
 
 
@@ -281,6 +286,8 @@ def _fit_cross_section(
         "r2_sector_median": 1 - float(((y - baseline) ** 2).sum()) / sst if sst else np.nan,
         "mae_model": float((y - pred).abs().mean()),
         "mae_sector_median": float((y - baseline).abs().mean()),
+        # does the model order the stocks right? (R^2 can be carried by a few outliers)
+        "spearman_model": float(stats.spearmanr(y, pred).statistic),
         "alpha": float(full_model.alpha_),
         **{f"coef_{f}": float(coefs[f]) for f in features if f in coefs.index},
     }
@@ -441,7 +448,7 @@ def summarize_diagnostics(diagnostics: pd.DataFrame) -> pd.DataFrame:
     """Mean per (multiple, split). The honest bar is r2_model vs.
     r2_sector_median: beating it means fundamentals explain multiples beyond
     "which sector is this"."""
-    metrics = ["r2_sector_median", "r2_model", "mae_sector_median", "mae_model"]
+    metrics = ["r2_sector_median", "r2_model", "spearman_model", "mae_sector_median", "mae_model"]
     summary = diagnostics.groupby(["target", "split"])[metrics].mean()
     summary["n_dates"] = diagnostics.groupby(["target", "split"]).size()
     return summary.reindex(["train", "val", "test"], level="split")
@@ -463,9 +470,63 @@ def coefficient_summary(diagnostics: pd.DataFrame) -> pd.DataFrame:
                 "target": key,
                 "feature": feat,
                 "mean_coef": coefs.mean(),
+                "median_coef": coefs.median(),
+                "q25_coef": coefs.quantile(0.25),
+                "q75_coef": coefs.quantile(0.75),
                 "same_sign_share": float((np.sign(coefs) == sign).mean()) if sign else np.nan,
             })
     return pd.DataFrame(rows)
+
+
+def _labels_from_gap(gap: pd.Series, as_of: pd.Series) -> pd.Series:
+    """저평가 / 중립 / 고평가 by the same 20% tails as screening, from a
+    combined gap (lower = cheaper)."""
+    rank = (-gap).groupby(as_of).rank(pct=True)
+    return pd.Series(np.where(rank > 0.8, "cheap", np.where(rank <= 0.2, "rich", "mid")), index=gap.index).where(rank.notna())
+
+
+def stability_summary(panel: pd.DataFrame, gap_col: str = "valuation_gap") -> pd.DataFrame:
+    """How much the verdict moves between consecutive snapshots, for tickers
+    present in both: Spearman of the combined gap, the share whose 3-way
+    label changed, and the share that jumped straight between 저평가 and
+    고평가. Mean per split. A tool that relabels half the market every
+    quarter would be describing noise."""
+    df = panel[["ticker", "as_of", gap_col]].dropna()
+    df = df.assign(label=_labels_from_gap(df[gap_col], df["as_of"]))
+    dates = sorted(df["as_of"].unique())
+    rows = []
+    for prev, cur in zip(dates, dates[1:]):
+        a = df[df["as_of"] == prev].set_index("ticker")
+        b = df[df["as_of"] == cur].set_index("ticker")
+        common = a.index.intersection(b.index)
+        if len(common) < 30:
+            continue
+        la, lb = a.loc[common, "label"], b.loc[common, "label"]
+        rows.append({
+            "as_of": cur, "split": split_of(cur),
+            "rank_corr": float(stats.spearmanr(a.loc[common, gap_col], b.loc[common, gap_col]).statistic),
+            "label_changed": float((la != lb).mean()),
+            "cheap_rich_flip": float(((la == "cheap") & (lb == "rich") | (la == "rich") & (lb == "cheap")).mean()),
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.groupby("split")[["rank_corr", "label_changed", "cheap_rich_flip"]].mean() \
+        .reindex(["train", "val", "test"])
+
+
+def top_overlap(gap_a: pd.Series, gap_b: pd.Series, as_of: pd.Series, side: str = "cheap") -> float:
+    """Mean per-date Jaccard overlap of the cheapest (or richest) 20% under
+    two versions of the combined gap (same rows) — do two model variants
+    point at the same stocks, whatever their R^2?"""
+    la, lb = _labels_from_gap(gap_a, as_of), _labels_from_gap(gap_b, as_of)
+    scores = []
+    for date in as_of.unique():
+        m = as_of == date
+        sa, sb = set(la[m][la[m] == side].index), set(lb[m][lb[m] == side].index)
+        if sa or sb:
+            scores.append(len(sa & sb) / len(sa | sb))
+    return float(np.mean(scores)) if scores else np.nan
 
 
 def _newey_west_mean_test(series: np.ndarray, lags: int) -> tuple[float, float, float]:

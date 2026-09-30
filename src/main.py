@@ -42,6 +42,7 @@ from fair_value import (
     gap_return_test,
     r2_by_group,
     split_of,
+    stability_summary,
     summarize_diagnostics,
     target_features,
 )
@@ -220,8 +221,17 @@ def evaluate(panel_path: str | Path = PANEL_PATH) -> dict[str, pd.DataFrame]:
     print("\n=== 3. What the market paid for (standardized Ridge coefficient, all dates) ===")
     print("    same_sign_share = share of dates with the same sign as the mean")
     print(coefs.pivot(index="feature", columns="target", values=["mean_coef", "same_sign_share"]).round(2).to_string())
+    print("    spread across dates: median [25% ~ 75%]")
+    spread_text = coefs.assign(
+        text=[f"{m:+.2f} [{a:+.2f}~{b:+.2f}]" for m, a, b in zip(coefs["median_coef"], coefs["q25_coef"], coefs["q75_coef"])])
+    print(spread_text.pivot(index="feature", columns="target", values="text").fillna("").to_string())
 
     _report_ttm_reliability(panel)
+
+    print("\n=== 2c. Stability between consecutive snapshots (same tickers) ===")
+    print("    rank_corr = Spearman of the combined gap; label_changed = share whose 저평가/중립/고평가 changed;")
+    print("    cheap_rich_flip = share that jumped straight between 저평가 and 고평가")
+    print(stability_summary(panel).round(3).to_string())
 
     by_size = "size_group" in panel.columns and panel["size_group"].nunique() > 1
     if by_size:

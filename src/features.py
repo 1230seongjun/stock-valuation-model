@@ -86,6 +86,9 @@ _AS_OF_FUNDAMENTAL_KEYS = [k for k in FUNDAMENTAL_INDICATORS if k != "dividend_y
     "eps_cagr_3y", "growth_consistency_3y", "eps_volatility_3y", "roe_volatility_3y",
     "gross_margin_volatility_3y", "loss_share_3y", "cash_conversion_3y",
     "earnings_cagr_3y", "earnings_turnaround_3y", "roe_spike", "eps_spike",
+    # trajectory (_add_trajectory)
+    "revenue_growth_accel", "revenue_growth_ttm", "revenue_growth_ttm_accel",
+    "op_margin_change_1y", "gross_margin_change_1y",
     # TTM-reliability checks (_add_fundamental_breaks)
     "eps_one_off_period", "eps_one_off_ratio", "per_share_break_period", "per_share_break_ratio",
     # raw components
@@ -230,7 +233,33 @@ def _add_durability(df: pd.DataFrame, eps: pd.Series) -> pd.DataFrame:
     df["loss_share_3y"] = roll((eps <= 0).astype(float).where(eps.notna())).mean()
     net = roll(df["net_margin"]).mean()
     df["cash_conversion_3y"] = (roll(df["fcf_margin"]).mean() / net).where(net > 0)
+    df = _add_trajectory(df)
     return df.drop(columns=["_eps_ttm_3y", "_ni_ttm", "_ni_ttm_3y"])
+
+
+def _add_trajectory(df: pd.DataFrame) -> pd.DataFrame:
+    """Direction, not level (candidates, 2026-09-30: the growth group added
+    <= .011 R^2 to any multiple; a price reflects where the business is
+    heading, and whether growth and margins are improving is the closest
+    thing in past statements). This row's and earlier periods only:
+      revenue_growth_accel     — revenue_growth_yoy minus its value a year earlier
+      revenue_growth_ttm       — TTM sales/share vs. a year earlier (smoother
+                                 than one quarter's YoY)
+      revenue_growth_ttm_accel — its change vs. a year earlier
+      op_margin_change_1y      — operating margin minus a year earlier
+      gross_margin_change_1y   — gross margin minus a year earlier"""
+    df = _match_prior(df, "revenue_growth_yoy", 365, "_growth_1y")
+    df["revenue_growth_accel"] = df["revenue_growth_yoy"] - df["_growth_1y"]
+    df = _match_prior(df, "sps_ttm", 365, "_sps_ttm_1y")
+    base = df["_sps_ttm_1y"].where(df["_sps_ttm_1y"] > 0)
+    df["revenue_growth_ttm"] = (df["sps_ttm"] / base - 1).where(df["sps_ttm"] > 0)
+    df = _match_prior(df, "revenue_growth_ttm", 365, "_growth_ttm_1y")
+    df["revenue_growth_ttm_accel"] = df["revenue_growth_ttm"] - df["_growth_ttm_1y"]
+    for col, out in (("operating_margin", "op_margin_change_1y"), ("gross_margin", "gross_margin_change_1y")):
+        df = _match_prior(df, col, 365, "_prior")
+        df[out] = df[col] - df["_prior"]
+        df = df.drop(columns=["_prior"])
+    return df.drop(columns=["_growth_1y", "_sps_ttm_1y", "_growth_ttm_1y"])
 
 
 # A quarter counts as a break when it is off by this factor against BOTH of

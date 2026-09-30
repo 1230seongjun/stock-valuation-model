@@ -22,7 +22,15 @@ import numpy as np
 import pandas as pd
 
 from config import FAIR_VALUE_FEATURES, HORIZONS_MONTHS
-from fair_value import add_fair_value, compare_feature_sets, gap_return_test, r2_by_group, summarize_diagnostics
+from fair_value import (
+    add_fair_value,
+    compare_feature_sets,
+    gap_return_test,
+    r2_by_group,
+    stability_summary,
+    summarize_diagnostics,
+    top_overlap,
+)
 from features import (
     _dividend_features,
     add_fundamental_trends,
@@ -198,6 +206,15 @@ def test_durability_features():
 
     assert np.isclose(steady["earnings_cagr_3y"], 0.10, atol=1e-9) and steady["earnings_turnaround_3y"] == 0
     assert steady["roe_spike"] == 0.0  # a steady ROE is not a spike, however high
+    # constant +8% sales growth and flat margins: no acceleration, no margin change
+    assert np.isclose(steady["revenue_growth_ttm"], 0.08, atol=1e-9)
+    assert np.isclose(steady["revenue_growth_accel"], 0.0, atol=1e-9) and np.isclose(steady["revenue_growth_ttm_accel"], 0.0, atol=1e-9)
+    assert steady["op_margin_change_1y"] == 0.0 and steady["gross_margin_change_1y"] == 0.0
+    speeding = add_fundamental_trends(pd.DataFrame({**base, "eps": steady_eps,
+                                                    "sales_per_share": 10 * 1.04 ** (np.arange(24) ** 2 / 40),
+                                                    "operating_margin": np.linspace(0.10, 0.20, 24)})).iloc[-1]
+    assert speeding["revenue_growth_accel"] > 0 and speeding["revenue_growth_ttm_accel"] > 0
+    assert np.isclose(speeding["op_margin_change_1y"], 4 * 0.10 / 23)
     # steady growth: TTM EPS sits a little above its 3-year average, nowhere near a one-off jump
     assert 1.0 < steady["eps_spike"] < 1.2
 
@@ -551,6 +568,24 @@ def test_compare_feature_sets():
     # the R^2-only path gives the same numbers as the full fit
     full = add_fair_value(panel)[1].groupby(["target", "split"])["r2_model"].mean()
     assert np.allclose(table["current"].dropna().sort_index(), full.reindex(table["current"].dropna().index).sort_index())
+
+
+def test_stability_and_overlap_metrics():
+    """A gap that barely moves between dates is stable; a reshuffled one is
+    not. Identical gaps overlap fully, opposite ones not at all."""
+    rng = np.random.default_rng(5)
+    tickers = [f"T{i:03d}" for i in range(200)]
+    dates = pd.date_range("2018-01-01", periods=4, freq="QS")
+    base = rng.normal(0, 1, len(tickers))
+    rows = [{"ticker": t, "as_of": d, "stable": b + rng.normal(0, 0.05), "noise": rng.normal(0, 1)}
+            for d in dates for t, b in zip(tickers, base)]
+    panel = pd.DataFrame(rows)
+    stable = stability_summary(panel, "stable").loc["train"]
+    noise = stability_summary(panel, "noise").loc["train"]
+    assert stable["rank_corr"] > 0.95 and stable["label_changed"] < 0.1
+    assert abs(noise["rank_corr"]) < 0.2 and noise["label_changed"] > 0.4 and noise["cheap_rich_flip"] > 0.05
+    assert top_overlap(panel["stable"], panel["stable"], panel["as_of"]) == 1.0
+    assert top_overlap(panel["stable"], -panel["stable"], panel["as_of"]) == 0.0
 
 
 def test_parallel_fits_match_sequential():
