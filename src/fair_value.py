@@ -98,6 +98,10 @@ from config import (
 # more than parallel fitting saves.
 _MIN_DATES_FOR_PARALLEL = 8
 
+# Features that are labels, one-hot encoded instead of ranked (the industry
+# group, universe.industry_groups). Sector is always in the model.
+CATEGORICAL_FEATURES = ("industry",)
+
 FEATURE_LABELS_KO = {
     "return_on_equity": "ROE",
     "operating_margin": "영업이익률",
@@ -130,6 +134,7 @@ FEATURE_LABELS_KO = {
     "roe_spike": "ROE의 평소 대비 급등",
     "eps_spike": "이익의 평소 대비 급등",
     "sector": "섹터",
+    "industry": "세부 업종",
 }
 
 
@@ -185,7 +190,14 @@ def _prepare_features(
     FAIR_VALUE_FEATURE_TRANSFORM)."""
     X = pd.DataFrame(index=cross_section.index)
     groups: dict[str, list[str]] = {}
-    for feat in (f for f in features if f in cross_section.columns):
+    for feat in (f for f in features if f in CATEGORICAL_FEATURES and f in cross_section.columns):
+        # one-hot like sector; one driver in explanations
+        levels = sorted(cross_section[feat].dropna().unique())
+        cols = [f"{feat}_{level}" for level in levels]
+        for level, col in zip(levels, cols):
+            X[col] = (cross_section[feat] == level).astype(float)
+        groups[feat] = cols
+    for feat in (f for f in features if f not in CATEGORICAL_FEATURES and f in cross_section.columns):
         raw = cross_section[feat].astype(float)
         if transform == "rank":
             raw = raw.rank(pct=True)

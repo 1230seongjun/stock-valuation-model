@@ -179,6 +179,52 @@ def fetch_fundamentals(ticker: str, api_key: str | None = None) -> pd.DataFrame:
     return merged.sort_values("period").reset_index(drop=True)
 
 
+def fetch_fiscal_year_ends(ticker: str, api_key: str | None = None) -> pd.DataFrame:
+    """Fiscal year-end dates (one row per `period`) from Finnhub's annual
+    series — which quarterly period is a fiscal Q4, whose numbers come with
+    the 10-K and so later (features.ANNUAL_REPORTING_LAG_DAYS). AAPL's are
+    late September on a 52/53-week calendar, WMT's January 31."""
+    raw = _finnhub_client(api_key).company_basic_financials(ticker, "all")
+    annual = (raw or {}).get("series", {}).get("annual", {})
+    periods = {d["period"] for series in annual.values() for d in series if d.get("period")}
+    return pd.DataFrame({"period": sorted(pd.to_datetime(list(periods)))})
+
+
+def collect_fiscal_year_ends(
+    tickers: list[str], api_key: str | None = None, cache_dir: str | Path = DEFAULT_CACHE_DIR,
+    force_refresh: bool = False,
+) -> dict[str, list[pd.Timestamp]]:
+    """Fiscal year-ends per ticker, cache first (a company rarely changes its
+    fiscal year; force_refresh re-fetches). Rate-limited like the
+    fundamentals; a ticker that fails or has no annual series is left out
+    and features.py falls back to December."""
+    out: dict[str, list[pd.Timestamp]] = {}
+    n_calls, failed = 0, []
+    print(f"Fiscal year-ends for {len(tickers)} tickers (Finnhub, cache={cache_dir})...")
+    for i, ticker in enumerate(tickers, start=1):
+        if i % _PROGRESS_EVERY == 0:
+            print(f"  fiscal year-ends {i}/{len(tickers)} ({n_calls} calls so far)")
+        path = _cache_path(cache_dir, "fiscal_year", ticker)
+        if path.exists() and not force_refresh:
+            out[ticker] = list(pd.read_parquet(path)["period"])
+            continue
+        if n_calls:
+            time.sleep(_MIN_INTERVAL_SEC)
+        n_calls += 1
+        df = _with_retry(lambda t: fetch_fiscal_year_ends(t, api_key), ticker, "Finnhub")
+        if df is None or df.empty:
+            failed.append(ticker)
+            continue
+        out[ticker] = list(df["period"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(path)
+    print(f"  {n_calls} Finnhub calls made ({len(tickers) - n_calls} from cache)")
+    if failed:
+        shown = ", ".join(failed[:_MAX_LISTED]) + (f" ... (+{len(failed) - _MAX_LISTED})" if len(failed) > _MAX_LISTED else "")
+        print(f"  no fiscal year-ends for {len(failed)} (December assumed): {shown}")
+    return out
+
+
 def _cache_path(cache_dir: str | Path, kind: str, ticker: str) -> Path:
     return Path(cache_dir) / kind / f"{ticker}.parquet"
 

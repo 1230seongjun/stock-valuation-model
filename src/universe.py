@@ -523,6 +523,65 @@ def load_universe(cache_dir: str | Path, indexes: tuple[str, ...] = tuple(INDEX_
     return universe
 
 
+# GICS sub-industry per ticker (2026-09-30): sectors are broad (hardware and
+# software, airlines and defense, mortgage REITs and banks share one), so
+# sub-industries that are cheap by nature land in 저평가 together. Fetched
+# once from the three Wikipedia index pages — the S&P 500 page covers most of
+# the core list — and frozen like the constituents. Membership is NOT taken
+# from these pages; only the ticker -> sub-industry map is.
+SUB_INDUSTRY_PAGES = {
+    "sp500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+    **{k: url for k, (_, url) in INDEX_PAGES.items()},
+}
+
+
+def parse_sub_industries(html: str) -> dict[str, str]:
+    """ticker -> GICS sub-industry from the first table with a symbol and a
+    sub-industry column."""
+    for table in pd.read_html(StringIO(html)):
+        cols = {str(c).strip().lower(): c for c in table.columns}
+        symbol = next((cols[c] for c in cols if c in ("symbol", "ticker", "ticker symbol")), None)
+        sub = next((cols[c] for c in cols if "sub-industry" in c or "sub industry" in c), None)
+        if symbol is None or sub is None:
+            continue
+        tickers = table[symbol].astype(str).str.strip().str.upper()
+        return dict(zip(tickers, table[sub].astype(str).str.strip()))
+    return {}
+
+
+def load_sub_industries(cache_dir: str | Path) -> dict[str, str]:
+    """ticker -> GICS sub-industry, from <cache_dir>/universe/sub_industry.csv
+    (fetched once from Wikipedia; delete the file to refresh)."""
+    path = Path(cache_dir) / "universe" / "sub_industry.csv"
+    if path.exists():
+        df = pd.read_csv(path)
+        return dict(zip(df["ticker"], df["sub_industry"]))
+    import requests
+
+    mapping: dict[str, str] = {}
+    for url in SUB_INDUSTRY_PAGES.values():
+        response = requests.get(url, headers={"User-Agent": "stock-valuation-model/1.0 (research)"}, timeout=30)
+        response.raise_for_status()
+        for ticker, sub in parse_sub_industries(response.text).items():
+            mapping.setdefault(ticker, sub)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"ticker": list(mapping), "sub_industry": list(mapping.values())}).to_csv(path, index=False)
+    print(f"  sub-industries: {len(mapping)} tickers fetched from Wikipedia -> {path}")
+    return mapping
+
+
+def industry_groups(universe: dict[str, dict[str, str]], sub_industries: dict[str, str],
+                    min_tickers: int) -> dict[str, str]:
+    """ticker -> industry group: its GICS sub-industry when at least
+    `min_tickers` universe members share it, else "<sector> 기타" (a
+    sub-industry of 2-3 stocks would give every one of them its own
+    intercept). Tickers without a sub-industry also fall back to the sector."""
+    subs = {t: sub_industries.get(t) for t in universe}
+    counts = pd.Series([s for s in subs.values() if s]).value_counts()
+    return {t: s if s and counts.get(s, 0) >= min_tickers else f"{universe[t]['sector']} 기타"
+            for t, s in subs.items()}
+
+
 def tickers_by_sector(sector: str) -> list[str]:
     """All tickers assigned to one sector — mainly useful for sanity-checking
     the universe (e.g. confirming each sector's size)."""

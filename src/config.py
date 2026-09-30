@@ -81,6 +81,17 @@ MOMENTUM_INDICATORS = ["ma50_vs_ma200", "pct_from_52w_high"]
 # Index pages (universe.INDEX_PAGES) added on top of the 281-name core list.
 # () = core only. See universe.py for the survivorship caveat.
 UNIVERSE_INDEXES = ("sp400", "sp600")
+# universe.industry_groups: a GICS sub-industry is its own group only with at
+# least this many universe members; the rest fall back to "<sector> 기타".
+# 2026-09-30, gain from the industry one-hot (train/val) by threshold:
+#   PSR   min 10 (44 groups) +.013/+.014   min 20 (13) +.014/+.015   min 30 (3) +.002/+.010
+#   PER   -.013/+.008   -.004/+.007    P/FCF  -.026/+.005   -.007/+.018
+#   PBR   +.005/+.011   +.008/+.012    EV/EBITDA +.001/+.028  -.004/+.016
+# Only PSR clears the bar (at 10 and 20; 20 is better and sparser). Other
+# multiples gain in Val/Test but lose in Train: early dates have fewer
+# members per group, and the sub-industry is today's GICS label, which fits
+# older years worse.
+INDUSTRY_MIN_TICKERS = 20
 
 # ---- Fair-value model (fair_value.py) -------------------------------------
 # Multiples the model learns to explain. Rows outside [min, max] are neither
@@ -169,11 +180,13 @@ UNIVERSE_INDEXES = ("sp400", "sp600")
 # average) did not pass for PER (-.001/+.003, +.005/+.007) and only moved
 # AAPL's ROE effect to -30/-31%. Spearman(ROE, log PER) per date is -0.23
 # even among stable earners (|eps_spike - 1| < 10%; -0.52 among spiky ones),
-# and ROA in place of ROE docks AAPL harder (-42%, R^2 .378/.419): the market
-# generally prices high current profitability to fade, and the model applies
-# that average to everyone. AAPL's gap is the market treating it as an
-# exception. (ROE + ROA together: PER +.023/+.010 — ROA is not a registered
-# candidate; it would deepen the AAPL penalty to fair PER 18.1.)
+# and ROA in place of ROE docks AAPL harder (-42%, R^2 .378/.419). Read with
+# care: ROA carries the same identity (PER = (market cap / assets) / ROA),
+# so neither test separates the arithmetic from any "profitability fades"
+# pricing — the negative coefficient mixes both, and one-off spikes are only
+# part of it. (Corrected 2026-09-30; an earlier note read ROA as proof of an
+# economic effect.) (ROE + ROA together: PER +.023/+.010 — ROA is not a
+# registered candidate; it would deepen the AAPL penalty to fair PER 18.1.)
 # The common FAIR_VALUE_FEATURES were dropped once too: operating_margin,
 # current_ratio and sga_to_sales no longer clear the bar for any multiple
 # (each <= .006) — they overlap with the features added since. Left in for
@@ -197,7 +210,7 @@ FAIR_VALUE_TARGETS = {
            "extra_features": ("net_debt_to_capital", "log_book_value", "roe_avg_3y", "log_revenue",
                               "eps_volatility_3y")},
     "ps": {"column": "price_to_sales", "min": 0.05, "max": 40.0, "label": "PSR",
-           "exclude_sectors": ("Financials",), "extra_features": ("asset_turnover", "log_revenue")},
+           "exclude_sectors": ("Financials",), "extra_features": ("asset_turnover", "log_revenue", "industry")},
     "ev_ebitda": {"column": "ev_to_ebitda", "min": 1.0, "max": 60.0, "label": "EV/EBITDA",
                   "exclude_sectors": ("Financials",), "extra_features": ("asset_turnover",)},
     "pfcf": {"column": "price_to_fcf", "min": 1.0, "max": 100.0, "label": "P/FCF",
@@ -245,6 +258,16 @@ RESCALE_MULTIPLES_TO_AS_OF_PRICE = True
 #   sga_to_sales  +.024/+.025  +.021/+.022  +.062/+.067  +.036/+.042  +.005/+.006
 # The rest stay candidates and get re-tested on top of this set (their
 # overlap with these three is unknown until then).
+# 2026-09-30 clean-up, the adoption rule run backwards: a common feature
+# goes when dropping it costs < FAIR_VALUE_MIN_GAIN on train or val for
+# EVERY verdict multiple. operating_margin, gross_margin, current_ratio and
+# sga_to_sales each failed alone, but they overlap (gross - SG&A ~ operating
+# margin), so removal was tested jointly (R^2 lost train/val):
+#   all four: >= bar in all five multiples (PBR .044/.037, P/FCF .045/.024)
+#   current_ratio + sga_to_sales: under the bar everywhere (max EV/EBITDA
+#     .009/.007) -> both removed
+#   + operating_margin: EV/EBITDA .012/.011 -> operating_margin stays
+#   + gross_margin instead: all five >= bar -> gross_margin stays
 FAIR_VALUE_FEATURES = [
     "return_on_equity",
     "operating_margin",
@@ -253,8 +276,6 @@ FAIR_VALUE_FEATURES = [
     "payout_ratio_ttm",
     "volatility_63d",
     "gross_margin",
-    "current_ratio",
-    "sga_to_sales",
 ]
 
 # Added 2026-09-28 (Finnhub statement ratios + trend + dividend history),
@@ -302,6 +323,12 @@ FAIR_VALUE_FEATURE_CANDIDATES = [
     # can the model tell a one-off ROE/EPS jump from a durably high ROE?
     "roe_spike",
     "eps_spike",
+    # removed from FAIR_VALUE_FEATURES 2026-09-30 (see there), candidates again
+    "current_ratio",
+    "sga_to_sales",
+    # GICS sub-industry group (one-hot on top of sector, 2026-09-30,
+    # universe.industry_groups / INDUSTRY_MIN_TICKERS)
+    "industry",
 ]
 
 FAIR_VALUE_CV_FOLDS = 5             # out-of-fold by ticker within each as_of
@@ -328,13 +355,13 @@ RIDGE_ALPHAS = [0.01, 0.1, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0]
 # A description, not a model input: it is built from the price on purpose.
 IMPLIED_GROWTH_YEARS = 10
 # screening.add_label_detail: delivered and priced-in excess growth closer
-# than this (per year) count as "기대와 실적 비슷" — a 3-year EPS CAGR is too
+# than this (per year) count as "요구 성장 ≈ 과거 성장" — a 3-year EPS CAGR is too
 # noisy to split on a hair (2026-09-30: AAPL +6.9% vs +6.9%, COST +7.1% vs
 # +8.8%, CRI -10.8% vs -11.8%). A judgment call, not tuned on any split.
 LABEL_DETAIL_BAND = 0.02
 # 3-year earnings growth above this per year (8x in 3 years) is marked "기저
 # 효과 가능": from a tiny base the rate says little (2026-09-30: BROS +586%/yr
-# made "실적 뒷받침" against +14% priced in). Real booms are marked too (NVDA
+# read "과거 성장 > 요구 성장" against +14% priced in). Real booms are marked too (NVDA
 # +152%) — it says "check the base", not "wrong". A judgment call.
 BASE_EFFECT_CAGR = 1.0
 

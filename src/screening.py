@@ -24,13 +24,15 @@ LABEL HISTORY (why it looks like this):
     fundamentals" is visible side by side.
 
 FLAGS (heuristics to prompt a second look, not verdicts):
-  - meme_flag: |5-day move| > 15% AND last-day volume > 3 std above its 63d
-    mean. Only sees the 5 days before each as_of, so between quarterly
+  - meme_flag ("단기 가격·거래량 이상" in the report — the rule does not
+    identify meme stocks): |5-day move| > 15% AND last-day volume > 3 std
+    above its 63d mean. Only sees the 5 days before each as_of, so between quarterly
     snapshots it misses events (e.g. GME in late Jan 2021); on the "today"
     snapshot it works as intended.
-  - value_trap_flag: 저평가 for 4 consecutive snapshots AND revenue growth in
-    the bottom 40% of its sector — cheap for a long time, possibly for a
-    reason the model can't see.
+  - value_trap_flag ("지속 할인·저성장 경고"): 저평가 for 4 consecutive
+    snapshots AND revenue growth in the bottom 40% of its sector — cheap
+    for a long time, possibly for a reason the model can't see. A warning
+    rule; whether flagged stocks are value traps was never tested.
   - transition_flag/type: snapshot where the label flipped 저평가 -> 고평가,
     attributed to price vs. EPS movement (classify_valuation_transition).
   - report_lag_flag: the quoted price moved more than REPORT_LAG_MOVE_LIMIT
@@ -153,17 +155,14 @@ def add_expectations(panel: pd.DataFrame, years: int = IMPLIED_GROWTH_YEARS) -> 
     return df
 
 
-# (label, delivered growth vs. priced in) -> detail. "above" = the company
-# delivered more excess growth than the price assumes, "below" = less.
-LABEL_DETAILS = {
-    ("고평가", "above"): "실적 뒷받침",         # the premium is growth already shown
-    ("고평가", "below"): "기대 위주",           # the premium is growth not shown yet
-    ("중립", "above"): "실적 대비 기대 낮음",
-    ("중립", "below"): "기대 위주",
-    ("저평가", "above"): "실적 대비 과도한 할인",  # the market is gloomier than the results
-    ("저평가", "below"): "실적 부진 반영",      # the discount matches weak results
-}
-SIMILAR = "기대와 실적 비슷"
+# Delivered (past 3-year) vs. required (priced-in) excess growth -> detail.
+# Named for the comparison itself, not a judgment (renamed 2026-09-30 from
+# 실적 뒷받침 / 기대 위주 / 실적 대비 과도한 할인 / 실적 부진 반영: past
+# growth exceeding what the price requires does not mean the future will
+# "back" the valuation).
+PAST_ABOVE = "과거 성장 > 요구 성장"
+REQUIRED_ABOVE = "요구 성장 > 과거 성장"
+SIMILAR = "요구 성장 ≈ 과거 성장"
 TURNAROUND = "흑자 전환"
 NO_GROWTH_HISTORY = "성장 이력 없음"
 ONE_OFF_NOTE = " (일회성 손익 가능)"
@@ -176,15 +175,16 @@ def add_label_detail(panel: pd.DataFrame, band: float = LABEL_DETAIL_BAND) -> pd
     growth the price assumes (implied_excess_growth, add_expectations) with
     the growth the company delivered, both relative to the median stock:
       realized_excess_growth = (1 + earnings_cagr_3y) / (1 + median) - 1
-    within `band` of each other -> 기대와 실적 비슷; otherwise LABEL_DETAILS
-    by which one is higher. A loss 3 years ago and a profit now (growth
+    within `band` of each other -> SIMILAR; otherwise PAST_ABOVE or
+    REQUIRED_ABOVE by which one is higher (for every label: a 저평가 stock
+    whose price requires less growth than it delivered is PAST_ABOVE). A loss 3 years ago and a profit now (growth
     undefined; 155 of the 283 undivided verdicts on 2026-09-30) -> 흑자 전환;
     anything else without a growth rate (a loss now, under 3 years of
     history) -> 성장 이력 없음. With fundamental_break_flag the delivered
     growth may be a one-off, and above BASE_EFFECT_CAGR a tiny base, so the
     detail says so. valuation_label itself
     is unchanged (the flags key on it); label_detail is added and
-    valuation_view = "고평가 · 기대 위주" for the report. "Delivered" = the
+    valuation_view = "고평가 · 요구 성장 > 과거 성장" for the report. "Delivered" = the
     past 3 years' growth rate — a description of the price, not a forecast."""
     df = panel.copy()
     median = df["earnings_cagr_3y_median"]
@@ -204,7 +204,7 @@ def add_label_detail(panel: pd.DataFrame, band: float = LABEL_DETAIL_BAND) -> pd
         elif pd.isna(d):
             detail.append(NO_GROWTH_HISTORY)
         else:
-            text = SIMILAR if abs(d) < band else LABEL_DETAILS[(label, "above" if d > 0 else "below")]
+            text = SIMILAR if abs(d) < band else (PAST_ABOVE if d > 0 else REQUIRED_ABOVE)
             detail.append(text + (ONE_OFF_NOTE if broken else "") + (BASE_EFFECT_NOTE if tiny else ""))
     df["label_detail"] = detail
     df["valuation_view"] = [f"{lbl} · {d}" if d else lbl for lbl, d in zip(df["valuation_label"], detail)]
@@ -262,7 +262,8 @@ def flag_value_trap(panel: pd.DataFrame, lookback_periods: int = VALUE_TRAP_LOOK
     df["value_trap_reason"] = np.where(
         df["value_trap_flag"],
         f"최근 {lookback_periods}개 시점 연속 저평가 + 매출성장률은 섹터 하위 "
-        f"{VALUE_TRAP_WEAK_GROWTH_PERCENTILE:.0f}% 이내 — 모델이 못 보는 이유로 계속 싼 것일 수 있음(밸류트랩 후보)",
+        f"{VALUE_TRAP_WEAK_GROWTH_PERCENTILE:.0f}% 이내 — 모델이 못 보는 이유로 계속 싼 것일 수 있음 "
+        "(지속 할인·저성장 경고; 밸류트랩인지는 검증하지 않은 규칙)",
         "",
     )
     return df

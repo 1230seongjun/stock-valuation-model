@@ -29,6 +29,7 @@ from features import (
     add_percentile_scores,
     build_as_of_dates,
     build_raw_panel,
+    is_fiscal_q4,
 )
 from screening import (
     _driver_text,
@@ -290,6 +291,34 @@ def test_no_look_ahead():
     pd.testing.assert_frame_equal(known_a, known_b)
     later = base["as_of"] > cutoff
     assert not base.loc[later, "price"].equals(scrambled.loc[later, "price"]), "scramble had no effect"
+
+
+def test_fiscal_q4_detection():
+    """52/53-week year-ends (AAPL) and non-December years (WMT) are
+    recognised in later years too; no fiscal info means December."""
+    q = lambda *dates: pd.Series(pd.to_datetime(list(dates)))
+    aapl = [pd.Timestamp("2025-09-27"), pd.Timestamp("2024-09-28")]
+    assert is_fiscal_q4(q("2026-09-26", "2026-06-27", "2025-12-27"), aapl).tolist() == [True, False, False]
+    assert is_fiscal_q4(q("2027-01-31", "2026-10-31"), [pd.Timestamp("2026-01-31")]).tolist() == [True, False]
+    assert is_fiscal_q4(q("2025-12-31", "2025-09-30")).tolist() == [True, False]
+
+
+def test_fiscal_q4_waits_for_the_10k():
+    """A fiscal Q4 is used 75 days after the period end, other quarters
+    after 45 (Finnhub filings, 2026-09-30: 10-Ks median ~53 days)."""
+    tickers, universe, prices, fundamentals = make_raw_data(n_tickers=1)
+    t = tickers[0]
+    q4_end = pd.Timestamp("2021-12-31")
+    snap = lambda day, fy=None: build_raw_panel(tickers, prices, fundamentals, universe, [q4_end + pd.Timedelta(days=day)],
+                                                fiscal_year_ends={t: fy} if fy else None).iloc[0]
+    assert snap(60)["fundamentals_period"] == pd.Timestamp("2021-09-30"), "December year: Q4 not yet filed"
+    assert snap(80)["fundamentals_period"] == q4_end
+    june_year = [pd.Timestamp("2021-06-30")]
+    assert snap(60, june_year)["fundamentals_period"] == q4_end, "a June fiscal year: December is a Q2 (10-Q)"
+    assert snap(60)["fiscal_year_end_assumed"] and not snap(60, june_year)["fiscal_year_end_assumed"]
+    # which quarter a snapshot uses, day by day around a December year-end (Q3 = Sep 30, Q4 = Dec 31)
+    for day, expected in [(1, "2021-09-30"), (45, "2021-09-30"), (74, "2021-09-30"), (75, "2021-12-31"), (91, "2021-12-31")]:
+        assert snap(day)["fundamentals_period"] == pd.Timestamp(expected), (day, snap(day)["fundamentals_period"])
 
 
 def test_no_rows_before_listing_or_after_delisting():
@@ -656,6 +685,37 @@ def test_parse_constituents_and_load_universe():
     assert loaded["PMT"]["sector"] == "Financials", "mortgage REITs are judged like other lenders"
 
 
+def test_sub_industries_and_groups():
+    import universe
+
+    html = """<table><tr><th>Symbol</th><th>Security</th><th>GICS Sector</th><th>GICS Sub-Industry</th></tr>
+    <tr><td>aaa</td><td>A</td><td>Financials</td><td>Regional Banks</td></tr>
+    <tr><td>BBB</td><td>B</td><td>Financials</td><td>Regional Banks</td></tr>
+    <tr><td>CCC</td><td>C</td><td>Financials</td><td>Mortgage REITs</td></tr></table>"""
+    subs = universe.parse_sub_industries(html)
+    assert subs == {"AAA": "Regional Banks", "BBB": "Regional Banks", "CCC": "Mortgage REITs"}
+    uni = {t: {"sector": "Financials"} for t in ("AAA", "BBB", "CCC", "DDD")}
+    groups = universe.industry_groups(uni, subs, min_tickers=2)
+    assert groups == {"AAA": "Regional Banks", "BBB": "Regional Banks",
+                      "CCC": "Financials 기타", "DDD": "Financials 기타"}  # too few / unknown -> sector
+
+
+def test_industry_group_is_learned():
+    """A planted sub-industry premium within one sector is picked up by the
+    industry one-hot, and the explanation names it."""
+    panel = make_fair_value_panel(n_dates=2)
+    tech = panel["sector"] == "Technology"
+    software = tech & (panel["ticker"].str[1:].astype(int) % 8 == 0)
+    panel["industry"] = np.where(software, "Software", panel["sector"] + " 기타")
+    for col in MULTIPLES:
+        panel.loc[software, col] *= np.exp(0.5)
+    # PSR carries the industry one-hot (config extra_features); dropping it must cost
+    table = compare_feature_sets(panel, {"current": FAIR_VALUE_FEATURES, "-industry": {"drop": ("industry",)}})
+    assert (table.loc["ps", "current"] > table.loc["ps", "-industry"] + 0.05).all()
+    out, _ = add_fair_value(panel)
+    assert out.loc[software, "ps_contrib_industry"].mean() > 0.3
+
+
 def test_size_features_are_price_free():
     """log_revenue = TTM sales/share x share count; moving every price after
     the period end must not change it (it's a size, not a valuation)."""
@@ -778,17 +838,18 @@ def test_label_detail_splits_by_delivered_growth():
         "fundamental_break_flag": [False] * 9 + [True] + [False] * 6,
     })
     out = add_label_detail(add_expectations(panel)).set_index("ticker")
-    assert out.loc["PROVEN", "label_detail"] == "실적 뒷받침"   # +13.6% delivered vs +7.2% priced in
-    assert out.loc["HOPE", "label_detail"] == "기대 위주"       # 0% delivered vs +7.2%
-    assert out.loc["GLOOM", "label_detail"] == "실적 부진 반영"  # -13.6% vs -6.7%
-    assert out.loc["UNLOVED", "label_detail"] == "실적 대비 과도한 할인"  # 0% vs -6.7%
-    assert out.loc["EVEN", "label_detail"] == "기대와 실적 비슷"  # +7.3% vs +7.2%: inside the band
+    assert out.loc["PROVEN", "label_detail"] == "과거 성장 > 요구 성장"   # +13.6% delivered vs +7.2% priced in
+    assert out.loc["HOPE", "label_detail"] == "요구 성장 > 과거 성장"     # 0% delivered vs +7.2%
+    assert out.loc["GLOOM", "label_detail"] == "요구 성장 > 과거 성장"    # -13.6% vs -6.7%
+    assert out.loc["UNLOVED", "label_detail"] == "과거 성장 > 요구 성장"  # 0% vs -6.7%
+    assert out.loc["EVEN", "label_detail"] == "요구 성장 ≈ 과거 성장"    # +7.3% vs +7.2%: inside the band
     assert out.loc["LOSS", "label_detail"] == "성장 이력 없음"
-    assert out.loc["MID1", "label_detail"] == "기대와 실적 비슷" and out.loc["MIDHOPE", "label_detail"] == "기대 위주"
-    assert out.loc["MIDLOW", "label_detail"] == "실적 대비 기대 낮음 (일회성 손익 가능)"
+    assert out.loc["MID1", "label_detail"] == "요구 성장 ≈ 과거 성장"
+    assert out.loc["MIDHOPE", "label_detail"] == "요구 성장 > 과거 성장"
+    assert out.loc["MIDLOW", "label_detail"] == "과거 성장 > 요구 성장 (일회성 손익 가능)"
     assert out.loc["TURN", "label_detail"] == "흑자 전환"
-    assert out.loc["TINYBASE", "label_detail"] == "실적 뒷받침 (기저 효과 가능)"  # BROS: +586%/yr from a tiny base
-    assert out.loc["HOPE", "valuation_view"] == "고평가 · 기대 위주"
+    assert out.loc["TINYBASE", "label_detail"] == "과거 성장 > 요구 성장 (기저 효과 가능)"  # BROS: +586%/yr
+    assert out.loc["HOPE", "valuation_view"] == "고평가 · 요구 성장 > 과거 성장"
 
 
 def test_report_lag_flag():

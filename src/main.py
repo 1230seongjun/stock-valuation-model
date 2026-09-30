@@ -20,6 +20,7 @@ import argparse
 import os
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from config import (
@@ -29,16 +30,18 @@ from config import (
     FAIR_VALUE_MIN_GAIN,
     FAIR_VALUE_TARGETS,
     IMPLIED_GROWTH_YEARS,
+    INDUSTRY_MIN_TICKERS,
     TRAIN_START,
     UNIVERSE_INDEXES,
 )
-from data import DEFAULT_CACHE_DIR, collect, data_quality_report
+from data import DEFAULT_CACHE_DIR, collect, collect_fiscal_year_ends, data_quality_report
 from fair_value import (
     add_fair_value,
     coefficient_summary,
     compare_feature_sets,
     gap_return_test,
     r2_by_group,
+    split_of,
     summarize_diagnostics,
     target_features,
 )
@@ -51,7 +54,7 @@ from screening import (
     report_at,
     screen as screen_panel,
 )
-from universe import load_universe
+from universe import industry_groups, load_sub_industries, load_universe
 
 OUTPUT_DIR = Path("real_data_output")
 PANEL_PATH = OUTPUT_DIR / "panel.parquet"
@@ -67,16 +70,20 @@ def build(api_key: str | None = None, cache_dir: str | Path = DEFAULT_CACHE_DIR,
           panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
     api_key = api_key or os.environ.get("FINNHUB_API_KEY")
     universe = load_universe(cache_dir, UNIVERSE_INDEXES)
+    groups = industry_groups(universe, load_sub_industries(cache_dir), INDUSTRY_MIN_TICKERS)
+    universe = {t: {**meta, "industry": groups[t]} for t, meta in universe.items()}
     tickers = list(universe)
     sizes = pd.Series({t: m["size"] for t, m in universe.items()}).value_counts()
     print(f"Universe: {len(tickers)} tickers ({', '.join(f'{k} {v}' for k, v in sizes.items())})")
     prices, fundamentals = collect(tickers, api_key=api_key, cache_dir=cache_dir, force_refresh=force_refresh)
+    fiscal_year_ends = collect_fiscal_year_ends(tickers, api_key=api_key, cache_dir=cache_dir)
     data_quality_report(prices, fundamentals)
 
     as_of_dates = build_as_of_dates(TRAIN_START)
     print(f"\nBuilding point-in-time panel: {len(as_of_dates)} snapshots "
           f"({as_of_dates[0].date()} ~ {as_of_dates[-1].date()})...")
-    panel = add_percentile_scores(build_raw_panel(tickers, prices, fundamentals, universe, as_of_dates))
+    panel = add_percentile_scores(build_raw_panel(tickers, prices, fundamentals, universe, as_of_dates,
+                                                  fiscal_year_ends=fiscal_year_ends))
     if panel.empty:
         raise RuntimeError("panel is empty — check that collection worked")
 
@@ -190,6 +197,19 @@ def evaluate(panel_path: str | Path = PANEL_PATH) -> dict[str, pd.DataFrame]:
     print("=== 1. Fair-value model: how well fundamentals explain log multiples (out-of-fold, mean per date) ===")
     print("    r2_model must beat r2_sector_median, i.e. explain more than 'which sector is it'.")
     print(summary.round(3).to_string())
+
+    print("\n=== 1c. Spread across dates and size of the error ===")
+    print("    r2 per date: median [25%-75%] (the mean above can hide a few bad dates);")
+    print("    error = |actual / fair - 1| per stock, out-of-fold: median and 90th percentile")
+    rows = []
+    for (key, split), g in diagnostics.groupby(["target", "split"]):
+        err = np.expm1(panel.loc[panel["as_of"].map(split_of) == split, f"{key}_gap"].abs().dropna())
+        rows.append({"target": key, "split": split,
+                     "r2_median": g["r2_model"].median(), "r2_q25": g["r2_model"].quantile(0.25),
+                     "r2_q75": g["r2_model"].quantile(0.75),
+                     "error_median": err.median(), "error_p90": err.quantile(0.9)})
+    spread = pd.DataFrame(rows).set_index(["target", "split"]).reindex(["train", "val", "test"], level="split")
+    print(spread.round(3).to_string())
 
     labelled = panel[panel["valuation_gap"].notna() & (panel["n_gaps"] > 1)]
     print("\n=== 2. Combined verdict: do the multiples agree? ===")
@@ -314,8 +334,8 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
 
     # flagged rows nearest the label extremes first; the full lists are in the CSV
     extremeness = (report["cheapness_rank"] - 50).abs().fillna(-1)
-    for flag, reason, title in [("meme_flag", "meme_reason", "급등락·거래량 이상"),
-                                ("value_trap_flag", "value_trap_reason", "밸류트랩 후보"),
+    for flag, reason, title in [("meme_flag", "meme_reason", "단기 가격·거래량 이상"),
+                                ("value_trap_flag", "value_trap_reason", "지속 할인·저성장 경고"),
                                 ("transition_flag", "transition_reason", "저평가→고평가 전환"),
                                 ("report_lag_flag", "report_lag_reason", "재무 기준일 이후 주가 급변"),
                                 ("fundamental_break_flag", "fundamental_break_reason", "최근 12개월 재무 단절"),

@@ -4,8 +4,10 @@ on that as_of date.
 
 This is deliberately the single place where "what counts as known at time T"
 is decided, so look-ahead bugs have one place to hide:
-  - fundamentals: the latest quarter whose period + REPORTING_LAG_DAYS <= as_of
-    (trend features are computed from that quarter and earlier ones only)
+  - fundamentals: the latest quarter whose period + REPORTING_LAG_DAYS <= as_of,
+    ANNUAL_REPORTING_LAG_DAYS for a fiscal Q4 (its numbers come with the
+    10-K) — see apply_reporting_lag (trend features are computed from that
+    quarter and earlier ones only)
   - valuation multiples: Finnhub reports them at the period-end price;
     rescaled to the as_of price (config.RESCALE_MULTIPLES_TO_AS_OF_PRICE)
     using two prices that are both <= as_of
@@ -54,7 +56,18 @@ from config import (
     TECHNICAL_INDICATORS,
 )
 
-REPORTING_LAG_DAYS = 45  # typical 10-Q lag; Finnhub has no filing dates to check against
+# Finnhub's quarterly series has no filing dates. Checked 2026-09-30 against
+# Finnhub's filings (financials-reported, 2010+): 10-Qs (fiscal Q1-Q3) came
+# within 45 days in 99.7% of 1,078 filings (25 tickers, median 34 days), but
+# 10-Ks (fiscal Q4) within 45 days in only 22% of 535 (40 tickers, median
+# ~53, 94% within 60, 99.4% within 75). Until then every quarter used 45
+# days, so a fiscal Q4 was often used ~a week before its 10-K was filed.
+REPORTING_LAG_DAYS = 45          # fiscal Q1-Q3 (10-Q)
+ANNUAL_REPORTING_LAG_DAYS = 75   # fiscal Q4 (10-K)
+# A quarterly period within this many days of a fiscal year-end (any year)
+# is that year's Q4 — covers 52/53-week calendars (AAPL: Sep 24 ~ Oct 1).
+FISCAL_YEAR_END_TOLERANCE_DAYS = 20
+DEFAULT_FISCAL_YEAR_END = (12, 31)  # when Finnhub has no annual series for a ticker
 # A snapshot needs a trade within this many days before as_of. Covers
 # weekends/holidays (e.g. as_of = Jan 1); anything longer means the stock
 # wasn't trading yet (pre-IPO) or anymore (delisted/acquired), and carrying
@@ -279,9 +292,34 @@ def _add_fundamental_breaks(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=["_eps_1y", "_sps_yoy"])
 
 
-def apply_reporting_lag(fundamentals: pd.DataFrame, lag_days: int = REPORTING_LAG_DAYS) -> pd.DataFrame:
+def is_fiscal_q4(periods: pd.Series, fiscal_year_ends: list[pd.Timestamp] | None = None) -> pd.Series:
+    """True for quarterly periods that close a fiscal year: within
+    FISCAL_YEAR_END_TOLERANCE_DAYS of a known fiscal year-end's month/day in
+    any year (so a Q4 newer than the last annual report is recognised too).
+    Without fiscal year-ends, December 31 is assumed."""
+    anchors = {(p.month, p.day) for p in pd.to_datetime(pd.Series(fiscal_year_ends or [], dtype="datetime64[ns]"))}
+    anchors = anchors or {DEFAULT_FISCAL_YEAR_END}
+    periods = pd.to_datetime(periods)
+    hit = pd.Series(False, index=periods.index)
+    tolerance = pd.Timedelta(days=FISCAL_YEAR_END_TOLERANCE_DAYS)
+    for month, day in anchors:
+        for offset in (-1, 0, 1):
+            years = periods.dt.year + offset
+            anchor = pd.to_datetime(dict(year=years, month=month, day=min(day, 28) if month == 2 else day),
+                                    errors="coerce")
+            hit |= (periods - anchor).abs() <= tolerance
+    return hit
+
+
+def apply_reporting_lag(
+    fundamentals: pd.DataFrame, fiscal_year_ends: list[pd.Timestamp] | None = None,
+    lag_days: int = REPORTING_LAG_DAYS, annual_lag_days: int = ANNUAL_REPORTING_LAG_DAYS,
+) -> pd.DataFrame:
+    """available_date = period + lag_days, or + annual_lag_days for a fiscal
+    Q4 (is_fiscal_q4): its numbers arrive with the later 10-K."""
     df = fundamentals.copy()
-    df["available_date"] = df["period"] + pd.Timedelta(days=lag_days)
+    q4 = is_fiscal_q4(df["period"], fiscal_year_ends)
+    df["available_date"] = df["period"] + pd.to_timedelta(np.where(q4, annual_lag_days, lag_days), unit="D")
     return df
 
 
@@ -449,6 +487,7 @@ def _ticker_rows(
     fundamentals: pd.DataFrame | None,
     meta: dict[str, str],
     as_of_dates: list[pd.Timestamp],
+    fiscal_year_ends: list[pd.Timestamp] | None = None,
 ) -> list[dict]:
     """All snapshot rows of one ticker (see build_raw_panel). Uses nothing
     but this ticker's own data, so tickers can be built in any order or in
@@ -475,9 +514,11 @@ def _ticker_rows(
         if "dividend" in price_df.columns else pd.DataFrame(columns=["date", "dividend"])
     )
     has_fundamentals = fundamentals is not None and not fundamentals.empty
-    fund_df = apply_reporting_lag(add_fundamental_trends(fundamentals)) if has_fundamentals else pd.DataFrame()
+    fund_df = apply_reporting_lag(add_fundamental_trends(fundamentals), fiscal_year_ends) \
+        if has_fundamentals else pd.DataFrame()
     sector = meta.get("sector", "Unknown")
     size_group = meta.get("size", "large")
+    industry = meta.get("industry") or f"{sector} 기타"  # universe.industry_groups
 
     rows = []
     for as_of in as_of_dates:
@@ -489,7 +530,8 @@ def _ticker_rows(
         quoted_now = quoted[quoted["date"] <= as_of]
         price = quoted_now["price"].iloc[-1] if len(quoted_now) else np.nan
 
-        row = {"as_of": as_of, "ticker": ticker, "sector": sector, "size_group": size_group, "price": price}
+        row = {"as_of": as_of, "ticker": ticker, "sector": sector, "industry": industry, "size_group": size_group,
+               "price": price, "fiscal_year_end_assumed": not fiscal_year_ends}
         row.update(_as_of_fundamentals(fund_df, as_of))
         period_price = _rescale_multiples(row, quoted_now)
         row.update(_size_features(row, period_price))
@@ -516,6 +558,7 @@ def build_raw_panel(
     universe: dict[str, dict[str, str]],
     as_of_dates: list[pd.Timestamp],
     n_jobs: int | None = None,
+    fiscal_year_ends: dict[str, list[pd.Timestamp]] | None = None,
 ) -> pd.DataFrame:
     """One row per (ticker, as_of) with raw indicators, price, dividend and
     anomaly features and forward-return labels. A (ticker, as_of) with no
@@ -524,9 +567,14 @@ def build_raw_panel(
     Price data cached before 2026-09-28 has no close_raw / dividend columns:
     close then stands in for the quoted price and dividends count as none.
     Tickers are built in parallel (n_jobs, default config.N_JOBS); the rows
-    come back in `tickers` order, so the panel is the same either way."""
+    come back in `tickers` order, so the panel is the same either way.
+    fiscal_year_ends (data.collect_fiscal_year_ends) decides which quarters
+    are fiscal Q4s; a ticker without them is assumed to end its year in
+    December."""
     n_jobs = N_JOBS if n_jobs is None else n_jobs
-    args = [(t, prices.get(t), fundamentals.get(t), universe.get(t, {}), as_of_dates) for t in tickers]
+    fiscal_year_ends = fiscal_year_ends or {}
+    args = [(t, prices.get(t), fundamentals.get(t), universe.get(t, {}), as_of_dates, fiscal_year_ends.get(t))
+            for t in tickers]
     if n_jobs == 1 or len(tickers) < _MIN_TICKERS_FOR_PARALLEL:
         per_ticker = (_ticker_rows(*a) for a in args)
     else:
