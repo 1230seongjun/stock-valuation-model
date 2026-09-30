@@ -150,6 +150,30 @@ UNIVERSE_INDEXES = ("sp400", "sp600")
 # (PBR as below, dropped once): log_book_value .043/.056, net_debt_to_capital
 # .018/.019, log_revenue .014/.015, roe_avg_3y .012/.028; asset_turnover
 # added back +.001/-.000.
+# 2026-09-30 durability candidates (features._add_durability), each alone
+# (train/val): passed only eps_volatility_3y for PBR +.017/+.016 and
+# cash_conversion_3y for P/FCF +.038/+.029 (drop-one after adding: .017/.016,
+# .038/.029). Neither is durability as hoped: eps_volatility_3y's own
+# coefficient flips sign (same sign on 47% of dates) — its gain comes from
+# the missing flag, i.e. a 3-year mean EPS <= 0; cash_conversion_3y is -0.13
+# (P/FCF = PER x net income / FCF, a denominator effect). Near misses:
+# growth_consistency_3y (PER +.005/+.013, PSR +.003/+.020). The quality
+# premium (WMT, COST, AAPL gaps +151/+132/+111%) stays in the gap —
+# screening.add_expectations shows what growth it prices in instead.
+# 2026-09-30 evening: log_revenue passed for P/FCF (+.016/+.012, drop-one
+# .016/.013) once cash_conversion_3y was in; asset_turnover then fell just
+# under the bar there (dropped .0099/.0100, re-added +.0099/+.0100) and was
+# taken out of P/FCF like out of PBR before.
+# ROE check (the PER coefficient on ROE is -0.31, AAPL's fair PER -35% from
+# it): roe_spike (TTM ROE - 3-year mean) and eps_spike (TTM EPS / 3-year
+# average) did not pass for PER (-.001/+.003, +.005/+.007) and only moved
+# AAPL's ROE effect to -30/-31%. Spearman(ROE, log PER) per date is -0.23
+# even among stable earners (|eps_spike - 1| < 10%; -0.52 among spiky ones),
+# and ROA in place of ROE docks AAPL harder (-42%, R^2 .378/.419): the market
+# generally prices high current profitability to fade, and the model applies
+# that average to everyone. AAPL's gap is the market treating it as an
+# exception. (ROE + ROA together: PER +.023/+.010 — ROA is not a registered
+# candidate; it would deepen the AAPL penalty to fair PER 18.1.)
 # The common FAIR_VALUE_FEATURES were dropped once too: operating_margin,
 # current_ratio and sga_to_sales no longer clear the bar for any multiple
 # (each <= .006) — they overlap with the features added since. Left in for
@@ -170,13 +194,15 @@ FAIR_VALUE_TARGETS = {
     "pe": {"column": "trailing_pe", "min": 1.0, "max": 100.0, "label": "PER",
            "extra_features": ("log_book_value", "roe_avg_3y")},
     "pb": {"column": "price_to_book", "min": 0.1, "max": 20.0, "label": "PBR",
-           "extra_features": ("net_debt_to_capital", "log_book_value", "roe_avg_3y", "log_revenue")},
+           "extra_features": ("net_debt_to_capital", "log_book_value", "roe_avg_3y", "log_revenue",
+                              "eps_volatility_3y")},
     "ps": {"column": "price_to_sales", "min": 0.05, "max": 40.0, "label": "PSR",
            "exclude_sectors": ("Financials",), "extra_features": ("asset_turnover", "log_revenue")},
     "ev_ebitda": {"column": "ev_to_ebitda", "min": 1.0, "max": 60.0, "label": "EV/EBITDA",
                   "exclude_sectors": ("Financials",), "extra_features": ("asset_turnover",)},
     "pfcf": {"column": "price_to_fcf", "min": 1.0, "max": 100.0, "label": "P/FCF",
-             "exclude_sectors": ("Financials",), "extra_features": ("fcf_margin", "asset_turnover")},
+             "exclude_sectors": ("Financials",),
+             "extra_features": ("fcf_margin", "cash_conversion_3y", "log_revenue")},
     "pe_norm": {"column": "normalized_pe", "min": 1.0, "max": 100.0, "label": "정규화 PER",
                 "in_verdict": False, "extra_features": ("log_book_value", "roe_avg_3y")},
 }
@@ -263,6 +289,19 @@ FAIR_VALUE_FEATURE_CANDIDATES = [
     "op_margin_volatility",
     "dividend_growth_3y",
     "dividend_years_no_cut",
+    # durability / multi-year growth (2026-09-30, features._add_durability):
+    # what the market may pay for beyond this year's numbers
+    "eps_cagr_3y",
+    "growth_consistency_3y",
+    "eps_volatility_3y",
+    "roe_volatility_3y",
+    "gross_margin_volatility_3y",
+    "loss_share_3y",
+    "cash_conversion_3y",
+    # this year's earnings vs. the company's own 3-year norm (2026-09-30):
+    # can the model tell a one-off ROE/EPS jump from a durably high ROE?
+    "roe_spike",
+    "eps_spike",
 ]
 
 FAIR_VALUE_CV_FOLDS = 5             # out-of-fold by ticker within each as_of
@@ -280,6 +319,24 @@ FAIR_VALUE_WINSOR_QUANTILE = 0.02   # clip each feature to [2%, 98%] per as_of
 FAIR_VALUE_FEATURE_TRANSFORM = "rank"
 FAIR_VALUE_MIN_ROWS = 50            # skip an as_of with fewer usable rows
 RIDGE_ALPHAS = [0.01, 0.1, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0]
+
+# ---- Priced-in expectations (screening.add_expectations) -----------------
+# "How much future is in the price": the yearly EPS growth above the median
+# stock's that a PER needs over this many years, if the stock is then valued
+# like the median stock (same PER) and both are discounted alike:
+#   (1 + excess)^years = PER / median PER   (same as_of, PER bounds)
+# A description, not a model input: it is built from the price on purpose.
+IMPLIED_GROWTH_YEARS = 10
+# screening.add_label_detail: delivered and priced-in excess growth closer
+# than this (per year) count as "기대와 실적 비슷" — a 3-year EPS CAGR is too
+# noisy to split on a hair (2026-09-30: AAPL +6.9% vs +6.9%, COST +7.1% vs
+# +8.8%, CRI -10.8% vs -11.8%). A judgment call, not tuned on any split.
+LABEL_DETAIL_BAND = 0.02
+# 3-year earnings growth above this per year (8x in 3 years) is marked "기저
+# 효과 가능": from a tiny base the rate says little (2026-09-30: BROS +586%/yr
+# made "실적 뒷받침" against +14% priced in). Real booms are marked too (NVDA
+# +152%) — it says "check the base", not "wrong". A judgment call.
+BASE_EFFECT_CAGR = 1.0
 
 # ---- Screening labels (screening.py) ---------------------------------------
 # cheapness_rank = percentile (0-100) of -valuation_gap across all stocks at

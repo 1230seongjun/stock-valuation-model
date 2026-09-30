@@ -3,7 +3,7 @@ Entry point.
 
     python src/main.py build     [--force-refresh]   # collect data -> real_data_output/panel.parquet
     python src/main.py verify-multiples              # check the multiples' price rescaling against yfinance
-    python src/main.py compare-features              # which candidate features help (Train/Val)
+    python src/main.py compare-features [--drop-check]  # which candidate features help (Train/Val)
     python src/main.py evaluate                      # fair-value model quality + gap-vs-return test
     python src/main.py screen    [--ticker AAPL] [--as-of 2026-07-01]
 
@@ -28,6 +28,7 @@ from config import (
     FAIR_VALUE_FEATURES,
     FAIR_VALUE_MIN_GAIN,
     FAIR_VALUE_TARGETS,
+    IMPLIED_GROWTH_YEARS,
     TRAIN_START,
     UNIVERSE_INDEXES,
 )
@@ -42,7 +43,14 @@ from fair_value import (
     target_features,
 )
 from features import add_percentile_scores, build_as_of_dates, build_raw_panel
-from screening import flag_fundamental_break, report_at, screen as screen_panel
+from screening import (
+    BASE_EFFECT_NOTE,
+    DETAIL_NOTES,
+    ONE_OFF_NOTE,
+    flag_fundamental_break,
+    report_at,
+    screen as screen_panel,
+)
 from universe import load_universe
 
 OUTPUT_DIR = Path("real_data_output")
@@ -113,7 +121,7 @@ def _load(panel_path: str | Path) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-def compare_features(panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
+def compare_features(panel_path: str | Path = PANEL_PATH, drop_check: bool = False) -> pd.DataFrame:
     """Out-of-fold R^2 of each multiple for: the current features (each
     multiple with its extra_features), current + each candidate alone,
     current minus each feature in use, current + all candidates, and the
@@ -123,15 +131,16 @@ def compare_features(panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
     it gains >= FAIR_VALUE_MIN_GAIN on train AND val; the "-feature" rows
     re-check the features already in use the same way (dropping one should
     cost at least that much where it is used — the second round after
-    adopting several overlapping candidates at once). Test is for the final
-    report."""
+    adopting several overlapping candidates at once; only with drop_check,
+    since they double the run time). Test is for the final report."""
     panel = _load(panel_path)
     candidates = [c for c in FAIR_VALUE_FEATURE_CANDIDATES if c in panel.columns]
     in_use = {key: target_features(spec, FAIR_VALUE_FEATURES) for key, spec in FAIR_VALUE_TARGETS.items()}
     used = list(dict.fromkeys(f for feats in in_use.values() for f in feats))
     sets: dict = {"current": FAIR_VALUE_FEATURES}
     sets.update({f"+{c}": [*FAIR_VALUE_FEATURES, c] for c in candidates})
-    sets.update({f"-{f}": {"drop": (f,)} for f in used})
+    if drop_check:
+        sets.update({f"-{f}": {"drop": (f,)} for f in used})
     sets["+all"] = [*FAIR_VALUE_FEATURES, *candidates]
     other = "winsor" if FAIR_VALUE_FEATURE_TRANSFORM == "rank" else "rank"
     sets[f"{other}_transform"] = (FAIR_VALUE_FEATURES, other)
@@ -141,7 +150,8 @@ def compare_features(panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
     print("\n=== out-of-fold R^2 (mean per date) ===")
     print(table.round(3).T.to_string())
     print("\n=== change vs. current features (+candidate: positive = helps; -feature: negative = it was helping) ===")
-    print(delta.round(3).T.to_string())
+    # 4 decimals: the bar is 0.01, and 0.0099 printed as 0.010 read as a pass (P/FCF asset_turnover, 2026-09-30)
+    print(delta.round(4).T.to_string())
 
     def split_delta(name: str, key: str) -> tuple[float, float] | None:
         if key not in delta.index.get_level_values(0) or name not in delta.columns:
@@ -157,6 +167,9 @@ def compare_features(panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
                 hits.append(f"    {name:24s} {FAIR_VALUE_TARGETS[key]['label']:10s} {d[0]:+.3f} / {d[1]:+.3f}")
     print("\n".join(hits) if hits else "    (none)")
 
+    if not drop_check:
+        print("\n(features in use not re-checked: run with --drop-check after adopting candidates)")
+        return table
     print(f"\n=== features in use: R^2 lost when dropped (train / val; bar {FAIR_VALUE_MIN_GAIN} on both) ===")
     for feat in used:
         cells = []
@@ -253,7 +266,7 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
         else:
             row = match.iloc[0]
             rank = f"{row['cheapness_rank']:.0f}" if pd.notna(row["cheapness_rank"]) else "-"
-            print(f"{row['ticker']} ({row['sector']}, {row['size_group']}) {date}: {row['valuation_label']} (저평가 순위 {rank}/100)")
+            print(f"{row['ticker']} ({row['sector']}, {row['size_group']}) {date}: {row['valuation_view']} (저평가 순위 {rank}/100)")
             print(row["explanation"])
             for col in ("meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason",
                         "fundamental_break_reason", "single_view_reason"):
@@ -266,6 +279,17 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
     if report["size_group"].nunique() > 1:
         mix = pd.crosstab(report["size_group"], report["valuation_label"])
         print("    labels by size group:\n" + mix.to_string())
+    split = report[report["label_detail"].fillna("") != ""]
+    if not split.empty:
+        # one row per reason; the "(...)" note variants are counted, not listed apart
+        detail = split["label_detail"]
+        for note in DETAIL_NOTES:
+            detail = detail.str.replace(note, "", regex=False)
+        view = (split["valuation_label"] + " · " + detail).rename("세부 라벨")
+        why = pd.crosstab(view, split["size_group"].rename("규모"))
+        why["일회성 가능"] = split["label_detail"].str.contains(ONE_OFF_NOTE, regex=False).groupby(view).sum()
+        why["기저 효과 가능"] = split["label_detail"].str.contains(BASE_EFFECT_NOTE, regex=False).groupby(view).sum()
+        print("    why (priced-in vs. delivered growth, screening.add_label_detail):\n" + why.to_string())
     pct = lambda s: s.map(lambda v: f"{v:+.0%}" if pd.notna(v) else "")
     table = report.assign(
         rank=report["cheapness_rank"].round(0),
@@ -273,10 +297,16 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
         agree=[f"{a * n:.0f}/{n:.0f}" if pd.notna(a) else "" for a, n in zip(report["gap_agreement"], report["n_gaps"])],
         **{spec["label"]: pct(report[f"{key}_gap"]) for key, spec in FAIR_VALUE_TARGETS.items()},
         quality=report["quality_score"].round(0),
+        priced_in=pct(report["implied_excess_growth"]),
+        earn_3y=pct(report["earnings_cagr_3y"]),
     )
-    cols = ["ticker", "sector", "size_group", "valuation_label", "rank", "gap", "agree",
-            *[spec["label"] for spec in FAIR_VALUE_TARGETS.values()], "quality"]
-    print("    (gap = combined; agree = views on the same side; per-multiple columns = actual vs. fair)")
+    cols = ["ticker", "sector", "size_group", "valuation_view", "rank", "gap", "agree",
+            *[spec["label"] for spec in FAIR_VALUE_TARGETS.values()], "priced_in", "earn_3y", "quality"]
+    median_growth = report["earnings_cagr_3y_median"].dropna()
+    print("    (gap = combined; agree = views on the same side; per-multiple columns = actual vs. fair;\n"
+          f"     priced_in = yearly EPS growth above the median stock the PER needs for {IMPLIED_GROWTH_YEARS} years;\n"
+          "     earn_3y = realized earnings growth per year, last 3 years (EPS, or net income without EPS)"
+          + (f" (median stock {median_growth.iloc[0]:+.0%})" if len(median_growth) else "") + ")")
     print("\n-- 저평가 상위 15 --")
     print(table[cols].head(15).to_string(index=False))
     print("\n-- 고평가 상위 15 --")
@@ -378,6 +408,7 @@ def main() -> None:
     v = sub.add_parser("verify-multiples", help="check the multiples' price rescaling against yfinance")
     v.add_argument("--tickers", nargs="+", default=VERIFY_TICKERS)
     c = sub.add_parser("compare-features", help="out-of-fold R^2 with each candidate feature added")
+    c.add_argument("--drop-check", action="store_true", help="also drop each feature in use once (slower)")
     e = sub.add_parser("evaluate", help="fair-value model quality + gap-vs-return test")
     s = sub.add_parser("screen", help="screening report")
     s.add_argument("--as-of")
@@ -391,7 +422,7 @@ def main() -> None:
     elif args.command == "verify-multiples":
         verify_multiples(args.tickers, panel_path=args.panel)
     elif args.command == "compare-features":
-        compare_features(args.panel)
+        compare_features(args.panel, drop_check=args.drop_check)
     elif args.command == "evaluate":
         evaluate(args.panel)
     else:

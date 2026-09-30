@@ -120,14 +120,26 @@ FEATURE_LABELS_KO = {
     "log_revenue": "매출 규모",
     "log_book_value": "자본 규모",
     "roe_avg_3y": "3년 평균 ROE",
+    "eps_cagr_3y": "3년 EPS 성장률",
+    "growth_consistency_3y": "성장 꾸준함",
+    "eps_volatility_3y": "이익 변동성",
+    "roe_volatility_3y": "ROE 변동성",
+    "gross_margin_volatility_3y": "매출총이익률 변동성",
+    "loss_share_3y": "적자 분기 비율",
+    "cash_conversion_3y": "이익의 현금 전환율",
+    "roe_spike": "ROE의 평소 대비 급등",
+    "eps_spike": "이익의 평소 대비 급등",
     "sector": "섹터",
 }
 
 
 def loss_flag(df: pd.DataFrame) -> pd.Series:
-    """PER unavailable AND (latest EPS <= 0 or TTM ROE < 0): the company is
-    losing money, not just missing data (ROE catches TTM losses whose latest
-    quarter happens to be positive, e.g. HAS/TAP after impairments).
+    """PER unavailable AND (latest EPS <= 0 or TTM ROE < 0 or TTM EPS <= 0):
+    the company is losing money, not just missing data (ROE catches TTM
+    losses whose latest quarter happens to be positive, e.g. HAS/TAP after
+    impairments; TTM EPS catches them when equity is negative and ROE is
+    missing — AAL, CAR, CCOI, PTCT were 저평가 on 2026-09-30, AAL #1, on a
+    single positive quarter).
 
     These rows keep their per-multiple gaps for reference but get no
     valuation_gap, i.e. no verdict ("판단 보류(적자)" in screening):
@@ -142,6 +154,8 @@ def loss_flag(df: pd.DataFrame) -> pd.Series:
         not a mispricing. A loss year says too little about which case it is."""
     pe_missing = df["trailing_pe"].isna() | (df["trailing_pe"] <= 0)
     losing = (df["eps"] <= 0) | (df["return_on_equity"] < 0)
+    if "eps_ttm" in df.columns:  # panels built before 2026-09-29 lack it
+        losing |= df["eps_ttm"] <= 0
     return (pe_missing & losing).fillna(False).astype(bool)
 
 
@@ -201,11 +215,13 @@ def _fit_ridge(X: pd.DataFrame, y: pd.Series) -> tuple[RidgeCV, pd.Series, pd.Se
 
 def _fit_cross_section(
     cs: pd.DataFrame, key: str, spec: dict, sectors: list[str], features: list[str] = FAIR_VALUE_FEATURES,
-    transform: str = FAIR_VALUE_FEATURE_TRANSFORM,
-) -> tuple[pd.DataFrame, dict] | None:
+    transform: str = FAIR_VALUE_FEATURE_TRANSFORM, contributions: bool = True,
+) -> tuple[pd.DataFrame | None, dict] | None:
     """Out-of-fold fair multiple + per-driver contributions for one as_of and
     one multiple, plus diagnostics (Ridge vs. sector-median baseline on the
-    exact same folds, and full-fit standardized coefficients)."""
+    exact same folds, and full-fit standardized coefficients).
+    contributions=False returns (None, diagnostics) and skips the
+    per-driver bookkeeping — compare_feature_sets only needs R^2."""
     col = spec["column"]
     if col not in cs.columns:  # panel built before this multiple existed
         return None
@@ -226,9 +242,10 @@ def _fit_cross_section(
         model, mean, scale = _fit_ridge(X.loc[tr], y.loc[tr])
         z = (X.loc[te] - mean) / scale
         pred.loc[te] = model.predict(z)
-        terms = z * model.coef_
-        for driver, cols in groups.items():
-            contrib.loc[te, driver] = terms[cols].sum(axis=1)
+        if contributions:
+            terms = z * model.coef_
+            for driver, cols in groups.items():
+                contrib.loc[te, driver] = terms[cols].sum(axis=1)
 
         sector_median = y.loc[tr].groupby(eligible.loc[tr, "sector"]).median()
         baseline.loc[te] = eligible.loc[te, "sector"].map(sector_median).fillna(y.loc[tr].median()).to_numpy()
@@ -236,11 +253,13 @@ def _fit_cross_section(
     full_model, _, _ = _fit_ridge(X, y)
     coefs = pd.Series(full_model.coef_, index=X.columns)
 
-    out = pd.DataFrame(index=eligible.index)
-    out[f"fair_{key}"] = np.exp(pred)
-    out[f"{key}_gap"] = y - pred
-    for driver in groups:
-        out[f"{key}_contrib_{driver}"] = contrib[driver]
+    out = None
+    if contributions:
+        out = pd.DataFrame(index=eligible.index)
+        out[f"fair_{key}"] = np.exp(pred)
+        out[f"{key}_gap"] = y - pred
+        for driver in groups:
+            out[f"{key}_contrib_{driver}"] = contrib[driver]
 
     sst = float(((y - y.mean()) ** 2).sum())
     diag = {
@@ -263,13 +282,14 @@ def _model_features(spec: dict, features: list[str], drop: tuple[str, ...] = ())
 
 def _fit_date(
     as_of: pd.Timestamp, cs: pd.DataFrame, sectors: list[str], features: list[str], transform: str,
-    drop: tuple[str, ...],
-) -> list[tuple[str, pd.DataFrame, dict]]:
+    drop: tuple[str, ...], contributions: bool = True,
+) -> list[tuple[str, pd.DataFrame | None, dict]]:
     """Every multiple's fit for one as_of cross-section. Dates never share
     data, so they can run in any order or in parallel."""
     results = []
     for key, spec in FAIR_VALUE_TARGETS.items():
-        result = _fit_cross_section(cs, key, spec, sectors, _model_features(spec, features, drop), transform)
+        result = _fit_cross_section(cs, key, spec, sectors, _model_features(spec, features, drop), transform,
+                                    contributions)
         if result is not None:
             out, diag = result
             results.append((key, out, {"as_of": as_of, "split": split_of(as_of), **diag}))
@@ -342,7 +362,10 @@ def _set_diagnostics(panel: pd.DataFrame, spec: list[str] | tuple | dict) -> pd.
         (features, transform), drop = spec, ()
     else:
         features, transform, drop = spec, FAIR_VALUE_FEATURE_TRANSFORM, ()
-    return add_fair_value(panel, features, transform, drop=drop, n_jobs=1)[1]
+    sectors = sorted(panel["sector"].dropna().unique())
+    rows = [diag for as_of, cs in panel.groupby("as_of")
+            for _, _, diag in _fit_date(as_of, cs, sectors, features, transform, drop, contributions=False)]
+    return pd.DataFrame(rows)
 
 
 def compare_feature_sets(

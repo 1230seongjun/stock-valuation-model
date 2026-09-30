@@ -24,6 +24,9 @@ Derived indicators (see data.py for the raw fields):
   - op_margin_volatility: std of quarterly operating margin, last 12 quarters
     (a one-off gain/charge or a cyclical business shows up here)
   - op_margin_avg_3y / roe_avg_3y: 12-quarter means (candidate features)
+  - eps_cagr_3y, growth_consistency_3y, *_volatility_3y, loss_share_3y,
+    cash_conversion_3y: multi-year growth and earnings durability
+    (_add_durability, candidate features)
   - normalized_pe: as_of price / (4 x mean quarterly EPS of the last 12
     quarters) — PER on 3-year average earnings, so one quarter's one-off
     gain or charge weighs 1/12 instead of 1/4 (a reference view, see
@@ -66,6 +69,10 @@ _AS_OF_FUNDAMENTAL_KEYS = [k for k in FUNDAMENTAL_INDICATORS if k != "dividend_y
     "current_ratio", "asset_turnover", "sga_to_sales",
     # trend features (add_fundamental_trends)
     "revenue_cagr_3y", "op_margin_volatility", "op_margin_avg_3y", "roe_avg_3y",
+    # durability / multi-year growth (_add_durability)
+    "eps_cagr_3y", "growth_consistency_3y", "eps_volatility_3y", "roe_volatility_3y",
+    "gross_margin_volatility_3y", "loss_share_3y", "cash_conversion_3y",
+    "earnings_cagr_3y", "earnings_turnaround_3y", "roe_spike", "eps_spike",
     # TTM-reliability checks (_add_fundamental_breaks)
     "eps_one_off_period", "eps_one_off_ratio", "per_share_break_period", "per_share_break_ratio",
     # raw components
@@ -148,8 +155,69 @@ def add_fundamental_trends(fundamentals: pd.DataFrame) -> pd.DataFrame:
     consecutive_3y = (df["period"] - df["period"].shift(11)) <= pd.Timedelta(days=3 * 365)
     df["eps_avg_3y"] = eps.rolling(12, min_periods=12).mean().where(consecutive_3y)
 
+    # Are this year's earnings unusual FOR THIS COMPANY? (candidates,
+    # 2026-09-30.) PER's ROE coefficient is -0.31: across stocks a high ROE
+    # mostly means a one-off gain inflating E, so the model docks every high
+    # ROE — including AAPL's steady, buyback-driven one (-35% on its fair
+    # PER). These say whether E is above the company's own norm:
+    #   roe_spike — TTM ROE minus its 12-quarter mean
+    #   eps_spike — TTM EPS / (4 x mean quarterly EPS over 12 quarters);
+    #               NaN if that mean <= 0
+    df["roe_spike"] = df["return_on_equity"] - df["roe_avg_3y"]
+    df["eps_spike"] = (df["eps_ttm"] / (4 * df["eps_avg_3y"])).where(df["eps_avg_3y"] > 0)
+
+    df = _add_durability(df, eps)
     df = _add_fundamental_breaks(df.assign(eps=eps))
     return df.drop(columns=["_sps_1y", "_sps_ttm", "_sps_ttm_3y"])
+
+
+def _add_durability(df: pd.DataFrame, eps: pd.Series) -> pd.DataFrame:
+    """Multi-year growth and how durable the earnings are (candidates,
+    2026-09-30: the model had nothing that tells a decade of steady profits
+    from a lucky year, and the stocks it called most expensive among large
+    caps were WMT, COST, AAPL, KO, PG). Last 12 quarters (min 8), this row's
+    and earlier periods only, like the other trends:
+      eps_cagr_3y            — TTM EPS vs. 3 years earlier, annualized (both > 0)
+      growth_consistency_3y  — share of quarters with sales/share above a year earlier
+      eps_volatility_3y      — std / mean of quarterly EPS (NaN if the mean <= 0)
+      roe_volatility_3y      — std of quarterly TTM ROE
+      gross_margin_volatility_3y — std of quarterly gross margin (pricing power)
+      loss_share_3y          — share of quarters with EPS <= 0
+      cash_conversion_3y     — mean FCF margin / mean net margin (profits that
+                               arrive as cash; NaN if the net margin <= 0)"""
+    for col in ("gross_margin", "fcf_margin", "net_margin"):
+        if col not in df.columns:
+            df[col] = np.nan
+    roll = lambda s: s.rolling(12, min_periods=8)
+
+    df = _match_prior(df, "eps_ttm", 3 * 365, "_eps_ttm_3y")
+    ratio = df["eps_ttm"] / df["_eps_ttm_3y"]
+    df["eps_cagr_3y"] = np.where((df["eps_ttm"] > 0) & (df["_eps_ttm_3y"] > 0), ratio ** (1 / 3) - 1, np.nan)
+
+    # Earnings growth for the report (screening.add_label_detail), not a model
+    # feature: EPS where Finnhub has it, else TTM net income = TTM ROE x equity
+    # (banks such as OZK, SLM, WAFD have no quarterly EPS at all; total, not
+    # per share, so buybacks don't show). earnings_turnaround_3y: a loss 3
+    # years ago, a profit now — growth is undefined, but it is a result.
+    book = df["book_value"] if "book_value" in df.columns else pd.Series(np.nan, index=df.index)
+    df["_ni_ttm"] = df["return_on_equity"] * book.where(book > 0)
+    df = _match_prior(df, "_ni_ttm", 3 * 365, "_ni_ttm_3y")
+    has_eps = df["eps_ttm"].notna() & df["_eps_ttm_3y"].notna()
+    now = df["eps_ttm"].where(has_eps, df["_ni_ttm"])
+    then = df["_eps_ttm_3y"].where(has_eps, df["_ni_ttm_3y"])
+    df["earnings_cagr_3y"] = np.where((now > 0) & (then > 0), (now / then) ** (1 / 3) - 1, np.nan)
+    df["earnings_turnaround_3y"] = ((now > 0) & (then <= 0)).astype(float).where(now.notna() & then.notna())
+
+    growing = (df["revenue_growth_yoy"] > 0).astype(float).where(df["revenue_growth_yoy"].notna())
+    df["growth_consistency_3y"] = roll(growing).mean()
+    eps_mean = roll(eps).mean()
+    df["eps_volatility_3y"] = (roll(eps).std() / eps_mean).where(eps_mean > 0)
+    df["roe_volatility_3y"] = roll(df["return_on_equity"]).std()
+    df["gross_margin_volatility_3y"] = roll(df["gross_margin"]).std()
+    df["loss_share_3y"] = roll((eps <= 0).astype(float).where(eps.notna())).mean()
+    net = roll(df["net_margin"]).mean()
+    df["cash_conversion_3y"] = (roll(df["fcf_margin"]).mean() / net).where(net > 0)
+    return df.drop(columns=["_eps_ttm_3y", "_ni_ttm", "_ni_ttm_3y"])
 
 
 # A quarter counts as a break when it is off by this factor against BOTH of

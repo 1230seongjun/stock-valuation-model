@@ -65,6 +65,9 @@ from config import (
     EXPENSIVE_THRESHOLD,
     FAIR_VALUE_FEATURES,
     FAIR_VALUE_TARGETS,
+    BASE_EFFECT_CAGR,
+    IMPLIED_GROWTH_YEARS,
+    LABEL_DETAIL_BAND,
     MOMENTUM_INDICATORS,
     QUALITY_INDICATORS,
     VALUATION_INDICATORS,
@@ -126,6 +129,107 @@ def add_labels(panel: pd.DataFrame) -> pd.DataFrame:
     df["quality_score"] = df[[f"{k}_pct" for k in QUALITY_INDICATORS]].mean(axis=1, skipna=True)
     df["momentum_score"] = df[[f"{k}_pct" for k in MOMENTUM_INDICATORS]].mean(axis=1, skipna=True)
     return df
+
+
+def add_expectations(panel: pd.DataFrame, years: int = IMPLIED_GROWTH_YEARS) -> pd.DataFrame:
+    """What the price assumes about the future, next to what the company
+    delivered (2026-09-30: a gap says "more than past fundamentals justify",
+    not why — TSLA's premium is pure expectation, NVDA's mostly delivered):
+      implied_excess_growth   — yearly EPS growth above the median stock's
+                                that the PER needs over `years` (config
+                                IMPLIED_GROWTH_YEARS); NaN without a PER
+      earnings_cagr_3y_median — the median stock's earnings_cagr_3y (EPS, or
+                                net income where Finnhub has no EPS —
+                                features._add_durability) at that date
+    The median PER is over PERs inside the model's bounds at the same as_of."""
+    df = panel.copy()
+    lo, hi = FAIR_VALUE_TARGETS["pe"]["min"], FAIR_VALUE_TARGETS["pe"]["max"]
+    pe = df["trailing_pe"].where(df["trailing_pe"] > 0)
+    median_pe = pe.where(pe.between(lo, hi)).groupby(df["as_of"]).transform("median")
+    df["implied_excess_growth"] = (pe / median_pe) ** (1 / years) - 1
+    if "earnings_cagr_3y" not in df.columns:  # panel built before 2026-09-30 evening
+        df["earnings_cagr_3y"] = df["eps_cagr_3y"] if "eps_cagr_3y" in df.columns else np.nan
+    df["earnings_cagr_3y_median"] = df["earnings_cagr_3y"].groupby(df["as_of"]).transform("median")
+    return df
+
+
+# (label, delivered growth vs. priced in) -> detail. "above" = the company
+# delivered more excess growth than the price assumes, "below" = less.
+LABEL_DETAILS = {
+    ("고평가", "above"): "실적 뒷받침",         # the premium is growth already shown
+    ("고평가", "below"): "기대 위주",           # the premium is growth not shown yet
+    ("중립", "above"): "실적 대비 기대 낮음",
+    ("중립", "below"): "기대 위주",
+    ("저평가", "above"): "실적 대비 과도한 할인",  # the market is gloomier than the results
+    ("저평가", "below"): "실적 부진 반영",      # the discount matches weak results
+}
+SIMILAR = "기대와 실적 비슷"
+TURNAROUND = "흑자 전환"
+NO_GROWTH_HISTORY = "성장 이력 없음"
+ONE_OFF_NOTE = " (일회성 손익 가능)"
+BASE_EFFECT_NOTE = " (기저 효과 가능)"
+DETAIL_NOTES = (ONE_OFF_NOTE, BASE_EFFECT_NOTE)
+
+
+def add_label_detail(panel: pd.DataFrame, band: float = LABEL_DETAIL_BAND) -> pd.DataFrame:
+    """Splits every verdict by WHY (user idea, 2026-09-30): compare the
+    growth the price assumes (implied_excess_growth, add_expectations) with
+    the growth the company delivered, both relative to the median stock:
+      realized_excess_growth = (1 + earnings_cagr_3y) / (1 + median) - 1
+    within `band` of each other -> 기대와 실적 비슷; otherwise LABEL_DETAILS
+    by which one is higher. A loss 3 years ago and a profit now (growth
+    undefined; 155 of the 283 undivided verdicts on 2026-09-30) -> 흑자 전환;
+    anything else without a growth rate (a loss now, under 3 years of
+    history) -> 성장 이력 없음. With fundamental_break_flag the delivered
+    growth may be a one-off, and above BASE_EFFECT_CAGR a tiny base, so the
+    detail says so. valuation_label itself
+    is unchanged (the flags key on it); label_detail is added and
+    valuation_view = "고평가 · 기대 위주" for the report. "Delivered" = the
+    past 3 years' growth rate — a description of the price, not a forecast."""
+    df = panel.copy()
+    median = df["earnings_cagr_3y_median"]
+    df["realized_excess_growth"] = (1 + df["earnings_cagr_3y"]) / (1 + median) - 1
+    diff = df["realized_excess_growth"] - df["implied_excess_growth"]
+    one_off = df["fundamental_break_flag"] if "fundamental_break_flag" in df.columns else pd.Series(False, index=df.index)
+    turnaround = (df["earnings_turnaround_3y"] == 1) if "earnings_turnaround_3y" in df.columns \
+        else pd.Series(False, index=df.index)
+    detail = []
+    tiny_base = df["earnings_cagr_3y"] > BASE_EFFECT_CAGR
+    for label, d, broken, turned, tiny in zip(df["valuation_label"], diff, one_off.fillna(False), turnaround,
+                                              tiny_base):
+        if label not in ("저평가", "중립", "고평가"):
+            detail.append("")
+        elif turned:
+            detail.append(TURNAROUND + (ONE_OFF_NOTE if broken else ""))
+        elif pd.isna(d):
+            detail.append(NO_GROWTH_HISTORY)
+        else:
+            text = SIMILAR if abs(d) < band else LABEL_DETAILS[(label, "above" if d > 0 else "below")]
+            detail.append(text + (ONE_OFF_NOTE if broken else "") + (BASE_EFFECT_NOTE if tiny else ""))
+    df["label_detail"] = detail
+    df["valuation_view"] = [f"{lbl} · {d}" if d else lbl for lbl, d in zip(df["valuation_label"], detail)]
+    return df
+
+
+def _expectation_text(row: pd.Series) -> str:
+    """'주가에 반영된 기대: ...' line of explain(), '' without a PER."""
+    excess = row.get("implied_excess_growth")
+    if pd.isna(excess):
+        return ""
+    years = IMPLIED_GROWTH_YEARS
+    if abs(excess) < 0.005:
+        need = f"앞으로 {years}년간 중간 종목과 비슷하게 성장하면 현재 PER이 설명됨"
+    else:
+        side = "더" if excess > 0 else "덜"
+        need = f"앞으로 {years}년간 이익이 중간 종목보다 매년 약 {abs(excess):.0%} {side} 늘어야 현재 PER이 설명됨"
+    growth, median = row.get("earnings_cagr_3y"), row.get("earnings_cagr_3y_median")
+    if pd.notna(growth) and pd.notna(median):
+        past = f"최근 3년 이익 성장률 연 {growth:+.0%}, 중간 종목 {median:+.0%}"
+    elif row.get("earnings_turnaround_3y") == 1:
+        past = "3년 전 적자에서 흑자로 전환해 성장률로 표시할 수 없음"
+    else:
+        past = "최근 3년 이익 성장률 계산 불가(적자 또는 3년 미만 이력)"
+    return f"주가에 반영된 기대: {need} ({past}; {years}년 뒤 중간 종목 수준 PER, 같은 할인율 가정)"
 
 
 def flag_meme_stock(panel: pd.DataFrame) -> pd.DataFrame:
@@ -300,9 +404,29 @@ def classify_valuation_transition(
     return df
 
 
+# Drivers that move a fair multiple through the multiple's own arithmetic,
+# not because the market pays for them (2026-09-30: AAPL's P/FCF read "높인
+# 요인 이익의 현금 전환율 +19%" because its conversion is BELOW average):
+#   PER = PBR / ROE, PBR = market cap / book, PSR = PBR / (sales / equity)
+#   and sales sit in its denominator, EV/EBITDA = (EV / assets) / (asset
+#   turnover x EBITDA margin), P/FCF = PSR / FCF margin = PER x net income /
+#   FCF. Their coefficients have the sign the identity predicts on 95-100%
+#   of dates (evaluate section 3).
+DENOMINATOR_DRIVERS = {
+    "pe": {"return_on_equity"},
+    "pe_norm": {"return_on_equity"},
+    "pb": {"log_book_value"},
+    # EV/EBITDA = (EV / assets) / (asset turnover x EBITDA margin)
+    "ev_ebitda": {"asset_turnover"},
+    "ps": {"asset_turnover", "log_revenue"},
+    "pfcf": {"fcf_margin", "cash_conversion_3y", "log_revenue"},  # P/FCF = PSR / FCF margin: sales below
+}
+
+
 def _driver_text(row: pd.Series, key: str) -> str:
     """'ROE +22%, 매출성장률 +9% / 변동성 -12%' — how each fundamental moved
-    this stock's fair multiple vs. the average stock at that date."""
+    this stock's fair multiple vs. the average stock at that date. Drivers in
+    DENOMINATOR_DRIVERS are marked "(분모 효과)"."""
     drivers = [*target_features(FAIR_VALUE_TARGETS[key], FAIR_VALUE_FEATURES), "sector"]
     effects = {driver: row.get(f"{key}_contrib_{driver}", np.nan) for driver in drivers}
     effects = {d: v for d, v in effects.items() if pd.notna(v) and abs(v) >= MIN_DRIVER_EFFECT}
@@ -316,7 +440,8 @@ def _driver_text(row: pd.Series, key: str) -> str:
         # "what stocks with this value missing usually trade at" (e.g. no ROE
         # because equity is negative), not the company's actual figure.
         missing = driver != "sector" and pd.isna(row.get(driver))
-        return f"{FEATURE_LABELS_KO[driver]}{'(값 없음)' if missing else ''} {np.expm1(effects[driver]):+.0%}"
+        mechanical = "(분모 효과)" if driver in DENOMINATOR_DRIVERS.get(key, ()) else ""
+        return f"{FEATURE_LABELS_KO[driver]}{'(값 없음)' if missing else ''} {np.expm1(effects[driver]):+.0%}{mechanical}"
 
     parts = []
     if ups:
@@ -366,6 +491,24 @@ def explain(row: pd.Series) -> str:
     skipped = [spec["label"] for spec in FAIR_VALUE_TARGETS.values() if row.get("sector") in spec.get("exclude_sectors", ())]
     if skipped:
         lines.append(f"{'·'.join(skipped)}: 금융업은 매출·EBITDA·현금흐름의 의미가 달라 비교하지 않음 (PER·PBR로만 판단)")
+    expectation = _expectation_text(row)
+    if expectation:
+        lines.append(expectation)
+    detail = row.get("label_detail")
+    note = ""
+    if isinstance(detail, str) and ONE_OFF_NOTE in detail:
+        note += " — 최근 12개월에 일회성 손익이 있어 실제 성장이 부풀거나 꺾였을 수 있음"
+    if isinstance(detail, str) and BASE_EFFECT_NOTE in detail:
+        note += " — 3년 전 이익이 지금의 1/8도 안 돼 성장률이 작은 기저 때문에 커 보일 수 있음"
+    if detail == NO_GROWTH_HISTORY:
+        lines.append(f"→ {row['valuation_label']} · {detail}: 3년 이익 성장률을 계산할 수 없어(지금 적자, "
+                     "또는 3년 미만 이력) 이유를 나누지 않음")
+    elif isinstance(detail, str) and detail.startswith(TURNAROUND):
+        lines.append(f"→ {row['valuation_label']} · {detail}: 3년 전 적자에서 지금 흑자로 돌아서 성장률 대신 "
+                     f"전환 자체를 실적으로 봄{note}")
+    elif isinstance(detail, str) and detail:
+        lines.append(f"→ {row['valuation_label']} · {detail}: 중간 종목 대비 최근 3년 실제 초과 성장 "
+                     f"{row['realized_excess_growth']:+.1%} vs 가격에 반영된 초과 성장 {row['implied_excess_growth']:+.1%}{note}")
     if row.get("loss_flag"):
         lines.append(
             "최근 12개월 적자 — 일회성 손상인지 구조적 부진인지 재무 지표만으로 구분할 수 없어 판단을 보류함 "
@@ -393,16 +536,21 @@ def screen(panel: pd.DataFrame) -> pd.DataFrame:
     df = flag_report_lag(df)
     df = flag_fundamental_break(df)
     df = flag_single_view(df)
+    df = add_expectations(df)
+    df = add_label_detail(df)  # after the break flag, which it reads
     return classify_valuation_transition(df)
 
 
 REPORT_COLUMNS = [
-    "ticker", "sector", "size_group", "as_of", "valuation_label", "cheapness_rank", "valuation_gap_pct", "valuation_basis",
+    "ticker", "sector", "size_group", "as_of", "valuation_label", "label_detail", "valuation_view",
+    "cheapness_rank", "valuation_gap_pct", "valuation_basis",
     "n_gaps", "gap_agreement",
     "trailing_pe", "fair_pe", "price_to_book", "fair_pb", "price_to_sales", "fair_ps",
     "ev_to_ebitda", "fair_ev_ebitda", "price_to_fcf", "fair_pfcf", "normalized_pe", "fair_pe_norm",
     "pe_gap", "pb_gap", "ps_gap", "ev_ebitda_gap", "pfcf_gap", "pe_norm_gap",
     "dividend_yield", "dividend_years_no_cut",
+    "implied_excess_growth", "realized_excess_growth", "earnings_cagr_3y", "earnings_cagr_3y_median",
+    "earnings_turnaround_3y",
     "sector_valuation_rank", "quality_score",
     "momentum_score", "loss_flag", "meme_flag", "value_trap_flag", "transition_flag", "transition_type",
     "report_lag_flag", "price_move_since_report", "fundamental_break_flag", "single_view_flag",

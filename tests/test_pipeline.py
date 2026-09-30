@@ -31,6 +31,10 @@ from features import (
     build_raw_panel,
 )
 from screening import (
+    _driver_text,
+    _expectation_text,
+    add_expectations,
+    add_label_detail,
     add_labels,
     classify_valuation_transition,
     flag_meme_stock,
@@ -175,6 +179,41 @@ def test_revenue_growth_and_trends():
     assert np.allclose(cagr, 0.08, atol=1e-9)
     vol = trends["op_margin_volatility"]
     assert vol.iloc[:7].isna().all() and np.isclose(vol.iloc[-1], np.std(margin[-12:], ddof=1))
+
+
+def test_durability_features():
+    """Steady business: EPS +10%/yr, sales always up, no losses, stable
+    margins. Its twin has one loss quarter and bumpier EPS, and must come out
+    less durable on every measure."""
+    periods = pd.date_range("2016-03-31", periods=24, freq="QE")
+    steady_eps = 1.0 * 1.10 ** (np.arange(24) / 4)
+    base = {"period": periods, "sales_per_share": 10 * 1.08 ** (np.arange(24) / 4), "operating_margin": 0.2,
+            "return_on_equity": 0.25, "gross_margin": 0.4, "fcf_margin": 0.18, "net_margin": 0.15}
+    steady = add_fundamental_trends(pd.DataFrame({**base, "eps": steady_eps})).iloc[-1]
+    assert np.isclose(steady["eps_cagr_3y"], 0.10, atol=1e-9)
+    assert steady["growth_consistency_3y"] == 1.0 and steady["loss_share_3y"] == 0.0
+    assert np.isclose(steady["cash_conversion_3y"], 0.18 / 0.15)
+    assert steady["roe_volatility_3y"] == 0.0 and steady["gross_margin_volatility_3y"] == 0.0
+
+    assert np.isclose(steady["earnings_cagr_3y"], 0.10, atol=1e-9) and steady["earnings_turnaround_3y"] == 0
+    assert steady["roe_spike"] == 0.0  # a steady ROE is not a spike, however high
+    # steady growth: TTM EPS sits a little above its 3-year average, nowhere near a one-off jump
+    assert 1.0 < steady["eps_spike"] < 1.2
+
+    bumpy_eps = steady_eps * np.tile([1.4, 0.6, 1.2, 0.8], 6)
+    bumpy_eps[-5] = -0.5
+    bumpy = add_fundamental_trends(pd.DataFrame({**base, "eps": bumpy_eps})).iloc[-1]
+    assert np.isclose(bumpy["loss_share_3y"], 1 / 12)
+    assert bumpy["eps_volatility_3y"] > steady["eps_volatility_3y"] + 0.2
+
+    # a bank without EPS: net income = TTM ROE x equity (+10%/yr); a turnaround: loss 3 years ago
+    bank = add_fundamental_trends(pd.DataFrame({**base, "eps": np.nan, "book_value": 1000.0,
+                                                "return_on_equity": 0.1 * 1.10 ** (np.arange(24) / 4)})).iloc[-1]
+    assert pd.isna(bank["eps_cagr_3y"]) and np.isclose(bank["earnings_cagr_3y"], 0.10, atol=1e-9)
+    turned_eps = steady_eps.copy()
+    turned_eps[8:12] = -0.3  # the TTM window 3 years before the last quarter is a loss
+    turned = add_fundamental_trends(pd.DataFrame({**base, "eps": turned_eps})).iloc[-1]
+    assert turned["earnings_turnaround_3y"] == 1 and pd.isna(turned["earnings_cagr_3y"])
 
 
 def test_fundamental_breaks_hon_2026():
@@ -419,8 +458,12 @@ def test_out_of_range_multiples_get_no_gap():
     panel.loc[panel["ticker"] == "T053", ["trailing_pe", "eps"]] = [np.nan, -1.0]  # loss, other multiples usable
     panel.loc[panel["ticker"] == "T055", ["trailing_pe", "eps", "price_to_sales"]] = [np.nan, -1.0, np.nan]
     panel.loc[panel["ticker"] == "T057", "price_to_sales"] = 90.0  # above PSR max
+    # negative equity (no ROE), one positive quarter, a TTM loss: AAL/CAR on 2026-09-30
+    panel["eps_ttm"] = 8.0
+    panel.loc[panel["ticker"] == "T059", ["trailing_pe", "return_on_equity", "eps_ttm"]] = [np.nan, np.nan, -0.5]
     out, _ = add_fair_value(panel)
     out = _labelled(out).set_index("ticker")
+    assert out.loc["T059", "loss_flag"] and out.loc["T059", "valuation_label"] == "판단 보류(적자)"
     assert pd.isna(out.loc["T049", "pe_gap"]) and pd.notna(out.loc["T049", "pb_gap"])
     assert out.loc["T049", "valuation_basis"] == "PBR+PSR+EV/EBITDA+P/FCF" and out.loc["T049", "n_gaps"] == 4
     assert pd.isna(out.loc["T051", "pb_gap"])
@@ -476,6 +519,9 @@ def test_compare_feature_sets():
     assert {"sector_median", "without_growth", "-revenue_growth_yoy", "current"} <= set(table.columns)
     assert (table.loc["pe", "current"] > table.loc["pe", "without_growth"] + 0.05).all()
     assert np.allclose(table["without_growth"], table["-revenue_growth_yoy"])
+    # the R^2-only path gives the same numbers as the full fit
+    full = add_fair_value(panel)[1].groupby(["target", "split"])["r2_model"].mean()
+    assert np.allclose(table["current"].dropna().sort_index(), full.reindex(table["current"].dropna().index).sort_index())
 
 
 def test_parallel_fits_match_sequential():
@@ -687,6 +733,62 @@ def test_single_view_flag():
     assert row["single_view_flag"] and "PBR 한 가지 배수" in row["single_view_reason"]
     assert "한 가지 관점으로만 판단" in row["explanation"]
     assert not report.drop("T001")["single_view_flag"].any()
+
+
+def test_denominator_drivers_are_marked():
+    row = pd.Series({"pfcf_contrib_fcf_margin": -0.18, "pfcf_contrib_revenue_growth_yoy": 0.12,
+                     "pfcf_contrib_sector": 0.3, "fcf_margin": 0.3, "revenue_growth_yoy": 0.2})
+    text = _driver_text(row, "pfcf")
+    assert "FCF이익률 -16%(분모 효과)" in text and "매출성장률 +13%" in text and "매출성장률 +13%(" not in text
+
+
+def test_priced_in_expectations():
+    """A PER twice the median needs 2^(1/10)-1 ~ 7.2% more EPS growth a year
+    for 10 years; the median stock needs none; no PER, no number."""
+    panel = pd.DataFrame({
+        "as_of": pd.Timestamp("2026-09-29"), "ticker": ["A", "B", "C", "D", "E"],
+        "trailing_pe": [20.0, 40.0, 10.0, np.nan, 500.0],  # E: above the PER bounds, left out of the median
+        "eps_cagr_3y": [0.05, 0.20, 0.00, np.nan, 0.30],
+    })
+    out = add_expectations(panel).set_index("ticker")
+    assert np.isclose(out.loc["A", "implied_excess_growth"], 0.0)
+    assert np.isclose(out.loc["B", "implied_excess_growth"], 2 ** 0.1 - 1)
+    assert pd.isna(out.loc["D", "implied_excess_growth"]) and out.loc["E", "implied_excess_growth"] > 0.3
+    assert np.isclose(out["earnings_cagr_3y_median"].iloc[0], 0.125)
+    text = _expectation_text(out.loc["B"])
+    assert "매년 약 7% 더" in text and "최근 3년 이익 성장률 연 +20%" in text
+    assert _expectation_text(out.loc["D"]) == ""
+
+
+def test_label_detail_splits_by_delivered_growth():
+    """Premium/discount split by delivered vs. priced-in growth: median PER
+    20 and median 3-year EPS growth 10% (from the middle rows)."""
+    panel = pd.DataFrame({
+        "as_of": pd.Timestamp("2026-09-30"),
+        "ticker": ["PROVEN", "HOPE", "GLOOM", "UNLOVED", "LOSS", "EVEN", "MID1", "MID2", "MIDHOPE", "MIDLOW",
+                   "F1", "F2", "F3", "F4", "TURN", "TINYBASE"],
+        "valuation_label": ["고평가", "고평가", "저평가", "저평가", "고평가", "고평가", "중립", "중립", "중립", "중립",
+                            "중립", "중립", "중립", "중립", "저평가", "고평가"],
+        # median PER 20 (fillers F1-F4 keep it there): 40 needs +7.2%/yr over the median stock, 10 needs -6.7%/yr
+        "trailing_pe": [40.0, 40.0, 10.0, 10.0, 40.0, 40.0, 20.0, 20.0, 40.0, 20.0, 20.0, 20.0, 20.0, 20.0, 150.0,
+                        150.0],
+        "earnings_cagr_3y": [0.25, 0.10, -0.05, 0.10, np.nan, 0.18, 0.10, 0.10, 0.10, 0.20, 0.10, 0.10, 0.10, 0.10,
+                             np.nan, 5.86],
+        "earnings_turnaround_3y": [0.0] * 4 + [np.nan] + [0.0] * 9 + [1.0, 0.0],
+        "fundamental_break_flag": [False] * 9 + [True] + [False] * 6,
+    })
+    out = add_label_detail(add_expectations(panel)).set_index("ticker")
+    assert out.loc["PROVEN", "label_detail"] == "실적 뒷받침"   # +13.6% delivered vs +7.2% priced in
+    assert out.loc["HOPE", "label_detail"] == "기대 위주"       # 0% delivered vs +7.2%
+    assert out.loc["GLOOM", "label_detail"] == "실적 부진 반영"  # -13.6% vs -6.7%
+    assert out.loc["UNLOVED", "label_detail"] == "실적 대비 과도한 할인"  # 0% vs -6.7%
+    assert out.loc["EVEN", "label_detail"] == "기대와 실적 비슷"  # +7.3% vs +7.2%: inside the band
+    assert out.loc["LOSS", "label_detail"] == "성장 이력 없음"
+    assert out.loc["MID1", "label_detail"] == "기대와 실적 비슷" and out.loc["MIDHOPE", "label_detail"] == "기대 위주"
+    assert out.loc["MIDLOW", "label_detail"] == "실적 대비 기대 낮음 (일회성 손익 가능)"
+    assert out.loc["TURN", "label_detail"] == "흑자 전환"
+    assert out.loc["TINYBASE", "label_detail"] == "실적 뒷받침 (기저 효과 가능)"  # BROS: +586%/yr from a tiny base
+    assert out.loc["HOPE", "valuation_view"] == "고평가 · 기대 위주"
 
 
 def test_report_lag_flag():
