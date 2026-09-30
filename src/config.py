@@ -255,6 +255,20 @@ FAIR_VALUE_MIN_GAIN = 0.01
 # Confidence score (logistic on flags + high-error sectors, fitted on Train):
 # low-confidence group's large-error rate 1.7-2.0x the rest in Val/Test, AUC
 # .62 — below the pre-set 2x, so no confidence rating; flags stay warnings.
+# After the freeze (baseline-2026-09-30), scratch-only tests, criteria fixed in
+# advance, all rejected (2026-10-01):
+#   - market risk (diagnostic): beta + idiosyncratic vol + turnover-based
+#     illiquidity add ~+.02 R^2; Amihud's +.11 is market cap leaking in (rank
+#     corr with log market cap -.95; market cap alone +.19).
+#   - PER on SEC-XBRL earnings net of impairments, disposal/deconsolidation
+#     gains, debt-extinguishment and discontinued ops (filed-date point in
+#     time, dates >= 2012): HON fixed (PER 7.8 -> 16.9) but one-off-flagged
+#     large-error rate +8-9% and PER R^2 -.015 to -.030.
+#   - R&D/sales, SBC/sales, capex/D&A (one bundle): +.02 to +.07 on every
+#     multiple, almost all from SBC. SBC follows the share price (10% return ->
+#     +1.9% SBC next year, t 9.4) and adds <= .008 once the own multiples of 2
+#     years ago are in: price contamination can't be ruled out, nothing left
+#     beyond past valuation. R&D alone mainly EV/EBITDA (+.02, denominator).
 
 # Finnhub's quarterly multiples are computed at the fiscal period-end price,
 # but a snapshot is 45-135 days later. When True, features.build_raw_panel
