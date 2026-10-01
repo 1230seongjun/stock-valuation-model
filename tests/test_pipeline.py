@@ -32,6 +32,8 @@ from fair_value import (
     top_overlap,
 )
 from features import (
+    _accruals_asof,
+    _sec_prepare,
     _dividend_features,
     add_fundamental_trends,
     add_percentile_scores,
@@ -308,6 +310,112 @@ def test_no_look_ahead():
     pd.testing.assert_frame_equal(known_a, known_b)
     later = base["as_of"] > cutoff
     assert not base.loc[later, "price"].equals(scrambled.loc[later, "price"]), "scramble had no effect"
+
+
+def _sec_facts(rows):
+    df = pd.DataFrame(rows, columns=["tag", "start", "end", "val", "filed"])
+    for col in ("start", "end", "filed"):
+        df[col] = pd.to_datetime(df[col])
+    return df
+
+
+def test_accruals_point_in_time():
+    """Accruals use only SEC facts FILED by as_of, the original filing (not a
+    later restatement), and build the TTM from year-to-date values the way
+    10-Qs report cash flow: prior year + this YTD - last year's YTD."""
+    facts = _sec_facts([
+        ("Assets", "2021-12-31", "2021-12-31", 1000, "2022-02-20"),
+        ("Assets", "2021-12-31", "2021-12-31", 2000, "2023-02-20"),  # restated a year later: ignored
+        ("NetIncomeLoss", "2021-01-01", "2021-12-31", 100, "2022-02-20"),
+        ("NetCashProvidedByUsedInOperatingActivities", "2021-01-01", "2021-12-31", 60, "2022-02-20"),
+        ("NetIncomeLoss", "2021-01-01", "2021-09-30", 70, "2022-11-01"),  # comparative in the 2022 10-Q
+        ("NetIncomeLoss", "2022-01-01", "2022-09-30", 90, "2022-11-01"),
+        ("NetCashProvidedByUsedInOperatingActivities", "2021-01-01", "2021-09-30", 40, "2022-11-01"),
+        ("NetCashProvidedByUsedInOperatingActivities", "2022-01-01", "2022-09-30", 50, "2022-11-01"),
+        ("Assets", "2022-09-30", "2022-09-30", 1100, "2022-11-01"),
+    ])
+    sec = _sec_prepare(facts)
+    acc = lambda as_of, period: _accruals_asof(sec, pd.Timestamp(as_of), pd.Timestamp(period))
+    assert np.isnan(acc("2022-02-19", "2021-12-31")), "10-K not filed yet"
+    assert np.isclose(acc("2022-03-01", "2021-12-31"), (100 - 60) / 1000)
+    assert np.isclose(acc("2023-06-01", "2021-12-31"), (100 - 60) / 1000), "original filing, not the restatement"
+    assert np.isnan(acc("2022-10-31", "2022-09-30")), "10-Q not filed yet"
+    assert np.isclose(acc("2022-11-15", "2022-09-30"), ((100 + 90 - 70) - (60 + 50 - 40)) / 1100)
+    assert np.isnan(_accruals_asof(None, pd.Timestamp("2022-11-15"), pd.Timestamp("2022-09-30")))
+    assets_only = _sec_prepare(facts[facts["tag"] == "Assets"])  # a filer without NetIncomeLoss (custom tag)
+    assert np.isnan(_accruals_asof(assets_only, pd.Timestamp("2022-03-01"), pd.Timestamp("2021-12-31")))
+
+
+def test_accruals_in_panel_wait_for_the_filing():
+    """In the panel, accruals belong to the same fiscal period as the
+    Finnhub fundamentals and appear only once that period's SEC filing is
+    in; a ticker without SEC facts gets NaN."""
+    tickers, universe, prices, fundamentals = make_raw_data(n_tickers=2)
+    t = tickers[0]
+    facts = _sec_facts([
+        ("Assets", "2021-09-30", "2021-09-30", 1000, "2021-12-10"),
+        ("NetIncomeLoss", "2020-10-01", "2021-09-30", 80, "2021-12-10"),  # a September fiscal year
+        ("NetCashProvidedByUsedInOperatingActivities", "2020-10-01", "2021-09-30", 50, "2021-12-10"),
+    ])
+    as_of = [pd.Timestamp("2021-12-01"), pd.Timestamp("2022-01-01")]
+    panel = build_raw_panel(tickers, prices, fundamentals, universe, as_of, sec_facts={t: facts}).set_index(["ticker", "as_of"])
+    assert (panel.loc[t, "fundamentals_period"] == pd.Timestamp("2021-09-30")).all()
+    assert np.isnan(panel.loc[(t, as_of[0]), "accruals"]), "filed 2021-12-10, after the first snapshot"
+    assert np.isclose(panel.loc[(t, as_of[1]), "accruals"], (80 - 50) / 1000)
+    assert panel.loc[tickers[1], "accruals"].isna().all()
+
+
+def test_load_sec_facts_from_the_bulk_zip():
+    """Reads only the needed tags from the hand-downloaded zip, matches class
+    shares (MOG.A = SEC's MOG-A) by CIK, re-extracts when the zip changes, and
+    without the files returns {} so the model fits as before."""
+    import json
+    import tempfile
+    import zipfile
+
+    from data import load_sec_facts
+
+    with tempfile.TemporaryDirectory() as tmp:
+        assert load_sec_facts(["AAA"], cache_dir=tmp) == {}
+        sec = Path(tmp) / "sec"
+        sec.mkdir()
+        (sec / "company_tickers.json").write_text(json.dumps({"0": {"cik_str": 1, "ticker": "AAA"}, "1": {"cik_str": 2, "ticker": "MOG-A"}}))
+        fact = lambda val, filed, form="10-K": {"start": "2021-01-01", "end": "2021-12-31", "val": val, "filed": filed, "form": form}
+        def write(val):
+            with zipfile.ZipFile(sec / "companyfacts.zip", "w") as z:
+                for cik in (1, 2):
+                    z.writestr(f"CIK{cik:010d}.json", json.dumps({"facts": {"us-gaap": {
+                        "NetIncomeLoss": {"units": {"USD": [fact(val, "2022-02-20"), fact(999, "2022-03-01", "8-K")]}},
+                        "Revenues": {"units": {"USD": [fact(5, "2022-02-20")]}},
+                        "Assets": {"units": {"USD": [{"end": "2021-12-31", "val": 1000, "filed": "2022-02-20", "form": "10-K"}]}}}}}))
+        write(100)
+        out = load_sec_facts(["AAA", "MOG.A", "ZZZ"], cache_dir=tmp, n_jobs=1)
+        assert set(out) == {"AAA", "MOG.A"}
+        aaa = out["AAA"].set_index("tag")
+        assert set(aaa.index) == {"NetIncomeLoss", "Assets"}, "only SEC_TAGS from 10-K/10-Q forms"
+        assert aaa.loc["NetIncomeLoss", "val"] == 100 and aaa.loc["Assets", "start"] == aaa.loc["Assets", "end"]
+        import os, time
+        time.sleep(1.1)
+        write(200)  # a newer download
+        os.utime(sec / "companyfacts.zip")
+        assert load_sec_facts(["AAA"], cache_dir=tmp, n_jobs=1)["AAA"].set_index("tag").loc["NetIncomeLoss", "val"] == 200
+
+
+def test_accruals_ignored_for_financials():
+    """config.FAIR_VALUE_FEATURE_EXCLUDE_SECTORS: a financial's accruals
+    (operating cash flow mixes in loans) change no fair multiple."""
+    panel = build_synthetic_panel(n_tickers=80)
+    rng = np.random.default_rng(3)
+    panel["accruals"] = rng.normal(0, 0.05, len(panel))
+    fin = panel["sector"] == "Financials"
+    a, _ = add_fair_value(panel, n_jobs=1)
+    changed = panel.copy()
+    changed.loc[fin, "accruals"] = rng.normal(0, 0.5, fin.sum())
+    b, _ = add_fair_value(changed, n_jobs=1)
+    pd.testing.assert_series_equal(a["fair_pe"], b["fair_pe"])
+    changed.loc[~fin, "accruals"] = rng.normal(0, 0.05, (~fin).sum())  # not a sign flip: ranks would just mirror
+    c, _ = add_fair_value(changed, n_jobs=1)
+    assert not np.allclose(a["fair_pe"].fillna(0), c["fair_pe"].fillna(0)), "non-financials' accruals still count"
 
 
 def test_fiscal_q4_detection():

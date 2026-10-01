@@ -15,6 +15,14 @@ Derived in features.py from raw components fetched here:
 Finnhub gives only the fiscal `period` end date, not the filing date, so
 features.py treats each quarter as known from period + REPORTING_LAG_DAYS.
 
+SEC XBRL company facts (load_sec_facts, 2026-10-01): net income, operating
+cash flow and total assets WITH their filing dates, for the accruals feature
+(features._accruals_asof). sec.gov refuses scripted downloads from some
+networks ("Undeclared Automated Tool", 403), so the two bulk files are
+downloaded by hand into <cache_dir>/sec/ (see SEC_* below). Without them the
+feature is simply empty and the model fits as before. XBRL starts 2009-2011,
+so earlier snapshots have no accruals either.
+
 CACHE: fetching the whole universe takes minutes (Finnhub free tier is 50
 calls/min), and a past quarter's fundamentals or a past day's price never
 change, so each ticker's raw response is stored under `cache_dir` and reused.
@@ -338,6 +346,92 @@ def collect(
         print(f"  {len(failed)} fetches failed after retries: {', '.join(failed)}")
         print("  -> re-run build to fetch just these (everything else is cached)")
     return prices, fundamentals
+
+
+# Hand-downloaded SEC bulk files (see the module docstring), in <cache_dir>/sec/:
+#   https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip  (~1.4 GB, never unzipped)
+#   https://www.sec.gov/files/company_tickers.json
+SEC_DIR = "sec"
+SEC_COMPANYFACTS = "companyfacts.zip"
+SEC_TICKERS = "company_tickers.json"
+SEC_TAGS = ("NetIncomeLoss", "NetCashProvidedByUsedInOperatingActivities", "Assets")
+SEC_FORMS = ("10-K", "10-Q", "10-K/A", "10-Q/A")
+SEC_FACT_COLUMNS = ["tag", "start", "end", "val", "filed"]
+
+
+def _sec_extract(pairs: list[tuple[str, int]], zip_path: Path, out_dir: Path) -> None:
+    """SEC_TAGS of each (ticker, CIK) from the zip into out_dir/<ticker>.parquet.
+    Balance-sheet values are instants (no start): start = end."""
+    import json
+    import zipfile
+
+    with zipfile.ZipFile(zip_path) as z:
+        names = set(z.namelist())
+        for ticker, cik in pairs:
+            name = f"CIK{cik:010d}.json"
+            rows = []
+            if name in names:
+                facts = json.loads(z.read(name)).get("facts", {}).get("us-gaap", {})
+                rows = [(tag, x.get("start", x["end"]), x["end"], x["val"], x["filed"])
+                        for tag in SEC_TAGS for x in facts.get(tag, {}).get("units", {}).get("USD", [])
+                        if x.get("form") in SEC_FORMS]
+            pd.DataFrame(rows, columns=SEC_FACT_COLUMNS).to_parquet(out_dir / f"{ticker}.parquet")
+
+
+def load_sec_facts(
+    tickers: list[str], cache_dir: str | Path = DEFAULT_CACHE_DIR, force_refresh: bool = False,
+    n_jobs: int | None = None,
+) -> dict[str, pd.DataFrame]:
+    """SEC_TAGS facts per ticker (columns SEC_FACT_COLUMNS, dates as
+    Timestamps), extracted once from the hand-downloaded companyfacts.zip into
+    <cache_dir>/sec_facts/ and re-extracted when the zip changes (a newer
+    download) or force_refresh. Tickers are matched by CIK through
+    company_tickers.json (class shares: our MOG.A = SEC's MOG-A). No files ->
+    {} with a note; a ticker without an SEC filer (OZK, PFBC file with bank
+    regulators) gets no entry."""
+    from config import N_JOBS
+
+    sec_dir, out_dir = Path(cache_dir) / SEC_DIR, Path(cache_dir) / "sec_facts"
+    zip_path, map_path = sec_dir / SEC_COMPANYFACTS, sec_dir / SEC_TICKERS
+    if not (zip_path.exists() and map_path.exists()):
+        print(f"SEC facts: {zip_path} / {map_path.name} not found -> accruals left empty "
+              f"(download them by hand, see data.SEC_DIR)")
+        return {}
+    import json
+
+    stat = zip_path.stat()
+    source = f"{stat.st_size} {int(stat.st_mtime)}"
+    marker = out_dir / "_source.txt"
+    fresh = force_refresh or not marker.exists() or marker.read_text() != source
+    ciks = {v["ticker"].upper(): int(v["cik_str"]) for v in json.loads(map_path.read_text()).values()}
+    pairs = [(t, ciks.get(t.upper()) or ciks.get(t.upper().replace(".", "-"))) for t in tickers]
+    missing = [t for t, c in pairs if c is None]
+    pairs = [(t, c) for t, c in pairs if c is not None]
+    todo = pairs if fresh else [(t, c) for t, c in pairs if not (out_dir / f"{t}.parquet").exists()]
+    print(f"SEC facts for {len(pairs)} tickers ({len(todo)} to extract from {zip_path})...")
+    if todo:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        n_jobs = N_JOBS if n_jobs is None else n_jobs
+        if n_jobs == 1 or len(todo) < 50:
+            _sec_extract(todo, zip_path, out_dir)
+        else:
+            from joblib import Parallel, delayed
+
+            k = 8  # chunks, each opening the zip once
+            Parallel(n_jobs=min(k, os.cpu_count() or 1) if n_jobs == -1 else n_jobs)(
+                delayed(_sec_extract)(todo[i::k], zip_path, out_dir) for i in range(k))
+        marker.write_text(source)
+    out = {}
+    for t, _ in pairs:
+        df = pd.read_parquet(out_dir / f"{t}.parquet")
+        if not df.empty:
+            for col in ("start", "end", "filed"):
+                df[col] = pd.to_datetime(df[col])
+            out[t] = df
+    if missing:
+        print(f"  no SEC CIK for {len(missing)}: {', '.join(missing[:_MAX_LISTED])}")
+    print(f"  {len(out)} tickers with facts")
+    return out
 
 
 _MAX_LISTED = 25  # tickers printed per issue; the rest are counted

@@ -203,9 +203,21 @@ INDUSTRY_MIN_TICKERS = 20
 # Extended universe + current features (2026-09-29, 59,961 labelled rows):
 # 0.43 vs. 0.43 with a break (26%), PER 0.32 vs. 0.35 without; R^2
 # 0.25/0.27 vs. PER's 0.38/0.44. Not better even where the TTM is broken.
+# accruals for PER (2026-10-01, user decision): (TTM net income - TTM operating
+# cash flow) / assets from SEC XBRL (features._accruals_asof; 2012+ coverage
+# 72-91%, none before ~2010). Dates >= 2012, PER R^2 +.017/+.019/+.026
+# (train/val/test), rank corr .653 -> .665 (val), p90 error 141% -> 135%;
+# coefficient -.098 [IQR -.123, -.074], negative on all 60 dates. Checks fixed
+# in advance: T1 beats 20 within-date shuffles (max -.0004); T2 positive on
+# 98% of dates, every year 2012-2026; T3 large/mid/small +.017/+.026/+.022;
+# T4 without fundamental-break flags +.012/+.012/+.019; T6 on top of XBRL
+# NI/assets +.017/+.021/+.026; T5 FAILED: normalized PER +.006/+.009/+.016
+# (< .01) — part of the effect goes with the current earnings level, so
+# don't read it as pure "earnings quality". Adopted despite T5 by the user.
+# PER only; labels 95.7% unchanged, no cheap<->rich flips.
 FAIR_VALUE_TARGETS = {
     "pe": {"column": "trailing_pe", "min": 1.0, "max": 100.0, "label": "PER",
-           "extra_features": ("log_book_value", "roe_avg_3y")},
+           "extra_features": ("log_book_value", "roe_avg_3y", "accruals")},
     "pb": {"column": "price_to_book", "min": 0.1, "max": 20.0, "label": "PBR",
            "extra_features": ("net_debt_to_capital", "log_book_value", "roe_avg_3y", "log_revenue",
                               "eps_volatility_3y")},
@@ -219,6 +231,14 @@ FAIR_VALUE_TARGETS = {
     "pe_norm": {"column": "normalized_pe", "min": 1.0, "max": 100.0, "label": "정규화 PER",
                 "in_verdict": False, "extra_features": ("log_book_value", "roe_avg_3y")},
 }
+# Features set to missing for some sectors before the per-date transform (so
+# they neither shape the percentiles nor move those stocks' fair multiples).
+# accruals for Financials (2026-10-01, user decision): a lender's operating
+# cash flow mixes in loans and deposits — the same reason P/FCF skips them.
+# Costs PER R^2 (dates >= 2012) +.018/+.019/+.026 -> +.012/+.012/+.016:
+# accruals did explain financials' PER a little, but likely through
+# something other than earnings quality (e.g. loan growth).
+FAIR_VALUE_FEATURE_EXCLUDE_SECTORS = {"accruals": ("Financials",)}
 FAIR_VALUE_MIN_GAIN = 0.01
 # Tried and rejected 2026-09-30 (judged on R^2, Spearman, stability and
 # top-20% overlap, not R^2 alone):
@@ -269,6 +289,22 @@ FAIR_VALUE_MIN_GAIN = 0.01
 #     +1.9% SBC next year, t 9.4) and adds <= .008 once the own multiples of 2
 #     years ago are in: price contamination can't be ruled out, nothing left
 #     beyond past valuation. R&D alone mainly EV/EBITDA (+.02, denominator).
+# Also 2026-10-01, rejected (criteria fixed in advance):
+#   - oracle (diagnostic, future data): realized next 1-2y sales/EPS growth
+#     adds only +.034 mean Val R^2 — even perfect foresight of fundamentals
+#     explains little more; consensus could add more only by encoding beliefs.
+#   - sector-specific coefficients (own Ridge for sectors with >= 100 stocks,
+#     global percentiles): PER -.022, PBR -.006 Val; nothing passes.
+#   - gap vs the stock's own last 12 quarters (z): chronic extremes' share of
+#     the labels 42-47% -> 9%, small caps' share of the cheap 20% .61 -> .45,
+#     but quarter-to-quarter rank corr .88 -> .58 (< .80): labels unchanged.
+#   - bundles from SEC XBRL, dates >= 2012: goodwill+intangibles/assets and
+#     1y diluted share change pass on EV/EBITDA or P/FCF but vanish once the
+#     own multiples of 2 years ago are in; interest coverage, cash/assets and
+#     total payout add ~0. Accruals passed -> adopted for PER (see above).
+#   - accruals coverage dips 2014-2018 (48-62%): many filers tag operating
+#     cash flow differently then (2016: 54% vs. net income 82%). Adding the
+#     other tag would change the validated values — a separate experiment.
 
 # Finnhub's quarterly multiples are computed at the fiscal period-end price,
 # but a snapshot is 45-135 days later. When True, features.build_raw_panel

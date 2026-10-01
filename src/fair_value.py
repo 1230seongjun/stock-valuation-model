@@ -82,6 +82,7 @@ from statsmodels.stats.multitest import multipletests
 
 from config import (
     FAIR_VALUE_CV_FOLDS,
+    FAIR_VALUE_FEATURE_EXCLUDE_SECTORS,
     FAIR_VALUE_FEATURE_TRANSFORM,
     FAIR_VALUE_FEATURES,
     FAIR_VALUE_MIN_ROWS,
@@ -104,6 +105,7 @@ CATEGORICAL_FEATURES = ("industry",)
 
 FEATURE_LABELS_KO = {
     "return_on_equity": "ROE",
+    "accruals": "발생액(이익−영업현금흐름)",
     "operating_margin": "영업이익률",
     "revenue_growth_yoy": "매출성장률",
     "debt_to_equity": "부채비율",
@@ -204,6 +206,8 @@ def _prepare_features(
         groups[feat] = cols
     for feat in (f for f in features if f not in CATEGORICAL_FEATURES and f in cross_section.columns):
         raw = cross_section[feat].astype(float)
+        # a feature meaningless for a sector (config) is treated as missing there
+        raw = raw.where(~cross_section["sector"].isin(FAIR_VALUE_FEATURE_EXCLUDE_SECTORS.get(feat, ())))
         if transform == "rank":
             raw = raw.rank(pct=True)
         elif raw.notna().sum() >= 3:

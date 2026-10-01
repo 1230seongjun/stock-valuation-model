@@ -34,7 +34,7 @@ from config import (
     TRAIN_START,
     UNIVERSE_INDEXES,
 )
-from data import DEFAULT_CACHE_DIR, collect, collect_fiscal_year_ends, data_quality_report
+from data import DEFAULT_CACHE_DIR, collect, collect_fiscal_year_ends, data_quality_report, load_sec_facts
 from fair_value import (
     add_fair_value,
     coefficient_summary,
@@ -78,13 +78,14 @@ def build(api_key: str | None = None, cache_dir: str | Path = DEFAULT_CACHE_DIR,
     print(f"Universe: {len(tickers)} tickers ({', '.join(f'{k} {v}' for k, v in sizes.items())})")
     prices, fundamentals = collect(tickers, api_key=api_key, cache_dir=cache_dir, force_refresh=force_refresh)
     fiscal_year_ends = collect_fiscal_year_ends(tickers, api_key=api_key, cache_dir=cache_dir)
+    sec_facts = load_sec_facts(tickers, cache_dir=cache_dir)
     data_quality_report(prices, fundamentals)
 
     as_of_dates = build_as_of_dates(TRAIN_START)
     print(f"\nBuilding point-in-time panel: {len(as_of_dates)} snapshots "
           f"({as_of_dates[0].date()} ~ {as_of_dates[-1].date()})...")
     panel = add_percentile_scores(build_raw_panel(tickers, prices, fundamentals, universe, as_of_dates,
-                                                  fiscal_year_ends=fiscal_year_ends))
+                                                  fiscal_year_ends=fiscal_year_ends, sec_facts=sec_facts))
     if panel.empty:
         raise RuntimeError("panel is empty — check that collection worked")
 
@@ -93,7 +94,8 @@ def build(api_key: str | None = None, cache_dir: str | Path = DEFAULT_CACHE_DIR,
           + ", ".join(f"{k} {v}" for k, v in latest["size_group"].value_counts().items()))
     print("  share of rows missing:")
     multiples = [spec["column"] for spec in FAIR_VALUE_TARGETS.values()]
-    for col in [*multiples, *FAIR_VALUE_FEATURES, *FAIR_VALUE_FEATURE_CANDIDATES, "dividend_yield"]:
+    extras = sorted({f for spec in FAIR_VALUE_TARGETS.values() for f in spec.get("extra_features", ())} - {"industry"})
+    for col in dict.fromkeys([*multiples, *FAIR_VALUE_FEATURES, *extras, *FAIR_VALUE_FEATURE_CANDIDATES, "dividend_yield"]):
         missing = panel[col].isna().mean()
         warn = "  <- almost empty: check the Finnhub field name (data.FINNHUB_FIELD_MAP)" if missing > 0.95 else ""
         print(f"    {col:24s} {missing:6.1%}{warn}")

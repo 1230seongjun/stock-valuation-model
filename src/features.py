@@ -40,6 +40,10 @@ Derived indicators (see data.py for the raw fields):
     for splitting reports only
   - dividend_yield / dividend_growth_3y / dividend_years_no_cut: from actual
     dividend payments (see _dividend_features)
+  - accruals: (TTM net income - TTM operating cash flow) / total assets from
+    SEC XBRL (data.load_sec_facts) for the SAME fiscal period as the Finnhub
+    fundamentals, counting only facts FILED on or before as_of — SEC gives
+    the real filing date, so no assumed lag here (_accruals_asof)
 """
 from __future__ import annotations
 
@@ -510,6 +514,87 @@ def _forward_log_return(prices: pd.DataFrame, as_of: pd.Timestamp, base_close: f
     return float(np.log(future["close"].iloc[-1] / base_close))
 
 
+# SEC facts (accruals, 2026-10-01). A fact belongs to a fiscal period if its
+# end is within SEC_MATCH_DAYS of the period end (52/53-week calendars).
+SEC_MATCH_DAYS = 7
+_SEC_FISCAL_YEAR_DAYS = 350  # a duration at least this long is a full fiscal year
+
+
+def _sec_prepare(facts: pd.DataFrame | None) -> dict[str, dict[str, np.ndarray]] | None:
+    """One ticker's SEC facts (data.load_sec_facts) as numpy arrays per tag,
+    in filing order — prepared once per ticker, read at every snapshot."""
+    if facts is None or facts.empty:
+        return None
+    out = {}
+    for tag, g in facts.sort_values("filed", kind="stable").groupby("tag", sort=False):
+        day = lambda col: g[col].to_numpy().astype("datetime64[D]").astype(np.int64)
+        start, end = day("start"), day("end")
+        out[tag] = {"start": start, "end": end, "dur": end - start, "filed": day("filed"),
+                    "val": g["val"].to_numpy(dtype=float)}
+    return out
+
+
+def _sec_known(a: dict[str, np.ndarray], as_of: int) -> np.ndarray:
+    """Positions of facts filed on or before as_of (days); for each (start,
+    end) the FIRST filing — the original report, not a later restatement of
+    the comparatives. Returned in filing order."""
+    idx = np.flatnonzero(a["filed"] <= as_of)
+    _, first = np.unique(a["start"][idx] * 1_000_000 + a["end"][idx], return_index=True)
+    return idx[np.sort(first)]
+
+
+def _sec_ttm(a: dict[str, np.ndarray] | None, as_of: int, period_end: int) -> float:
+    """Trailing-12-month flow (one tag) ending at period_end: the annual value
+    if period_end closes a fiscal year, else prior fiscal year + this year's
+    year-to-date - last year's year-to-date (how 10-Qs report cash flow), else
+    the last four 3-month values. NaN if period_end isn't reported yet."""
+    if a is None:
+        return np.nan
+    k = _sec_known(a, as_of)
+    k = k[(a["dur"][k] >= 80) & (a["dur"][k] <= 380)]
+    end, dur, val = a["end"], a["dur"], a["val"]
+    at = k[np.abs(end[k] - period_end) <= SEC_MATCH_DAYS]
+    if not len(at):
+        return np.nan
+    annual = at[dur[at] >= _SEC_FISCAL_YEAR_DAYS]
+    if len(annual):
+        return float(val[annual[0]])
+    cur = at[np.argmax(dur[at])]
+    prior_year = k[(dur[k] >= _SEC_FISCAL_YEAR_DAYS) & (np.abs(end[k] - (a["start"][cur] - 1)) <= SEC_MATCH_DAYS)]
+    prior_ytd = k[(np.abs(end[k] - (period_end - 365)) <= 10) & (np.abs(dur[k] - dur[cur]) <= 15)]
+    if len(prior_year) and len(prior_ytd):
+        return float(val[prior_year[0]] + val[cur] - val[prior_ytd[0]])
+    quarters = k[(dur[k] <= 100) & (end[k] >= period_end - 300) & (end[k] <= period_end + SEC_MATCH_DAYS)]
+    if len(quarters) >= 4:
+        return float(val[quarters[np.argsort(end[quarters], kind="stable")][-4:]].sum())
+    return np.nan
+
+
+def _sec_instant(a: dict[str, np.ndarray] | None, as_of: int, period_end: int) -> float:
+    """Balance-sheet value (one tag) at period_end, as first filed by as_of."""
+    if a is None:
+        return np.nan
+    hit = np.flatnonzero((a["filed"] <= as_of) & (np.abs(a["end"] - period_end) <= SEC_MATCH_DAYS))
+    return float(a["val"][hit[0]]) if len(hit) else np.nan
+
+
+def _accruals_asof(sec: dict[str, dict[str, np.ndarray]] | None, as_of: pd.Timestamp, period_end: pd.Timestamp) -> float:
+    """(TTM net income - TTM operating cash flow) / total assets for the
+    fiscal period the snapshot's Finnhub fundamentals use, from SEC facts
+    filed by as_of (sec: _sec_prepare of data.load_sec_facts). Earnings the
+    cash flow doesn't back. Adopted for PER 2026-10-01 (config)."""
+    if not sec or pd.isna(period_end):
+        return np.nan
+    day = lambda ts: int(np.datetime64(pd.Timestamp(ts).date(), "D").astype(np.int64))
+    a, e = day(as_of), day(period_end)
+    assets = _sec_instant(sec.get("Assets"), a, e)
+    if not assets > 0:
+        return np.nan
+    ni = _sec_ttm(sec.get("NetIncomeLoss"), a, e)
+    cfo = _sec_ttm(sec.get("NetCashProvidedByUsedInOperatingActivities"), a, e)
+    return (ni - cfo) / assets
+
+
 def _ticker_rows(
     ticker: str,
     price_df: pd.DataFrame | None,
@@ -517,6 +602,7 @@ def _ticker_rows(
     meta: dict[str, str],
     as_of_dates: list[pd.Timestamp],
     fiscal_year_ends: list[pd.Timestamp] | None = None,
+    sec_facts: pd.DataFrame | None = None,
 ) -> list[dict]:
     """All snapshot rows of one ticker (see build_raw_panel). Uses nothing
     but this ticker's own data, so tickers can be built in any order or in
@@ -548,6 +634,7 @@ def _ticker_rows(
     sector = meta.get("sector", "Unknown")
     size_group = meta.get("size", "large")
     industry = meta.get("industry") or f"{sector} 기타"  # universe.industry_groups
+    sec = _sec_prepare(sec_facts)
 
     rows = []
     for as_of in as_of_dates:
@@ -562,6 +649,7 @@ def _ticker_rows(
         row = {"as_of": as_of, "ticker": ticker, "sector": sector, "industry": industry, "size_group": size_group,
                "price": price, "fiscal_year_end_assumed": not fiscal_year_ends}
         row.update(_as_of_fundamentals(fund_df, as_of))
+        row["accruals"] = _accruals_asof(sec, as_of, row["fundamentals_period"])
         period_price = _rescale_multiples(row, quoted_now)
         row.update(_size_features(row, period_price))
         # already at the as_of price (no Finnhub period-end price involved)
@@ -588,6 +676,7 @@ def build_raw_panel(
     as_of_dates: list[pd.Timestamp],
     n_jobs: int | None = None,
     fiscal_year_ends: dict[str, list[pd.Timestamp]] | None = None,
+    sec_facts: dict[str, pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
     """One row per (ticker, as_of) with raw indicators, price, dividend and
     anomaly features and forward-return labels. A (ticker, as_of) with no
@@ -599,11 +688,13 @@ def build_raw_panel(
     come back in `tickers` order, so the panel is the same either way.
     fiscal_year_ends (data.collect_fiscal_year_ends) decides which quarters
     are fiscal Q4s; a ticker without them is assumed to end its year in
-    December."""
+    December. sec_facts (data.load_sec_facts) feed `accruals`; without them
+    it is NaN."""
     n_jobs = N_JOBS if n_jobs is None else n_jobs
     fiscal_year_ends = fiscal_year_ends or {}
-    args = [(t, prices.get(t), fundamentals.get(t), universe.get(t, {}), as_of_dates, fiscal_year_ends.get(t))
-            for t in tickers]
+    sec_facts = sec_facts or {}
+    args = [(t, prices.get(t), fundamentals.get(t), universe.get(t, {}), as_of_dates, fiscal_year_ends.get(t),
+             sec_facts.get(t)) for t in tickers]
     if n_jobs == 1 or len(tickers) < _MIN_TICKERS_FOR_PARALLEL:
         per_ticker = (_ticker_rows(*a) for a in args)
     else:
