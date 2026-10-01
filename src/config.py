@@ -325,6 +325,18 @@ FAIR_VALUE_MIN_GAIN = 0.01
 # Sanity check H1 (real rate vs market multiple level) did NOT show the known
 # negative relation (all |t| < 1.5): with 92 quarterly points the analysis has
 # little power, so read the passes cautiously.
+# Follow-ups the same day (scratch, criteria fixed in advance):
+#   - cyclical (Industrials, Materials, Energy, Cons. Disc.) minus defensive
+#     (Utilities, Staples, Health Care) sector contribution per date, after
+#     the fundamentals: shrinks when VIX rises (4/5 multiples, 1 sd -> -.02 to
+#     -.04 log) and when the 2s10s curve flattens (4/5); credit spread right
+#     sign but only P/FCF passes. 9/15 tests. The per-date fit already absorbs
+#     this (sector effects are re-learned every date).
+#   - sales beta (firm YoY sales growth on the universe median, 20 dates):
+#     sensible by sector (Energy 4.4, Staples .56) but within +-.006 on every
+#     multiple -> rejected.
+#   - market-wide CAPE vs. macro -> market_context.py (descriptive, not a
+#     model input): see that module's docstring for the validation.
 
 # Finnhub's quarterly multiples are computed at the fiscal period-end price,
 # but a snapshot is 45-135 days later. When True, features.build_raw_panel

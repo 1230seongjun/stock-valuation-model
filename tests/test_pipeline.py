@@ -422,6 +422,36 @@ def test_accruals_ignored_for_financials():
     assert not np.allclose(a["fair_pe"].fillna(0), c["fair_pe"].fillna(0)), "non-financials' accruals still count"
 
 
+def test_market_context_point_in_time():
+    """Shiller dates (2026.1 = October) parse right; CPI and unemployment
+    enter one month late; a snapshot uses the last full month before it and
+    nothing after; the fixed 1990-2015 fit recovers a planted relation."""
+    from market_context import market_context, monthly_inputs, parse_shiller
+
+    sh = parse_shiller(pd.DataFrame({"Date": [2026.09, 2026.1, "note"], "CAPE": [40.0, 41.0, None]}))
+    assert list(sh.index.astype(str)) == ["2026-09", "2026-10"]
+
+    rng = np.random.default_rng(5)
+    days = pd.date_range("1988-01-01", "2026-09-30", freq="D")
+    months = pd.period_range("1988-01", "2026-09", freq="M")
+    y10 = pd.Series(np.repeat(rng.uniform(2, 8, len(months)), days.to_period("M").value_counts(sort=False).reindex(months).values), index=days)
+    cpi = pd.Series(100 * np.exp(np.cumsum(rng.uniform(0, 0.006, len(months)))), index=months.to_timestamp())
+    une = pd.Series(rng.uniform(3, 10, len(months)), index=months.to_timestamp())
+    data = monthly_inputs(pd.Series(1.0, index=months), {"yield10y": y10, "cpi": cpi, "unemployment": une})
+    assert np.isclose(data.loc[pd.Period("2020-05", "M"), "unemployment"], une[pd.Timestamp("2020-04-01")]), "published a month late"
+    assert np.isclose(data.loc[pd.Period("2020-05", "M"), "yield10y"], y10["2020-05"].mean())
+    data["log_cape"] = 4.0 - 0.05 * data["yield10y"] - 0.04 * data["inflation"] - 0.1 * data["unemployment"]
+    data["log_cape"] += rng.normal(0, 0.01, len(data))
+
+    ctx = market_context(data, "2026-09-30")
+    assert ctx["month"] == "2026-08" and abs(ctx["gap_log"]) < 0.05
+    assert np.isclose(ctx["model"]["coefficients"]["unemployment"], -0.1, atol=0.01)
+    later = data.copy()
+    later.loc[later.index >= pd.Period("2026-09", "M"), "log_cape"] += 5
+    assert market_context(later, "2026-09-30") == ctx, "data after the last full month is not used"
+    assert market_context(data.loc[: pd.Period("2026-07", "M")], "2026-09-30") is None, "August not in yet"
+
+
 def test_fiscal_q4_detection():
     """52/53-week year-ends (AAPL) and non-December years (WMT) are
     recognised in later years too; no fiscal info means December."""

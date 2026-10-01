@@ -5,7 +5,7 @@ Entry point.
     python src/main.py verify-multiples              # check the multiples' price rescaling against yfinance
     python src/main.py compare-features [--drop-check]  # which candidate features help (Train/Val)
     python src/main.py evaluate                      # fair-value model quality + gap-vs-return test
-    python src/main.py screen    [--ticker AAPL] [--as-of 2026-07-01]
+    python src/main.py screen    [--ticker AAPL] [--as-of 2026-07-01]   # + market_context_<date>.json
 
 build needs FINNHUB_API_KEY (env var or --api-key). The other commands only
 need the saved panel, and recompute the fair-value model from it every time,
@@ -47,6 +47,7 @@ from fair_value import (
     target_features,
 )
 from features import add_percentile_scores, build_as_of_dates, build_raw_panel
+from market_context import context_lines, load_market_data, market_context
 from screening import (
     BASE_EFFECT_NOTE,
     DETAIL_NOTES,
@@ -284,12 +285,38 @@ def _report_ttm_reliability(panel: pd.DataFrame) -> None:
         print(f"    mean per-date Spearman(PER gap, normalized PER gap): {corr:.2f}")
 
 
+def _market_context(as_of: pd.Timestamp, save: bool, cache_dir: str | Path = DEFAULT_CACHE_DIR) -> dict | None:
+    """market_context for the report date: printed as a short block and saved
+    as real_data_output/market_context_<date>.json (for an LLM explanation).
+    A download failure without a cache only prints a note."""
+    import json
+
+    try:
+        ctx = market_context(load_market_data(cache_dir), as_of)
+    except Exception as exc:  # network / file format: the stock report still runs
+        print(f"\n-- 시장 전체 맥락: 계산 못 함 ({type(exc).__name__}: {exc}) --")
+        return None
+    if ctx is None:
+        print(f"\n-- 시장 전체 맥락: {pd.Timestamp(as_of).date()} 직전 달의 데이터가 아직 없음 --")
+        return None
+    print("\n-- 시장 전체 맥락 (서술용, 예측 아님; 종목 라벨과 무관) --")
+    for line in context_lines(ctx):
+        print("  " + line)
+    if save:
+        out = OUTPUT_DIR / f"market_context_{pd.Timestamp(as_of).date()}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(ctx, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"  saved {out}")
+    return ctx
+
+
 def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker: str | None = None,
            save: bool = True) -> pd.DataFrame:
     report = report_at(screen_panel(_load(panel_path)), as_of)
     if report.empty:
         raise ValueError(f"no rows for as_of={as_of}")
     date = report["as_of"].iloc[0].date()
+    _market_context(report["as_of"].iloc[0], save)
 
     if ticker:
         match = report[report["ticker"] == ticker.upper()]
