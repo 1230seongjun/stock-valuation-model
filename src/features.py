@@ -592,6 +592,8 @@ def _accruals_asof(sec: dict[str, dict[str, np.ndarray]] | None, as_of: pd.Times
         return np.nan
     ni = _sec_ttm(sec.get("NetIncomeLoss"), a, e)
     cfo = _sec_ttm(sec.get("NetCashProvidedByUsedInOperatingActivities"), a, e)
+    if np.isnan(cfo):  # many 2014-2018 filers tagged only continuing operations
+        cfo = _sec_ttm(sec.get("NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"), a, e)
     return (ni - cfo) / assets
 
 

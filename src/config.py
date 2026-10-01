@@ -302,9 +302,16 @@ FAIR_VALUE_MIN_GAIN = 0.01
 #     1y diluted share change pass on EV/EBITDA or P/FCF but vanish once the
 #     own multiples of 2 years ago are in; interest coverage, cash/assets and
 #     total payout add ~0. Accruals passed -> adopted for PER (see above).
-#   - accruals coverage dips 2014-2018 (48-62%): many filers tag operating
-#     cash flow differently then (2016: 54% vs. net income 82%). Adding the
-#     other tag would change the validated values — a separate experiment.
+#   - accruals coverage dipped 2014-2018 (48-62%): many filers tagged only
+#     continuing-operations cash flow then. Using it as a fallback (criteria:
+#     coverage up, PER gain not down > .002): 2014-2018 coverage 74-78%, rows
+#     that had a value unchanged, PER gain over no accruals (Financials
+#     excluded) +.012/+.012/+.017 -> +.016/+.013/+.018 -> adopted.
+#   - business-model clusters from today's yfinance descriptions (TF-IDF ->
+#     SVD 100 -> KMeans 50, clusters >= 20 tickers, AMI with GICS sector .60),
+#     one-hot on every multiple: Train worse everywhere (PER -.015, P/FCF
+#     -.033), Test better (EV/EBITDA +.025, P/FCF +.028) — the same pattern
+#     as sub-industries: today's classification projected into the past.
 
 # Finnhub's quarterly multiples are computed at the fiscal period-end price,
 # but a snapshot is 45-135 days later. When True, features.build_raw_panel

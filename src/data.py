@@ -354,7 +354,10 @@ def collect(
 SEC_DIR = "sec"
 SEC_COMPANYFACTS = "companyfacts.zip"
 SEC_TICKERS = "company_tickers.json"
-SEC_TAGS = ("NetIncomeLoss", "NetCashProvidedByUsedInOperatingActivities", "Assets")
+# The continuing-operations cash flow tag is a fallback (features._accruals_asof):
+# many 2014-2018 filers used it instead of the main tag (2016: 54% -> 78% coverage).
+SEC_TAGS = ("NetIncomeLoss", "NetCashProvidedByUsedInOperatingActivities",
+            "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations", "Assets")
 SEC_FORMS = ("10-K", "10-Q", "10-K/A", "10-Q/A")
 SEC_FACT_COLUMNS = ["tag", "start", "end", "val", "filed"]
 
@@ -384,8 +387,8 @@ def load_sec_facts(
 ) -> dict[str, pd.DataFrame]:
     """SEC_TAGS facts per ticker (columns SEC_FACT_COLUMNS, dates as
     Timestamps), extracted once from the hand-downloaded companyfacts.zip into
-    <cache_dir>/sec_facts/ and re-extracted when the zip changes (a newer
-    download) or force_refresh. Tickers are matched by CIK through
+    <cache_dir>/sec_facts/ and re-extracted when the zip (a newer download) or SEC_TAGS change, or
+    force_refresh. Tickers are matched by CIK through
     company_tickers.json (class shares: our MOG.A = SEC's MOG-A). No files ->
     {} with a note; a ticker without an SEC filer (OZK, PFBC file with bank
     regulators) gets no entry."""
@@ -400,7 +403,7 @@ def load_sec_facts(
     import json
 
     stat = zip_path.stat()
-    source = f"{stat.st_size} {int(stat.st_mtime)}"
+    source = f"{stat.st_size} {int(stat.st_mtime)} {','.join(SEC_TAGS)}"  # a new tag re-extracts too
     marker = out_dir / "_source.txt"
     fresh = force_refresh or not marker.exists() or marker.read_text() != source
     ciks = {v["ticker"].upper(): int(v["cik_str"]) for v in json.loads(map_path.read_text()).values()}

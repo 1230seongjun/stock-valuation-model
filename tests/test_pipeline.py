@@ -342,6 +342,10 @@ def test_accruals_point_in_time():
     assert np.isnan(acc("2022-10-31", "2022-09-30")), "10-Q not filed yet"
     assert np.isclose(acc("2022-11-15", "2022-09-30"), ((100 + 90 - 70) - (60 + 50 - 40)) / 1100)
     assert np.isnan(_accruals_asof(None, pd.Timestamp("2022-11-15"), pd.Timestamp("2022-09-30")))
+    cont_ops = _sec_facts([("Assets", "2021-12-31", "2021-12-31", 1000, "2022-02-20"),
+                           ("NetIncomeLoss", "2021-01-01", "2021-12-31", 100, "2022-02-20"),
+                           ("NetCashProvidedByUsedInOperatingActivitiesContinuingOperations", "2021-01-01", "2021-12-31", 70, "2022-02-20")])
+    assert np.isclose(_accruals_asof(_sec_prepare(cont_ops), pd.Timestamp("2022-03-01"), pd.Timestamp("2021-12-31")), 0.03),         "continuing-operations cash flow when the main tag is missing"
     assets_only = _sec_prepare(facts[facts["tag"] == "Assets"])  # a filer without NetIncomeLoss (custom tag)
     assert np.isnan(_accruals_asof(assets_only, pd.Timestamp("2022-03-01"), pd.Timestamp("2021-12-31")))
 
