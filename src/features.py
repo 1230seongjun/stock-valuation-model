@@ -40,7 +40,8 @@ Derived indicators (see data.py for the raw fields):
     for splitting reports only
   - dividend_yield / dividend_growth_3y / dividend_years_no_cut: from actual
     dividend payments (see _dividend_features)
-  - accruals: (TTM net income - TTM operating cash flow) / total assets from
+  - accruals (+ its parts sec_net_income_ttm, sec_operating_cash_flow_ttm,
+    sec_assets): (TTM net income - TTM operating cash flow) / total assets from
     SEC XBRL (data.load_sec_facts) for the SAME fiscal period as the Finnhub
     fundamentals, counting only facts FILED on or before as_of — SEC gives
     the real filing date, so no assumed lag here (_accruals_asof)
@@ -578,23 +579,36 @@ def _sec_instant(a: dict[str, np.ndarray] | None, as_of: int, period_end: int) -
     return float(a["val"][hit[0]]) if len(hit) else np.nan
 
 
-def _accruals_asof(sec: dict[str, dict[str, np.ndarray]] | None, as_of: pd.Timestamp, period_end: pd.Timestamp) -> float:
-    """(TTM net income - TTM operating cash flow) / total assets for the
-    fiscal period the snapshot's Finnhub fundamentals use, from SEC facts
-    filed by as_of (sec: _sec_prepare of data.load_sec_facts). Earnings the
-    cash flow doesn't back. Adopted for PER 2026-10-01 (config)."""
+SEC_EARNINGS_KEYS = ["sec_net_income_ttm", "sec_operating_cash_flow_ttm", "sec_assets", "accruals"]
+
+
+def _sec_earnings_asof(sec: dict[str, dict[str, np.ndarray]] | None, as_of: pd.Timestamp,
+                       period_end: pd.Timestamp) -> dict[str, float]:
+    """SEC_EARNINGS_KEYS for the fiscal period the snapshot's Finnhub
+    fundamentals use, from SEC facts filed by as_of (sec: _sec_prepare of
+    data.load_sec_facts): TTM net income, TTM operating cash flow, total
+    assets (USD) and accruals = (net income - operating cash flow) / assets —
+    earnings the cash flow doesn't back. Accruals adopted for PER 2026-10-01
+    (config); the components are kept for explanations (llm_context)."""
+    out = dict.fromkeys(SEC_EARNINGS_KEYS, np.nan)
     if not sec or pd.isna(period_end):
-        return np.nan
+        return out
     day = lambda ts: int(np.datetime64(pd.Timestamp(ts).date(), "D").astype(np.int64))
     a, e = day(as_of), day(period_end)
-    assets = _sec_instant(sec.get("Assets"), a, e)
-    if not assets > 0:
-        return np.nan
     ni = _sec_ttm(sec.get("NetIncomeLoss"), a, e)
     cfo = _sec_ttm(sec.get("NetCashProvidedByUsedInOperatingActivities"), a, e)
     if np.isnan(cfo):  # many 2014-2018 filers tagged only continuing operations
         cfo = _sec_ttm(sec.get("NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"), a, e)
-    return (ni - cfo) / assets
+    assets = _sec_instant(sec.get("Assets"), a, e)
+    out.update(sec_net_income_ttm=ni, sec_operating_cash_flow_ttm=cfo, sec_assets=assets)
+    if assets > 0:
+        out["accruals"] = (ni - cfo) / assets
+    return out
+
+
+def _accruals_asof(sec: dict[str, dict[str, np.ndarray]] | None, as_of: pd.Timestamp, period_end: pd.Timestamp) -> float:
+    """Just the accruals of _sec_earnings_asof."""
+    return _sec_earnings_asof(sec, as_of, period_end)["accruals"]
 
 
 def _ticker_rows(
@@ -651,7 +665,7 @@ def _ticker_rows(
         row = {"as_of": as_of, "ticker": ticker, "sector": sector, "industry": industry, "size_group": size_group,
                "price": price, "fiscal_year_end_assumed": not fiscal_year_ends}
         row.update(_as_of_fundamentals(fund_df, as_of))
-        row["accruals"] = _accruals_asof(sec, as_of, row["fundamentals_period"])
+        row.update(_sec_earnings_asof(sec, as_of, row["fundamentals_period"]))
         period_price = _rescale_multiples(row, quoted_now)
         row.update(_size_features(row, period_price))
         # already at the as_of price (no Finnhub period-end price involved)

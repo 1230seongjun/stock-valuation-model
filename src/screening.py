@@ -452,6 +452,34 @@ def _driver_text(row: pd.Series, key: str) -> str:
     return " / ".join(parts)
 
 
+def multiple_status(row: pd.Series, key: str) -> tuple[str, str]:
+    """Why a multiple was or wasn't compared for this stock: (status, Korean
+    reason). status: evaluated | excluded_sector | not_available | too_high |
+    too_low | no_peers (shared by explain and llm_context)."""
+    spec = FAIR_VALUE_TARGETS[key]
+    actual, gap = row.get(spec["column"]), row.get(f"{key}_gap")
+    if pd.notna(gap):
+        return "evaluated", ""
+    if row.get("sector") in spec.get("exclude_sectors", ()):
+        return "excluded_sector", "금융업은 매출·EBITDA·현금흐름의 의미가 달라 비교하지 않음"
+    if pd.isna(actual) or actual <= 0:
+        return "not_available", ("적자라 계산 불가" if key == "pe" and row.get("loss_flag")
+                                 else "값 없음(적자·자본잠식 또는 데이터 누락)")
+    if actual > spec["max"]:
+        base = {
+            "pe": "이익이 너무 작아",
+            "pb": "자본이 너무 작아(자사주 매입 등)",
+            "ps": "매출 대비 가격이 너무 높아",
+            "ev_ebitda": "EBITDA가 너무 작아",
+            "pfcf": "잉여현금흐름이 너무 작아",
+            "pe_norm": "3년 평균 이익이 너무 작아",
+        }.get(key, "기준 범위를 벗어나")
+        return "too_high", f"{base} 배수로 비교하기 어려움"
+    if actual < spec["min"]:
+        return "too_low", "비정상적으로 작은 값 — 데이터 오류 가능성"
+    return "no_peers", "같은 시점 비교 종목 부족"
+
+
 def explain(row: pd.Series) -> str:
     """One paragraph per stock: actual vs. fair multiple for each multiple
     that could be evaluated, the drivers behind each fair multiple, and why
@@ -461,7 +489,8 @@ def explain(row: pd.Series) -> str:
         if spec["column"] not in row.index:  # panel built before this multiple existed
             continue
         actual, fair, gap = row.get(spec["column"]), row.get(f"fair_{key}"), row.get(f"{key}_gap")
-        if pd.notna(gap):
+        status, why = multiple_status(row, key)
+        if status == "evaluated":
             excluded = " [적자라 참고용]" if row.get("loss_flag") else ""
             if not spec.get("in_verdict", True):
                 excluded = " [참고용, 종합 판단 제외]"
@@ -470,25 +499,14 @@ def explain(row: pd.Series) -> str:
                 f"{spec['label']} {actual:.1f}배 (적정 {fair:.1f}배, {np.expm1(gap):+.0%}){excluded} — 적정 "
                 f"{spec['label']}{particle} {_driver_text(row, key)}"
             )
-        elif row.get("sector") in spec.get("exclude_sectors", ()):
+        elif status == "excluded_sector":
             continue  # one summary line below instead of one per multiple
-        elif pd.isna(actual) or actual <= 0:
-            why = "적자라 계산 불가" if key == "pe" and row.get("loss_flag") else "값 없음(적자·자본잠식 또는 데이터 누락)"
-            lines.append(f"{spec['label']}: {why}")
-        elif actual > spec["max"]:
-            base = {
-                "pe": "이익이 너무 작아",
-                "pb": "자본이 너무 작아(자사주 매입 등)",
-                "ps": "매출 대비 가격이 너무 높아",
-                "ev_ebitda": "EBITDA가 너무 작아",
-                "pfcf": "잉여현금흐름이 너무 작아",
-                "pe_norm": "3년 평균 이익이 너무 작아",
-            }.get(key, "기준 범위를 벗어나")
-            lines.append(f"{spec['label']} {actual:.0f}배: {base} 배수로 비교하기 어려움")
-        elif actual < spec["min"]:
-            lines.append(f"{spec['label']} {actual:.2f}배: 비정상적으로 작은 값 — 데이터 오류 가능성")
+        elif status == "too_high":
+            lines.append(f"{spec['label']} {actual:.0f}배: {why}")
+        elif status == "too_low":
+            lines.append(f"{spec['label']} {actual:.2f}배: {why}")
         else:
-            lines.append(f"{spec['label']}: 같은 시점 비교 종목 부족")
+            lines.append(f"{spec['label']}: {why}")
     skipped = [spec["label"] for spec in FAIR_VALUE_TARGETS.values() if row.get("sector") in spec.get("exclude_sectors", ())]
     if skipped:
         lines.append(f"{'·'.join(skipped)}: 금융업은 매출·EBITDA·현금흐름의 의미가 달라 비교하지 않음 (PER·PBR로만 판단)")

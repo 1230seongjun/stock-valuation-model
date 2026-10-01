@@ -6,6 +6,7 @@ Entry point.
     python src/main.py compare-features [--drop-check]  # which candidate features help (Train/Val)
     python src/main.py evaluate                      # fair-value model quality + gap-vs-return test
     python src/main.py screen    [--ticker AAPL] [--as-of 2026-07-01]   # + market_context_<date>.json
+    python src/main.py export    [--as-of 2026-07-01]   # per-stock JSON for an LLM -> real_data_output/llm/<date>/
 
 build needs FINNHUB_API_KEY (env var or --api-key). The other commands only
 need the saved panel, and recompute the fair-value model from it every time,
@@ -47,6 +48,7 @@ from fair_value import (
     target_features,
 )
 from features import add_percentile_scores, build_as_of_dates, build_raw_panel
+from llm_context import export_date
 from market_context import context_lines, load_market_data, market_context
 from screening import (
     BASE_EFFECT_NOTE,
@@ -396,6 +398,18 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
     return report
 
 
+def export(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, out_dir: str | Path = OUTPUT_DIR / "llm") -> Path:
+    """Per-stock JSON for an LLM explanation (llm_context): screens the panel,
+    adds the market context for that date, writes <out_dir>/<date>/."""
+    screened = screen_panel(_load(panel_path))
+    target = pd.Timestamp(as_of) if as_of else screened["as_of"].max()
+    market = _market_context(target, save=False)
+    folder = export_date(screened, target, out_dir, market)
+    n_stocks = len(list(folder.glob("*.json"))) - 1 - (market is not None)  # minus index / market files
+    print(f"\nexported {n_stocks} stocks -> {folder}")
+    return folder
+
+
 # HON: all 5 views -77% on 2026-09-29 — a one-off gain + per-share break in
 # Finnhub's data (screening.flag_fundamental_break); prices matched yfinance.
 VERIFY_TICKERS = ["AAPL", "MSFT", "JPM", "XOM", "KO", "TSLA", "HON"]
@@ -472,7 +486,9 @@ def main() -> None:
     s = sub.add_parser("screen", help="screening report")
     s.add_argument("--as-of")
     s.add_argument("--ticker")
-    for p in (b, v, c, e, s):
+    x = sub.add_parser("export", help="per-stock JSON for an LLM explanation")
+    x.add_argument("--as-of")
+    for p in (b, v, c, e, s, x):
         p.add_argument("--panel", default=str(PANEL_PATH))
     args = parser.parse_args()
 
@@ -484,6 +500,8 @@ def main() -> None:
         compare_features(args.panel, drop_check=args.drop_check)
     elif args.command == "evaluate":
         evaluate(args.panel)
+    elif args.command == "export":
+        export(args.panel, as_of=args.as_of)
     else:
         screen(args.panel, as_of=args.as_of, ticker=args.ticker)
 

@@ -238,6 +238,14 @@ FAIR_VALUE_TARGETS = {
 # Costs PER R^2 (dates >= 2012) +.018/+.019/+.026 -> +.012/+.012/+.016:
 # accruals did explain financials' PER a little, but likely through
 # something other than earnings quality (e.g. loan growth).
+# Do accruals penalize fast growers? (2026-10-01, criteria fixed in advance,
+# dates >= 2012): rank corr with revenue growth only +.07; the top-10% growers'
+# 고평가 share moved +0.2pp more than the rest (threshold 3pp); accruals raise
+# PER R^2 within them too (+.020); growth-adjusted ("abnormal", Jones-style)
+# accruals change nothing; the top 5% growers' mean OOF PER gap is -.07 (the
+# model does not under-credit hyper-growth). No bias found. NVDA's move to
+# 고평가 (rank 22 -> 19) is its own: TTM operating cash flow / net income .70
+# (a year earlier .89) — llm_context exports exactly this (cash_backing).
 FAIR_VALUE_FEATURE_EXCLUDE_SECTORS = {"accruals": ("Financials",)}
 FAIR_VALUE_MIN_GAIN = 0.01
 # Tried and rejected 2026-09-30 (judged on R^2, Spearman, stability and

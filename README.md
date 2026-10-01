@@ -74,6 +74,7 @@ python src/main.py build                      # 데이터 수집 + 패널
 python src/main.py compare-features           # 후보 변수 비교 (--drop-check: 채택 변수를 하나씩 빼 보기)
 python src/main.py evaluate                   # 모델 평가 + 수익률 가설 검정
 python src/main.py screen [--ticker AAPL]     # 최신 리포트 + 시장 전체 맥락(market_context_<날짜>.json)
+python src/main.py export [--as-of 날짜]      # 종목별 LLM용 JSON -> real_data_output/llm/<날짜>/
 python src/main.py verify-multiples           # 배수 주가 보정을 yfinance 현재 값과 비교
 ```
 
@@ -195,6 +196,25 @@ report = main.screen(PANEL)
 - **시점**: 기준일 직전의 완료된 달까지. 물가와 실업률은 발표가 늦어 그보다 한 달 전 값입니다.
 - **해석 규칙**은 JSON의 `interpretation_rules`에 들어 있습니다. 예측이 아니고, 높은 차이가 몇 년씩 이어질 수 있으며(2021년 평균 +0.34), CAPE에는 구조적 상승 추세가 있고, 종목 라벨과는 별개입니다.
 - 데이터: [shillerdata.com](https://shillerdata.com/) CAPE, FRED(`DGS10`, `CPIAUCNS`, `UNRATE`). `data_cache/macro/`에 저장되고 7일마다 다시 받습니다. 받지 못하면 리포트는 맥락 없이 그대로 나옵니다.
+
+### LLM·웹용 JSON (`export`)
+
+`python src/main.py export`는 한 기준일의 결과를 **종목별 JSON**으로 저장합니다(`real_data_output/llm/<날짜>/`). LLM이 설명을 쓰거나 웹이 화면을 그릴 때 이 파일만 읽도록 만든 **데이터 계약**입니다. 라벨과 수치는 `screen`과 같습니다(테스트로 확인).
+
+| 파일 | 내용 |
+|---|---|
+| `<TICKER>.json` | 판정(라벨, 세부 라벨, 순위, 종합 괴리, 일치 배수 수), 배수별 실제·적정·괴리와 상위 설명 요인(분모 효과·값 없음 표시), 비교하지 못한 배수와 이유, 성장 비교, 주요 재무 지표(값·단위·같은 날 백분위·모델 사용 여부), 플래그와 이유, 그날의 모델 적합도(R², 오차 중앙값·상위 10%), **해석 규칙** |
+| `index.json` | 전 종목 한 줄 요약(라벨, 순위, 괴리, 플래그)과 그날의 모델 적합도 |
+| `market_context.json` | 시장 전체 맥락(위 절) |
+
+- 해석 규칙(`interpretation_rules`)은 LLM이 지켜야 할 문장들입니다: 적정 배수는 내재가치가 아님, 수익률 예측이 아님, 설명 요인은 인과가 아님, 한 배수의 ±40% 안팎 괴리는 오차 범위, 파일에 없는 숫자는 만들지 않음 등.
+- **판정의 근거와 민감도**도 들어 있습니다(1.1).
+  - `cash_backing`: SEC 기준 12개월 순이익·영업현금흐름, 현금 ÷ 이익 비율과 1년 전 비율, 발생액이 적정 PER을 움직인 정도
+  - `without_accruals`: 발생액을 빼고 계산한 라벨·괴리
+  - `near_label_boundary`: 라벨 기준선에서 순위 3 이내
+  - 예: NVDA는 이익 $193B 중 현금 $134B(0.70, 1년 전 0.89)라 적정 PER이 −19% 낮아졌고, 발생액이 없으면 "중립"(순위 22)이며, 경계선에 있습니다.
+- 백분율은 % 단위(+74.0 = 74% 높음), 값이 없으면 `null`입니다. 구조가 바뀌면 `schema_version`을 올립니다(현재 1.1).
+- 한 기준일에 약 18MB(1,261개 파일)입니다.
 
 ## 모델
 
@@ -396,8 +416,9 @@ R²는 **현재 배수의 종목 간 차이 중 재무 변수로 설명되는 �
 | `src/fair_value.py` | 기준 배수 모델, 평가 지표, 수익률 검정 |
 | `src/screening.py` | 라벨, 세부 라벨, 설명 문장, 플래그, 리포트 |
 | `src/market_context.py` | 시장 전체 CAPE vs 거시 기준 수준 (서술용, 모델 입력 아님) |
-| `src/main.py` | `build` / `verify-multiples` / `compare-features` / `evaluate` / `screen` |
-| `tests/test_pipeline.py` | 합성 데이터 테스트 46개 |
+| `src/llm_context.py` | 종목별 LLM·웹용 JSON (`export`) |
+| `src/main.py` | `build` / `verify-multiples` / `compare-features` / `evaluate` / `screen` / `export` |
+| `tests/test_pipeline.py` | 합성 데이터 테스트 49개 |
 | `notebooks/run_local.py` | VS Code 셀 실행용 |
 
 테스트가 확인하는 것: 미래 데이터 차단(미래 데이터를 뒤섞어도 과거 행 불변, 4분기 75일, 발생액은 SEC 제출일 이후에만·재진술 무시), out-of-fold(자기 배수가 자기 기준 배수에 안 들어감), 심어 둔 가격 오류 복원, 병렬·순차 결과 일치, 배수 보정·캐시 보호, 라벨·세부 라벨·플래그 조건.

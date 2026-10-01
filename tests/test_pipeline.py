@@ -366,6 +366,7 @@ def test_accruals_in_panel_wait_for_the_filing():
     assert (panel.loc[t, "fundamentals_period"] == pd.Timestamp("2021-09-30")).all()
     assert np.isnan(panel.loc[(t, as_of[0]), "accruals"]), "filed 2021-12-10, after the first snapshot"
     assert np.isclose(panel.loc[(t, as_of[1]), "accruals"], (80 - 50) / 1000)
+    assert panel.loc[(t, as_of[1]), "sec_net_income_ttm"] == 80 and panel.loc[(t, as_of[1]), "sec_operating_cash_flow_ttm"] == 50
     assert panel.loc[tickers[1], "accruals"].isna().all()
 
 
@@ -450,6 +451,78 @@ def test_market_context_point_in_time():
     later.loc[later.index >= pd.Period("2026-09", "M"), "log_cape"] += 5
     assert market_context(later, "2026-09-30") == ctx, "data after the last full month is not used"
     assert market_context(data.loc[: pd.Period("2026-07", "M")], "2026-09-30") is None, "August not in yet"
+
+
+def test_llm_export_is_valid_and_matches_the_report():
+    """The per-stock JSON parses without NaN, carries the same numbers as the
+    report, marks skipped multiples and denominator drivers, and the index
+    lists every stock."""
+    import json
+    import tempfile
+
+    from llm_context import SCHEMA_VERSION, export_date
+
+    panel = build_synthetic_panel(n_tickers=80)
+    screened = screen(panel)
+    report = report_at(screened).set_index("ticker")
+    def no_nan(token):
+        raise ValueError(f"non-JSON number {token}")
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = export_date(screened, None, tmp, market={"cape": 30.0})
+        index = json.loads((folder / "index.json").read_text(encoding="utf-8"), parse_constant=no_nan)
+        assert index["n_stocks"] == len(report) and index["market_context_file"] == "market_context.json"
+        for t in report.index:
+            ctx = json.loads((folder / f"{t}.json").read_text(encoding="utf-8"), parse_constant=no_nan)
+            row = report.loc[t]
+            assert ctx["schema_version"] == SCHEMA_VERSION and ctx["verdict"]["label"] == row["valuation_label"]
+            pe = next(m for m in ctx["multiples"] if m["key"] == "pe")
+            if pe["status"] == "evaluated":
+                assert np.isclose(pe["gap_pct"], row["pe_gap"] * 100, atol=0.06)
+                assert all(d["denominator_effect"] == (d["feature"] == "return_on_equity") for d in pe["drivers_up"] + pe["drivers_down"])
+            if row["sector"] == "Financials":
+                assert next(m for m in ctx["multiples"] if m["key"] == "ps")["status"] == "excluded_sector"
+            assert ctx["interpretation_rules"] and ctx["model_fit"]["PER"]["n_stocks"] > 0
+            assert ctx["fundamentals"]["return_on_equity"]["unit"] == "fraction"
+            assert isinstance(ctx["verdict"]["near_label_boundary"], bool) and ctx["without_accruals"] is None, "no accruals in the synthetic panel"
+
+
+def test_llm_export_cash_backing_and_without_accruals():
+    """With accruals and their SEC parts, the JSON reports cash vs. earnings
+    (and a year earlier), the verdict without accruals, and boundary ranks."""
+    import json
+    import tempfile
+
+    from llm_context import export_date
+
+    panel = build_synthetic_panel(n_tickers=80)
+    rng = np.random.default_rng(11)
+    panel["sec_net_income_ttm"] = rng.uniform(50, 150, len(panel))
+    panel["sec_operating_cash_flow_ttm"] = panel["sec_net_income_ttm"] * rng.uniform(0.5, 1.3, len(panel))
+    panel["sec_assets"] = 1000.0
+    panel["accruals"] = (panel["sec_net_income_ttm"] - panel["sec_operating_cash_flow_ttm"]) / panel["sec_assets"]
+    screened = screen(panel)
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = export_date(screened, None, tmp)
+        last = screened[screened["as_of"] == screened["as_of"].max()].set_index("ticker")
+        for t in list(last.index)[:20]:
+            ctx = json.loads((folder / f"{t}.json").read_text(encoding="utf-8"))
+            cb, row = ctx["cash_backing"], last.loc[t]
+            assert np.isclose(cb["cash_to_earnings"], row["sec_operating_cash_flow_ttm"] / row["sec_net_income_ttm"], atol=1e-3)
+            assert cb["cash_to_earnings_1y_ago"] is not None, "a snapshot a year earlier exists"
+            assert cb["used_by_model"] == (row["sector"] != "Financials")
+            assert ctx["without_accruals"]["label"] in ("저평가", "중립", "고평가", "판단 보류(적자)", "데이터 부족")
+            rank = ctx["verdict"]["cheapness_rank"]
+            if rank is not None:
+                assert ctx["verdict"]["near_label_boundary"] == (min(abs(rank - 80), abs(rank - 20)) <= 3)
+
+
+def test_main_imports():
+    """main.py is not exercised by the other tests — at least it must import."""
+    import importlib
+
+    import main
+    importlib.reload(main)
+    assert callable(main.export) and callable(main.screen)
 
 
 def test_fiscal_q4_detection():
