@@ -312,6 +312,19 @@ FAIR_VALUE_MIN_GAIN = 0.01
 #     one-hot on every multiple: Train worse everywhere (PER -.015, P/FCF
 #     -.033), Test better (EV/EBITDA +.025, P/FCF +.028) — the same pattern
 #     as sub-industries: today's classification projected into the past.
+# Macro context (2026-10-01, descriptive, model unchanged; hypotheses and rule
+# fixed in advance): per-date coefficients / multiple level / dispersion vs.
+# FRED series (last value before as_of), judged on quarterly changes, Newey-
+# West (4 lags), BH-FDR over 16 tests, same sign 2004-15 and 2016-26. M2 and
+# NFCI dropped (revised series, no ALFRED key). 3/16 pass: PSR volatility
+# coefficient falls when VIX rises (1 sd -> -.015 vs mean |coef| .105, q .043);
+# dispersion of log PBR / PSR rises with Fed-asset growth (1 sd -> +.006-.008
+# on a std of ~.7-1.0, q .043) — small effects at the FDR edge. Not passed:
+# real rate vs growth coefficients (H2), credit spread vs debt coefficients
+# (H3; EV/EBITDA significant the OTHER way, q < .001 — EV contains the debt).
+# Sanity check H1 (real rate vs market multiple level) did NOT show the known
+# negative relation (all |t| < 1.5): with 92 quarterly points the analysis has
+# little power, so read the passes cautiously.
 
 # Finnhub's quarterly multiples are computed at the fiscal period-end price,
 # but a snapshot is 45-135 days later. When True, features.build_raw_panel
