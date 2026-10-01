@@ -345,6 +345,11 @@ FAIR_VALUE_MIN_GAIN = 0.01
 #     multiple -> rejected.
 #   - market-wide CAPE vs. macro -> market_context.py (descriptive, not a
 #     model input): see that module's docstring for the validation.
+#   - net long-term debt issuance (TTM proceeds - repayments) / assets, SEC
+#     XBRL, Financials excluded (coverage ~54%): every multiple within +-.003,
+#     also with the own multiples of 2 years ago in; rank corr with the past
+#     1y return -.05. Debt levels (debt / equity, net debt / capital, EV)
+#     already carry it -> rejected.
 
 # Finnhub's quarterly multiples are computed at the fiscal period-end price,
 # but a snapshot is 45-135 days later. When True, features.build_raw_panel
