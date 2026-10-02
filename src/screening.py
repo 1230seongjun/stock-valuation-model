@@ -1,61 +1,31 @@
 """
-Screening report: turns fair_value.py's output into a label per stock, a
-plain-language explanation, and a few "look at this by eye" flags.
+Screening report: fair_value.py's gaps -> a label per stock, a plain-language
+explanation, and flags that ask for a second look.
 
-This is a DESCRIPTIVE tool: "at this date, this stock trades X% below/above
-the multiple its fundamentals would normally command". It is not a return
-forecast — the return-prediction version of this project found nothing
-(0/60 significant after FDR, 2026-09-18), and fair_value.gap_return_test is
-where the gap itself gets tested against later returns.
+Descriptive only: "at this date the stock trades X% below/above the multiple
+its fundamentals usually get". Not a return forecast (gap_return_test).
 
-LABEL HISTORY (why it looks like this):
-  - until 2026-09-23 AM: composite_score (mean of 11 sector percentiles)
-    >= 70 / <= 30. Broken by design: an average of 11 percentiles clusters
-    near 50, so ~93% of rows were "중립"; and it mixed quality/momentum into
-    a "valuation" label (XRX was 고평가 with one of the cheapest PBRs in its
-    sector).
-  - 2026-09-23 midday: sector rank of PER/PBR/dividend-yield percentiles
-    only. Fixed both problems, but still called every high-growth/high-ROE
-    stock expensive.
-  - now: cheapness_rank = percentile of -valuation_gap (fair_value.py)
-    across all stocks at the same as_of. Top 20% = 저평가, bottom 20% =
-    고평가 (config thresholds). The naive sector rank is still reported as
-    sector_valuation_rank, so "expensive vs. sector but fair for its
-    fundamentals" is visible side by side.
+Labels: cheapness_rank = percentile of -valuation_gap among all stocks of the
+same as_of, cut into five 20% bands (config.LABEL_BANDS). Loss-makers are
+ranked on the same scale using the multiples that still work for them
+(LOSS_VIEW_KEYS) and labelled "적자 · <band>". Verdicts are withheld for
+heavily indebted loss-makers on the cheap side and for new listings judged on
+one multiple (config FINANCIAL_RISK_* / NEW_LISTING_*). The naive sector rank
+stays as sector_valuation_rank for reference.
 
-FLAGS (heuristics to prompt a second look, not verdicts):
-  - meme_flag ("단기 가격·거래량 이상" in the report — the rule does not
-    identify meme stocks): |5-day move| > 15% AND last-day volume > 3 std
-    above its 63d mean. Only sees the 5 days before each as_of, so between quarterly
-    snapshots it misses events (e.g. GME in late Jan 2021); on the "today"
-    snapshot it works as intended.
-  - value_trap_flag ("지속 할인·저성장 경고"): 저평가 for 4 consecutive
-    snapshots AND revenue growth in the bottom 40% of its sector — cheap
-    for a long time, possibly for a reason the model can't see. A warning
-    rule; whether flagged stocks are value traps was never tested.
-  - transition_flag/type: snapshot where the label flipped 저평가 -> 고평가,
-    attributed to price vs. EPS movement (classify_valuation_transition).
-  - report_lag_flag: the quoted price moved more than REPORT_LAG_MOVE_LIMIT
-    (log) since the fiscal quarter the fundamentals come from. The rescaled
-    multiples assume the business is unchanged since then; a crash/rally
-    the statements haven't caught up with, or a spin-off after the quarter
-    end, breaks that (2026-09-29: ORCL -39%, KLAC -38%, GLW -39%, AMC +55%).
-    Label unchanged — it tells you to check the news first.
-  - fundamental_break_flag: a quarter inside the TTM window with a one-off
-    EPS or a per-share break (features._add_fundamental_breaks) — the TTM
-    multiples mix incomparable quarters. Found on HON 2026-09-29 (one-off
-    gain + sales/share doubling made all 5 views -77%); first suspected to
-    be a spin-off price drop, which verify-multiples ruled out. Label
-    unchanged: on 2026-09-29 it hit 22.9% of labelled rows (60 of 278 on
-    the latest date — GAAP one-offs are common), 28.7% of the cheapest 20%
-    and 26.9% of the most expensive 20% vs. 19.6% in the middle. Enriched
-    in the tails, but withholding a quarter of all verdicts for a 1.4x
-    enrichment would cost more than it saves; it stays a warning.
-  - single_view_flag: 저평가/고평가 resting on one multiple (the others out
-    of range or missing). On 2026-09-29 10 of 445 labels (MBGL and VSNT on
-    PBR alone, AAL on PSR alone near the top of the cheap list; RYAN and
-    AAMI, asset-light financials, on one view among the most expensive).
-    Few, but they sit at the extremes; label unchanged, warning only.
+Flags (warnings, labels unchanged):
+  - meme_flag: |5-day move| > 15% and volume > 3 std above its 63-day mean;
+    only sees the 5 days before each snapshot.
+  - value_trap_flag: 매우 저평가 for 4 snapshots in a row with revenue growth in
+    the sector's bottom 40% (never validated as a value-trap detector).
+  - transition_flag/type: 매우 저평가 <-> 매우 고평가 flips, attributed to price vs. EPS.
+  - report_lag_flag: price moved > REPORT_LAG_MOVE_LIMIT (log) since the
+    fundamentals' quarter end, so the rescaled multiples may be stale.
+  - fundamental_break_flag: a one-off EPS or per-share break inside the TTM
+    window (features._add_fundamental_breaks).
+  - single_view_flag: a non-neutral verdict resting on one multiple.
+  - financial_risk_flag / heavy_debt_flag: heavy debt on a loss-maker / a
+    profitable stock (heavy_debt).
 """
 from __future__ import annotations
 
@@ -65,6 +35,15 @@ import pandas as pd
 from config import (
     CHEAP_THRESHOLD,
     EXPENSIVE_THRESHOLD,
+    FINANCIAL_RISK_LABEL,
+    FINANCIAL_RISK_NET_DEBT_TO_CAPITAL,
+    FINANCIAL_RISK_TOP_SHARE,
+    NEW_LISTING_DAYS,
+    NEW_LISTING_LABEL,
+    LABEL_BANDS,
+    LABELS,
+    VERY_CHEAP_LABEL,
+    VERY_EXPENSIVE_LABEL,
     FAIR_VALUE_FEATURES,
     FAIR_VALUE_TARGETS,
     BASE_EFFECT_CAGR,
@@ -74,7 +53,7 @@ from config import (
     QUALITY_INDICATORS,
     VALUATION_INDICATORS,
 )
-from fair_value import FEATURE_LABELS_KO, add_fair_value, loss_flag, target_features
+from fair_value import FEATURE_LABELS_KO, LOSS_VIEW_KEYS, add_fair_value, loss_flag, target_features
 
 PRICE_SPIKE_THRESHOLD = 0.15
 VOLUME_ZSCORE_THRESHOLD = 3.0
@@ -102,29 +81,107 @@ def _pct_rank(values: pd.Series, by: pd.Series) -> pd.Series:
     return (100.0 * grouped.rank(method="max") / counts).where(counts >= 3)
 
 
+LOSS_LABEL_PREFIX = "적자 · "  # loss-makers, ranked on the all-stock scale
+
+
 def valuation_label(cheapness_rank: float) -> str:
     if pd.isna(cheapness_rank):
         return "데이터 부족"
+    # extremes: >= CHEAP_THRESHOLD / <= EXPENSIVE_THRESHOLD; then 저평가 >= 60, 중립 >= 40, 고평가 > 20
     if cheapness_rank >= CHEAP_THRESHOLD:
-        return "저평가"
+        return VERY_CHEAP_LABEL
     if cheapness_rank <= EXPENSIVE_THRESHOLD:
-        return "고평가"
-    return "중립"
+        return VERY_EXPENSIVE_LABEL
+    return next(label for edge, label in LABEL_BANDS[1:] if cheapness_rank >= edge)
+
+
+def heavy_debt(df: pd.DataFrame) -> pd.Series:
+    """Negative equity, or (outside Financials) net debt / capital above
+    FINANCIAL_RISK_NET_DEBT_TO_CAPITAL or in the date's top
+    FINANCIAL_RISK_TOP_SHARE among non-Financials (config)."""
+    nan = pd.Series(np.nan, index=df.index)
+    ndc, book = df.get("net_debt_to_capital", nan), df.get("book_value", nan)
+    nonfin = df["sector"] != "Financials"
+    ndc_nf = ndc.where(nonfin)
+    top = ndc_nf.groupby(df["as_of"]).rank(pct=True) > 1 - FINANCIAL_RISK_TOP_SHARE
+    return ((book <= 0) | (ndc_nf > FINANCIAL_RISK_NET_DEBT_TO_CAPITAL) | top).fillna(False).astype(bool)
+
+
+def financial_risk(df: pd.DataFrame) -> pd.Series:
+    """Loss-maker with heavy_debt."""
+    loss = df["loss_flag"].astype(bool) if "loss_flag" in df.columns else pd.Series(False, index=df.index)
+    return loss & heavy_debt(df)
+
+
+def new_listing_single_view(df: pd.DataFrame) -> pd.Series:
+    """A verdict resting on ONE multiple within NEW_LISTING_DAYS of the stock's
+    first snapshot, unless that snapshot is the panel's first date (listed earlier)."""
+    first = df.groupby("ticker")["as_of"].transform("min")
+    young = (first > df["as_of"].min()) & ((df["as_of"] - first).dt.days < NEW_LISTING_DAYS)
+    loss = df["loss_flag"].astype(bool) if "loss_flag" in df.columns else pd.Series(False, index=df.index)
+    n = df["n_gaps"].where(~loss, df.get("loss_n_gaps", pd.Series(np.nan, index=df.index)))
+    return (young & (n == 1)).fillna(False).astype(bool)
+
+
+def flag_financial_risk(panel: pd.DataFrame) -> pd.DataFrame:
+    """financial_risk_reason for rows add_labels flagged (financial_risk_flag)."""
+    df = panel.copy()
+    if "financial_risk_flag" not in df.columns:
+        df["financial_risk_flag"] = financial_risk(df)
+        df["financial_risk_withheld"] = False
+    reasons = []
+    for hit, ndc, book, withheld in zip(df["financial_risk_flag"], df.get("net_debt_to_capital", pd.Series(np.nan, index=df.index)),
+                                        df.get("book_value", pd.Series(np.nan, index=df.index)), df["financial_risk_withheld"]):
+        if not hit:
+            reasons.append("")
+            continue
+        what = "자본잠식" if pd.notna(book) and book <= 0 else (f"순부채/총자본 {ndc:.2f}" if pd.notna(ndc) else "빚 부담 큼")
+        reasons.append(f"적자 + 빚 부담 큼({what}) — 부도·재무 위험이 가격에 반영됐을 수 있는데 모델은 이 위험을 측정하지 못함"
+                       + (": 그래서 '저평가'로 판단하지 않음" if withheld else ": 고평가 쪽 판단은 오히려 덜 잡혔을 수 있음"))
+    df["financial_risk_reason"] = reasons
+    if "heavy_debt_flag" not in df.columns:
+        df["heavy_debt_flag"] = heavy_debt(df) & ~df["financial_risk_flag"] & ~df.get("loss_flag", False)
+    df["heavy_debt_reason"] = np.where(
+        df["heavy_debt_flag"],
+        "흑자지만 빚이 많음 — 자본 구조·재무 위험이 배수에 반영돼 매우 저평가·매우 고평가 같은 극단 판정이 나오기 쉬움 "
+        "(빚 많은 흑자 기업은 양 끝 비율이 각각 약 26%, 보통 20%)", "")
+    return df
 
 
 def add_labels(panel: pd.DataFrame) -> pd.DataFrame:
     """cheapness_rank + valuation_label from valuation_gap, plus context
     columns: sector_valuation_rank (naive multiple-vs-sector view),
     quality_score, momentum_score (means of sector percentiles).
-    Loss-makers (fair_value.loss_flag) have no valuation_gap and get
-    "판단 보류(적자)" instead of "데이터 부족"."""
+    Loss-makers (fair_value.loss_flag) have no valuation_gap. Their
+    loss_valuation_gap (PSR/PBR/EV-EBITDA/P-FCF) is ranked against EVERY
+    stock's gap on the same four multiples that date (loss_cheapness_rank,
+    2026-10-02: ranked among loss-makers only, 20% of "적자 · 중립" were in
+    the most expensive 20% of all stocks) and labelled "적자 · " + the same
+    five bands; loss_peer_rank keeps the rank among loss-makers for
+    reference. No multiple at all: "판단 보류(적자)"."""
     df = panel.copy()
     if "loss_flag" not in df.columns:
         df["loss_flag"] = loss_flag(df)
 
     df["cheapness_rank"] = _pct_rank(-df["valuation_gap"], df["as_of"])
     df["valuation_label"] = df["cheapness_rank"].apply(valuation_label)
-    df.loc[df["loss_flag"] & df["cheapness_rank"].isna(), "valuation_label"] = "판단 보류(적자)"
+    # loss-makers: their gap ranked against every stock's gap on the same multiples
+    if "loss_valuation_gap" in df.columns:
+        same_basis = df[[f"{k}_gap" for k in LOSS_VIEW_KEYS if f"{k}_gap" in df.columns]].mean(axis=1, skipna=True)
+        df["loss_cheapness_rank"] = _pct_rank(-same_basis, df["as_of"]).where(df["loss_valuation_gap"].notna())
+        df["loss_peer_rank"] = _pct_rank(-df["loss_valuation_gap"], df["as_of"])
+        ranked = df["loss_flag"] & df["loss_cheapness_rank"].notna()
+        df.loc[ranked, "valuation_label"] = df.loc[ranked, "loss_cheapness_rank"].map(lambda r: LOSS_LABEL_PREFIX + valuation_label(r))
+    df.loc[df["loss_flag"] & df["valuation_label"].eq("데이터 부족"), "valuation_label"] = "판단 보류(적자)"
+    # distressed loss-makers: the model can't see default risk -> no cheap verdict (config)
+    df["financial_risk_flag"] = financial_risk(df)
+    cheap_side = df["valuation_label"].isin([LOSS_LABEL_PREFIX + VERY_CHEAP_LABEL, LOSS_LABEL_PREFIX + "저평가"])
+    df["financial_risk_withheld"] = df["financial_risk_flag"] & cheap_side
+    df.loc[df["financial_risk_withheld"], "valuation_label"] = FINANCIAL_RISK_LABEL
+    df["heavy_debt_flag"] = heavy_debt(df) & ~df["loss_flag"].astype(bool)
+    # a single-multiple verdict on a new listing: too little history to trust (config)
+    df["new_listing_withheld"] = new_listing_single_view(df) & ~df["valuation_label"].str.startswith("판단 보류")
+    df.loc[df["new_listing_withheld"], "valuation_label"] = NEW_LISTING_LABEL
 
     naive = df[[f"{k}_pct" for k in VALUATION_INDICATORS if f"{k}_pct" in df.columns]].mean(axis=1, skipna=True)
     df["sector_valuation_rank"] = _pct_rank(naive, [df["as_of"], df["sector"]])
@@ -156,10 +213,7 @@ def add_expectations(panel: pd.DataFrame, years: int = IMPLIED_GROWTH_YEARS) -> 
 
 
 # Delivered (past 3-year) vs. required (priced-in) excess growth -> detail.
-# Named for the comparison itself, not a judgment (renamed 2026-09-30 from
-# 실적 뒷받침 / 기대 위주 / 실적 대비 과도한 할인 / 실적 부진 반영: past
-# growth exceeding what the price requires does not mean the future will
-# "back" the valuation).
+# Names describe the comparison only, not whether the future will back the price.
 PAST_ABOVE = "과거 성장 > 요구 성장"
 REQUIRED_ABOVE = "요구 성장 > 과거 성장"
 SIMILAR = "요구 성장 ≈ 과거 성장"
@@ -197,7 +251,7 @@ def add_label_detail(panel: pd.DataFrame, band: float = LABEL_DETAIL_BAND) -> pd
     tiny_base = df["earnings_cagr_3y"] > BASE_EFFECT_CAGR
     for label, d, broken, turned, tiny in zip(df["valuation_label"], diff, one_off.fillna(False), turnaround,
                                               tiny_base):
-        if label not in ("저평가", "중립", "고평가"):
+        if label not in LABELS:
             detail.append("")
         elif turned:
             detail.append(TURNAROUND + (ONE_OFF_NOTE if broken else ""))
@@ -255,13 +309,13 @@ def flag_value_trap(panel: pd.DataFrame, lookback_periods: int = VALUE_TRAP_LOOK
     unflagged, not guessed; a stock that only just became cheap is not
     flagged either."""
     df = panel.sort_values(["ticker", "as_of"]).copy()
-    cheap = (df["valuation_label"] == "저평가").astype(int)
+    cheap = (df["valuation_label"] == VERY_CHEAP_LABEL).astype(int)  # the cheapest 20%
     streak = cheap.groupby(df["ticker"]).transform(lambda s: s.rolling(lookback_periods).sum())
     weak_growth = df["revenue_growth_yoy_pct"] <= VALUE_TRAP_WEAK_GROWTH_PERCENTILE
     df["value_trap_flag"] = ((streak == lookback_periods) & weak_growth).fillna(False).astype(bool)
     df["value_trap_reason"] = np.where(
         df["value_trap_flag"],
-        f"최근 {lookback_periods}개 시점 연속 저평가 + 매출성장률은 섹터 하위 "
+        f"최근 {lookback_periods}개 시점 연속 매우 저평가 + 매출성장률은 섹터 하위 "
         f"{VALUE_TRAP_WEAK_GROWTH_PERCENTILE:.0f}% 이내 — 모델이 못 보는 이유로 계속 싼 것일 수 있음 "
         "(지속 할인·저성장 경고; 밸류트랩인지는 검증하지 않은 규칙)",
         "",
@@ -298,16 +352,16 @@ def flag_fundamental_break(panel: pd.DataFrame) -> pd.DataFrame:
     *_period / *_ratio columns features.py adds. A panel built before those
     existed is left unflagged."""
     df = panel.copy()
+    col = lambda c: df[c] if c in df.columns else pd.Series(np.nan, index=df.index)
     reasons = []
-    for _, row in df.iterrows():
+    for eps_when, eps_ratio, sps_when, sps_ratio in zip(col("eps_one_off_period"), col("eps_one_off_ratio"),
+                                                        col("per_share_break_period"), col("per_share_break_ratio")):
         parts = []
-        when, ratio = row.get("eps_one_off_period"), row.get("eps_one_off_ratio")
-        if pd.notna(when):
-            size = f"전년 같은 분기의 {ratio:.1f}배" if pd.notna(ratio) and ratio > 0 else "전년 같은 분기와 부호가 반대(적자)"
-            parts.append(f"{pd.Timestamp(when).date()} 분기 EPS가 평소와 크게 다름({size}) — 일회성 손익 의심")
-        when, ratio = row.get("per_share_break_period"), row.get("per_share_break_ratio")
-        if pd.notna(when):
-            parts.append(f"{pd.Timestamp(when).date()} 분기 주당매출이 전년 대비 {ratio:.1f}배로 급변 — 분사·인수합병·주식 수 기준 변경·데이터 오류 의심")
+        if pd.notna(eps_when):
+            size = f"전년 같은 분기의 {eps_ratio:.1f}배" if pd.notna(eps_ratio) and eps_ratio > 0 else "전년 같은 분기와 부호가 반대(적자)"
+            parts.append(f"{pd.Timestamp(eps_when).date()} 분기 EPS가 평소와 크게 다름({size}) — 일회성 손익 의심")
+        if pd.notna(sps_when):
+            parts.append(f"{pd.Timestamp(sps_when).date()} 분기 주당매출이 전년 대비 {sps_ratio:.1f}배로 급변 — 분사·인수합병·주식 수 기준 변경·데이터 오류 의심")
         reasons.append(" / ".join(parts) + (" (최근 12개월 배수가 서로 다른 분기를 섞고 있어 괴리를 그대로 믿기 어려움)" if parts else ""))
     df["fundamental_break_reason"] = reasons
     df["fundamental_break_flag"] = df["fundamental_break_reason"] != ""
@@ -315,13 +369,19 @@ def flag_fundamental_break(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def flag_single_view(panel: pd.DataFrame) -> pd.DataFrame:
-    """single_view_flag: labelled 저평가/고평가 from ONE multiple, because the
+    """single_view_flag: a non-neutral label (매우 저평가 ... 매우 고평가, loss-makers
+    too) from ONE multiple, because the
     others were out of range, missing or excluded for the sector — nothing
     cross-checks it (see module docstring)."""
     df = panel.copy()
     n_gaps = df["n_gaps"] if "n_gaps" in df.columns else pd.Series(np.nan, index=df.index)
     basis = df["valuation_basis"] if "valuation_basis" in df.columns else pd.Series("", index=df.index)
-    labelled = df["valuation_label"].isin(["저평가", "고평가"])
+    if "loss_n_gaps" in df.columns:  # loss-makers: their own verdict's multiples
+        loss = df["valuation_label"].astype(str).str.startswith(LOSS_LABEL_PREFIX)
+        n_gaps = n_gaps.where(~loss, df["loss_n_gaps"])
+        basis = basis.where(~loss, df["loss_valuation_basis"])
+    directional = [lbl for lbl in LABELS if lbl != "중립"]
+    labelled = df["valuation_label"].isin(directional + [LOSS_LABEL_PREFIX + lbl for lbl in directional])
     df["single_view_flag"] = (labelled & (n_gaps == 1)).fillna(False).astype(bool)
     df["single_view_reason"] = [
         f"{b} 한 가지 배수로만 판단 — 다른 배수는 범위 밖이거나 값이 없어 교차 확인이 안 됨 (신뢰도 낮음)" if hit else ""
@@ -374,7 +434,7 @@ def classify_valuation_transition(
         prices = group["price"].to_numpy(dtype=float)
         eps = group["eps"].to_numpy(dtype=float)
         for i in range(1, len(group)):
-            if not (labels[i - 1] == "저평가" and labels[i] == "고평가"):
+            if not (labels[i - 1] == VERY_CHEAP_LABEL and labels[i] == VERY_EXPENSIVE_LABEL):
                 continue
             dp = _log_change(prices[i - 1], prices[i])
             de = _log_change(eps[i - 1], eps[i])
@@ -405,14 +465,9 @@ def classify_valuation_transition(
     return df
 
 
-# Drivers that move a fair multiple through the multiple's own arithmetic,
-# not because the market pays for them (2026-09-30: AAPL's P/FCF read "높인
-# 요인 이익의 현금 전환율 +19%" because its conversion is BELOW average):
-#   PER = PBR / ROE, PBR = market cap / book, PSR = PBR / (sales / equity)
-#   and sales sit in its denominator, EV/EBITDA = (EV / assets) / (asset
-#   turnover x EBITDA margin), P/FCF = PSR / FCF margin = PER x net income /
-#   FCF. Their coefficients have the sign the identity predicts on 95-100%
-#   of dates (evaluate section 3).
+# Drivers that move a fair multiple through the multiple's own arithmetic
+# (PER = PBR / ROE, P/FCF = PSR / FCF margin, ...), not because the market pays
+# for them; their signs match the identity on 95-100% of dates (evaluate §3).
 DENOMINATOR_DRIVERS = {
     "pe": {"return_on_equity"},
     "pe_norm": {"return_on_equity"},
@@ -491,7 +546,7 @@ def explain(row: pd.Series) -> str:
         actual, fair, gap = row.get(spec["column"]), row.get(f"fair_{key}"), row.get(f"{key}_gap")
         status, why = multiple_status(row, key)
         if status == "evaluated":
-            excluded = " [적자라 참고용]" if row.get("loss_flag") else ""
+            excluded = " [적자라 참고용]" if row.get("loss_flag") and key not in LOSS_VIEW_KEYS else ""
             if not spec.get("in_verdict", True):
                 excluded = " [참고용, 종합 판단 제외]"
             particle = "를" if spec["label"].endswith(("EBITDA", "FCF")) else "을"  # 에이/에프 end in a vowel
@@ -528,7 +583,17 @@ def explain(row: pd.Series) -> str:
     elif isinstance(detail, str) and detail:
         lines.append(f"→ {row['valuation_label']} · {detail}: 중간 종목 대비 최근 3년 실제 초과 성장 "
                      f"{row['realized_excess_growth']:+.1%} vs 가격에 반영된 초과 성장 {row['implied_excess_growth']:+.1%}{note}")
-    if row.get("loss_flag"):
+    if row.get("loss_flag") and pd.notna(row.get("loss_valuation_gap")):
+        n = int(row["loss_n_gaps"])
+        agree = int(round(row["loss_gap_agreement"] * n))
+        side = "싸다" if row["loss_valuation_gap"] < 0 else "비싸다"
+        lines.append(f"최근 12개월 적자 — PER을 쓸 수 없어 적자 기업끼리 {row['loss_valuation_basis']}로 비교: "
+                     f"{n}개 관점 중 {agree}개가 '{side}' 쪽 (평균 괴리 {np.expm1(row['loss_valuation_gap']):+.0%}). "
+                     "적자가 일회성 손상 때문인지 구조적 부진인지는 재무 지표만으로 구분할 수 없음")
+        if row.get("financial_risk_withheld"):
+            lines.append("판단 보류(재무 위험): 위 비교로는 싼 쪽이지만, 빚이 많아 부도·재무 위험이 가격에 반영됐을 수 있고 "
+                         "모델은 그 위험을 측정하지 못해 '저평가'로 판단하지 않음")
+    elif row.get("loss_flag"):
         lines.append(
             "최근 12개월 적자 — 일회성 손상인지 구조적 부진인지 재무 지표만으로 구분할 수 없어 판단을 보류함 "
             "(위 배수 괴리는 참고용)"
@@ -541,6 +606,8 @@ def explain(row: pd.Series) -> str:
     elif pd.notna(row.get("valuation_gap")) and row.get("n_gaps", 0) == 1:
         lines.append(f"종합: {row.get('valuation_basis')} 한 가지 관점으로만 판단 (괴리 {np.expm1(row['valuation_gap']):+.0%}) "
                      "— 다른 배수로 교차 확인할 수 없음")
+    if row.get("new_listing_withheld"):
+        lines.append("판단 보류(신규 상장): 상장 후 1년이 안 됐고 배수 하나로만 비교돼, 데이터가 부족해 판단하지 않음")
     return "\n".join(lines)
 
 
@@ -555,6 +622,7 @@ def screen(panel: pd.DataFrame) -> pd.DataFrame:
     df = flag_report_lag(df)
     df = flag_fundamental_break(df)
     df = flag_single_view(df)
+    df = flag_financial_risk(df)
     df = add_expectations(df)
     df = add_label_detail(df)  # after the break flag, which it reads
     return classify_valuation_transition(df)
@@ -571,8 +639,11 @@ REPORT_COLUMNS = [
     "implied_excess_growth", "realized_excess_growth", "earnings_cagr_3y", "earnings_cagr_3y_median",
     "earnings_turnaround_3y",
     "sector_valuation_rank", "quality_score",
-    "momentum_score", "loss_flag", "meme_flag", "value_trap_flag", "transition_flag", "transition_type",
+    "momentum_score", "loss_flag", "loss_cheapness_rank", "loss_peer_rank", "loss_valuation_gap_pct", "loss_valuation_basis",
+    "loss_n_gaps", "loss_gap_agreement", "meme_flag", "value_trap_flag", "transition_flag", "transition_type",
     "report_lag_flag", "price_move_since_report", "fundamental_break_flag", "single_view_flag",
+    "financial_risk_flag", "financial_risk_withheld", "financial_risk_reason", "heavy_debt_flag", "heavy_debt_reason",
+    "new_listing_withheld",
     "meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason", "fundamental_break_reason",
     "single_view_reason", "explanation",
 ]
@@ -587,20 +658,10 @@ def report_at(screened: pd.DataFrame, as_of: pd.Timestamp | None = None) -> pd.D
     rows["explanation"] = rows.apply(explain, axis=1)
     # report gaps as % (actual / fair - 1); the model works in log units
     rows["valuation_gap_pct"] = np.expm1(rows["valuation_gap"])
+    if "loss_valuation_gap" in rows.columns:
+        rows["loss_valuation_gap_pct"] = np.expm1(rows["loss_valuation_gap"])
     for key in FAIR_VALUE_TARGETS:
         if f"{key}_gap" in rows.columns:
             rows[f"{key}_gap"] = np.expm1(rows[f"{key}_gap"])
     rows = rows.reindex(columns=REPORT_COLUMNS)  # a panel built before PSR has no price_to_sales
     return rows[REPORT_COLUMNS].sort_values("cheapness_rank", ascending=False, na_position="last").reset_index(drop=True)
-
-
-def screen_latest(panel: pd.DataFrame, as_of: pd.Timestamp | None = None) -> pd.DataFrame:
-    return report_at(screen(panel), as_of)
-
-
-def screen_ticker(panel: pd.DataFrame, ticker: str, as_of: pd.Timestamp | None = None) -> dict:
-    report = screen_latest(panel, as_of)
-    match = report[report["ticker"] == ticker.upper()]
-    if match.empty:
-        return {"error": f"{ticker}에 대한 데이터가 없습니다 (유니버스에 없거나 해당 시점 데이터 부족)"}
-    return match.iloc[0].to_dict()

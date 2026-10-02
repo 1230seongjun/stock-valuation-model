@@ -7,6 +7,7 @@ Entry point.
     python src/main.py evaluate                      # fair-value model quality + gap-vs-return test
     python src/main.py screen    [--ticker AAPL] [--as-of 2026-07-01]   # + market_context_<date>.json
     python src/main.py export    [--as-of 2026-07-01]   # per-stock JSON for an LLM -> real_data_output/llm/<date>/
+    python src/main.py explain   --tickers AAPL NVDA | --submit | --collect   # Korean explanations (Claude API)
 
 build needs FINNHUB_API_KEY (env var or --api-key). The other commands only
 need the saved panel, and recompute the fair-value model from it every time,
@@ -368,19 +369,29 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
           f"     priced_in = yearly EPS growth above the median stock the PER needs for {IMPLIED_GROWTH_YEARS} years;\n"
           "     earn_3y = realized earnings growth per year, last 3 years (EPS, or net income without EPS)"
           + (f" (median stock {median_growth.iloc[0]:+.0%})" if len(median_growth) else "") + ")")
-    print("\n-- 저평가 상위 15 --")
+    print("\n-- 매우 저평가 상위 15 --")
     print(table[cols].head(15).to_string(index=False))
-    print("\n-- 고평가 상위 15 --")
-    print(table[table["valuation_label"] == "고평가"][cols].tail(15).iloc[::-1].to_string(index=False))
+    print("\n-- 매우 고평가 상위 15 --")
+    print(table[table["valuation_label"] == "매우 고평가"][cols].tail(15).iloc[::-1].to_string(index=False))
+    loss = report[report["loss_cheapness_rank"].notna()].sort_values("loss_cheapness_rank", ascending=False)
+    if not loss.empty:
+        loss_table = loss.assign(rank=loss["loss_cheapness_rank"].round(0), gap=pct(loss["loss_valuation_gap_pct"]),
+                                 basis=loss["loss_valuation_basis"])[["ticker", "sector", "size_group", "valuation_label",
+                                                                      "rank", "gap", "basis"]]
+        print(f"\n-- 적자 기업 {len(loss)}개 (PER 없음, 주로 PSR·PBR; rank = 같은 배수 기준 전체 종목 중 백분위) --")
+        print("  저평가 쪽 10:\n" + loss_table.head(10).to_string(index=False))
+        print("  고평가 쪽 10:\n" + loss_table.tail(10).iloc[::-1].to_string(index=False))
 
     # flagged rows nearest the label extremes first; the full lists are in the CSV
     extremeness = (report["cheapness_rank"] - 50).abs().fillna(-1)
     for flag, reason, title in [("meme_flag", "meme_reason", "단기 가격·거래량 이상"),
                                 ("value_trap_flag", "value_trap_reason", "지속 할인·저성장 경고"),
-                                ("transition_flag", "transition_reason", "저평가→고평가 전환"),
+                                ("transition_flag", "transition_reason", "매우 저평가→매우 고평가 전환"),
                                 ("report_lag_flag", "report_lag_reason", "재무 기준일 이후 주가 급변"),
                                 ("fundamental_break_flag", "fundamental_break_reason", "최근 12개월 재무 단절"),
-                                ("single_view_flag", "single_view_reason", "한 가지 배수로만 판단")]:
+                                ("single_view_flag", "single_view_reason", "한 가지 배수로만 판단"),
+                                ("financial_risk_flag", "financial_risk_reason", "적자 + 재무 위험"),
+                                ("heavy_debt_flag", "heavy_debt_reason", "빚 많은 흑자 기업")]:
         hits = report[report[flag]]
         if not hits.empty:
             print(f"\n-- {title} ({len(hits)}) --")
@@ -408,6 +419,40 @@ def export(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, out_di
     n_stocks = len(list(folder.glob("*.json"))) - 1 - (market is not None)  # minus index / market files
     print(f"\nexported {n_stocks} stocks -> {folder}")
     return folder
+
+
+def explain(as_of: str | None = None, tickers: list[str] | None = None, submit: bool = False, collect: bool = False,
+            model: str | None = None, effort: str | None = None, out_dir: str | Path = OUTPUT_DIR / "llm") -> None:
+    """Korean explanations of an exported date (llm_explain): --tickers runs
+    them one by one now; --submit sends every stock as a Message Batch;
+    --collect fetches a finished batch. Needs Claude API credentials in the
+    environment (ANTHROPIC_API_KEY or `ant auth login`)."""
+    import llm_explain
+
+    dates = sorted(p.name for p in Path(out_dir).iterdir() if p.is_dir()) if Path(out_dir).exists() else []
+    folder = Path(out_dir) / (as_of or (dates[-1] if dates else ""))
+    if not (folder / "index.json").exists():
+        raise SystemExit(f"{folder} has no export — run `python src/main.py export` first")
+    kw = {"model": model or llm_explain.MODEL}
+    if tickers:
+        for t in tickers:
+            r = llm_explain.explain_one(folder, t.upper(), effort=effort or llm_explain.EFFORT, **kw)
+            e = r["explanation"] or {}
+            verdict = "통과" if r["check"]["passed"] else "검수 실패: " + "; ".join(r["check"]["issues"])
+            print(f"\n=== {r['ticker']} ({verdict}) ===")
+            print(e.get("headline", ""))
+            print(e.get("summary", ""))
+            for line in e.get("reasons", []):
+                print("  - " + line)
+            for line in e.get("cautions", []):
+                print("  ※ " + line)
+            if e.get("market_note"):
+                print("  시장: " + e["market_note"])
+            print(f"  (tokens in {r['usage']['input_tokens']} + cache {r['usage']['cache_read_input_tokens']}, out {r['usage']['output_tokens']})")
+    elif submit:
+        print(f"batch submitted: {llm_explain.submit_batch(folder, effort=effort or llm_explain.EFFORT, **kw)}")
+    elif collect:
+        print(llm_explain.collect_batch(folder, **kw))
 
 
 # HON: all 5 views -77% on 2026-09-29 — a one-off gain + per-share break in
@@ -488,6 +533,13 @@ def main() -> None:
     s.add_argument("--ticker")
     x = sub.add_parser("export", help="per-stock JSON for an LLM explanation")
     x.add_argument("--as-of")
+    y = sub.add_parser("explain", help="Korean explanations with Claude (needs API credentials)")
+    y.add_argument("--as-of")
+    y.add_argument("--tickers", nargs="+")
+    y.add_argument("--submit", action="store_true")
+    y.add_argument("--collect", action="store_true")
+    y.add_argument("--model")
+    y.add_argument("--effort")
     for p in (b, v, c, e, s, x):
         p.add_argument("--panel", default=str(PANEL_PATH))
     args = parser.parse_args()
@@ -500,6 +552,8 @@ def main() -> None:
         compare_features(args.panel, drop_check=args.drop_check)
     elif args.command == "evaluate":
         evaluate(args.panel)
+    elif args.command == "explain":
+        explain(args.as_of, args.tickers, args.submit, args.collect, args.model, args.effort)
     elif args.command == "export":
         export(args.panel, as_of=args.as_of)
     else:

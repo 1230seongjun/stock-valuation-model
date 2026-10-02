@@ -20,31 +20,10 @@ Two price series (data.fetch_price_history): `close` is dividend-adjusted
 (for returns and volatility), `close_raw` is the price actually quoted (for
 the `price` column, dividend yield and rescaling Finnhub's multiples).
 
-Derived indicators (see data.py for the raw fields):
-  - revenue_growth_yoy: YoY % change in the quarter's sales per share
-  - revenue_cagr_3y: 3-year CAGR of trailing-12-month sales per share
-  - op_margin_volatility: std of quarterly operating margin, last 12 quarters
-    (a one-off gain/charge or a cyclical business shows up here)
-  - op_margin_avg_3y / roe_avg_3y: 12-quarter means (candidate features)
-  - eps_cagr_3y, growth_consistency_3y, *_volatility_3y, loss_share_3y,
-    cash_conversion_3y: multi-year growth and earnings durability
-    (_add_durability, candidate features)
-  - normalized_pe: as_of price / (4 x mean quarterly EPS of the last 12
-    quarters) — PER on 3-year average earnings, so one quarter's one-off
-    gain or charge weighs 1/12 instead of 1/4 (a reference view, see
-    config.FAIR_VALUE_TARGETS "in_verdict")
-  - eps_one_off_* / per_share_break_*: quarters inside the TTM window that
-    make trailing figures unreliable (_add_fundamental_breaks)
-  - log_revenue / log_book_value: company size without the snapshot price
-    (_size_features); size_group: today's index membership (universe.py),
-    for splitting reports only
-  - dividend_yield / dividend_growth_3y / dividend_years_no_cut: from actual
-    dividend payments (see _dividend_features)
-  - accruals (+ its parts sec_net_income_ttm, sec_operating_cash_flow_ttm,
-    sec_assets): (TTM net income - TTM operating cash flow) / total assets from
-    SEC XBRL (data.load_sec_facts) for the SAME fiscal period as the Finnhub
-    fundamentals, counting only facts FILED on or before as_of — SEC gives
-    the real filing date, so no assumed lag here (_accruals_asof)
+Derived indicators are documented where they are computed (add_fundamental_trends,
+_add_durability, _add_trajectory, _add_fundamental_breaks, _size_features,
+_dividend_features, _accruals_asof). Accruals use SEC XBRL facts FILED on or
+before as_of — SEC gives the real filing date, so no assumed lag there.
 """
 from __future__ import annotations
 
@@ -61,22 +40,16 @@ from config import (
     TECHNICAL_INDICATORS,
 )
 
-# Finnhub's quarterly series has no filing dates. Checked 2026-09-30 against
-# Finnhub's filings (financials-reported, 2010+): 10-Qs (fiscal Q1-Q3) came
-# within 45 days in 99.7% of 1,078 filings (25 tickers, median 34 days), but
-# 10-Ks (fiscal Q4) within 45 days in only 22% of 535 (40 tickers, median
-# ~53, 94% within 60, 99.4% within 75). Until then every quarter used 45
-# days, so a fiscal Q4 was often used ~a week before its 10-K was filed.
+# Finnhub has no filing dates. 10-Qs came within 45 days in 99.7% of filings,
+# 10-Ks only 22% (99.4% within 75) — 2026-09-30 sample.
 REPORTING_LAG_DAYS = 45          # fiscal Q1-Q3 (10-Q)
 ANNUAL_REPORTING_LAG_DAYS = 75   # fiscal Q4 (10-K)
 # A quarterly period within this many days of a fiscal year-end (any year)
 # is that year's Q4 — covers 52/53-week calendars (AAPL: Sep 24 ~ Oct 1).
 FISCAL_YEAR_END_TOLERANCE_DAYS = 20
 DEFAULT_FISCAL_YEAR_END = (12, 31)  # when Finnhub has no annual series for a ticker
-# A snapshot needs a trade within this many days before as_of. Covers
-# weekends/holidays (e.g. as_of = Jan 1); anything longer means the stock
-# wasn't trading yet (pre-IPO) or anymore (delisted/acquired), and carrying
-# a months-old price forward would fake a valuation.
+# A snapshot needs a trade within this many days before as_of (weekends,
+# holidays); longer means pre-IPO or delisted, and a stale price would fake a valuation.
 MAX_PRICE_STALENESS_DAYS = 10
 
 # Columns taken from the latest known fundamentals row. dividend_yield is not
@@ -363,10 +336,10 @@ def _as_of_fundamentals(fundamentals: pd.DataFrame, as_of: pd.Timestamp) -> dict
     empty = {k: np.nan for k in _AS_OF_FUNDAMENTAL_KEYS} | {"fundamentals_period": pd.NaT}
     if fundamentals.empty:
         return empty
-    valid = fundamentals[fundamentals["available_date"] <= as_of]
-    if valid.empty:
+    i = fundamentals["available_date"].searchsorted(as_of, side="right")  # sorted by _ticker_rows
+    if i == 0:
         return empty
-    row = valid.sort_values("available_date").iloc[-1]
+    row = fundamentals.iloc[i - 1]
     return {k: row.get(k, np.nan) for k in _AS_OF_FUNDAMENTAL_KEYS} | {"fundamentals_period": row["period"]}
 
 
@@ -385,10 +358,10 @@ def _rescale_multiples(row: dict, quoted: pd.DataFrame) -> float:
         row[f"{col}_reported"] = row[col]
     if pd.isna(row["fundamentals_period"]) or pd.isna(row["price"]):
         return np.nan
-    at_period = quoted[quoted["date"] <= row["fundamentals_period"]]
-    if at_period.empty or at_period["price"].iloc[-1] <= 0:
+    i = quoted["date"].searchsorted(row["fundamentals_period"], side="right")
+    if i == 0 or quoted["price"].iloc[i - 1] <= 0:
         return np.nan
-    period_price = at_period["price"].iloc[-1]
+    period_price = quoted["price"].iloc[i - 1]
     if not RESCALE_MULTIPLES_TO_AS_OF_PRICE:
         return period_price
     ratio = row["price"] / period_price
@@ -421,7 +394,22 @@ def _size_features(row: dict, period_price: float) -> dict[str, float]:
     return out
 
 
-def _dividend_features(payments: pd.DataFrame, as_of: pd.Timestamp, price: float) -> dict[str, float]:
+def _dividend_streak_starts(payments: pd.DataFrame) -> np.ndarray:
+    """For each payment k: the date the no-cut streak started, scanning
+    payments 0..k (a cut = a payment < 95% of the median of the 4 before it,
+    the next 3 counting as the same cut). Depends on earlier payments only."""
+    amounts, dates = payments["dividend"].to_numpy(), payments["date"].to_numpy()
+    starts = np.empty(len(amounts), dtype=dates.dtype)
+    since, last_cut = dates[0] if len(dates) else None, -4
+    for i in range(len(amounts)):
+        if i >= 4 and amounts[i] < 0.95 * np.median(amounts[i - 4:i]) and i - last_cut >= 4:
+            since, last_cut = dates[i], i
+        starts[i] = since
+    return starts
+
+
+def _dividend_features(payments: pd.DataFrame, as_of: pd.Timestamp, price: float,
+                       streak_starts: np.ndarray | None = None) -> dict[str, float]:
     """From actual cash dividends (ex-date <= as_of; `payments`: date +
     dividend, only rows with a payment). Built on per-payment amounts rather
     than calendar-year sums: quarterly ex-dates drift, so a 365-day window can
@@ -441,29 +429,25 @@ def _dividend_features(payments: pd.DataFrame, as_of: pd.Timestamp, price: float
                               same cut), capped at 25; 0 for a non-payer
     A company that stopped paying more than 400 days ago is a non-payer."""
     none = {"dividend_yield": 0.0, "dividend_growth_3y": np.nan, "dividend_years_no_cut": 0.0}
-    past = payments[payments["date"] <= as_of]
+    past = payments.iloc[:payments["date"].searchsorted(as_of, side="right")]  # payments are in date order
     if past.empty or (as_of - past["date"].iloc[-1]).days > 400 or pd.isna(price) or price <= 0:
         return none
 
-    recent = past[past["date"] > as_of - pd.Timedelta(days=730)]
+    recent = past.iloc[past["date"].searchsorted(as_of - pd.Timedelta(days=730), side="right"):]
     gaps = recent["date"].diff().dt.days.dropna()
     freq = int(np.clip(round(365 / gaps.median()), 1, 12)) if len(gaps) else 1
     annual = past["dividend"].tail(freq).median() * freq
 
-    then = past[past["date"] <= as_of - pd.Timedelta(days=3 * 365)]
+    then = past.iloc[:past["date"].searchsorted(as_of - pd.Timedelta(days=3 * 365), side="right")]
     growth = np.nan
     if len(then) >= 4:
         now_amt, then_amt = past["dividend"].tail(4).median(), then["dividend"].tail(4).median()
         if now_amt > 0 and then_amt > 0:
             growth = (now_amt / then_amt) ** (1 / 3) - 1
 
-    amounts = past["dividend"].to_numpy()
-    dates = past["date"].to_numpy()
-    since, last_cut = dates[0], -4
-    for i in range(4, len(amounts)):
-        if amounts[i] < 0.95 * np.median(amounts[i - 4:i]) and i - last_cut >= 4:
-            since, last_cut = dates[i], i
-    years = min(25.0, (as_of - pd.Timestamp(since)).days / 365.25)
+    if streak_starts is None:
+        streak_starts = _dividend_streak_starts(payments)
+    years = min(25.0, (as_of - pd.Timestamp(streak_starts[len(past) - 1])).days / 365.25)
     return {"dividend_yield": annual / price, "dividend_growth_3y": growth, "dividend_years_no_cut": years}
 
 
@@ -507,12 +491,13 @@ def _forward_log_return(prices: pd.DataFrame, as_of: pd.Timestamp, base_close: f
     if pd.isna(base_close) or base_close <= 0:
         return np.nan
     target_date = as_of + pd.Timedelta(days=round(months * 30.4))
-    if prices["date"].iloc[-1] < target_date:
+    dates = prices["date"]
+    if dates.iloc[-1] < target_date:
         return np.nan
-    future = prices[(prices["date"] > as_of) & (prices["date"] <= target_date)]
-    if future.empty:
+    start, end = dates.searchsorted(as_of, side="right"), dates.searchsorted(target_date, side="right")
+    if end <= start:
         return np.nan
-    return float(np.log(future["close"].iloc[-1] / base_close))
+    return float(np.log(prices["close"].iloc[end - 1] / base_close))
 
 
 # SEC facts (accruals, 2026-10-01). A fact belongs to a fiscal period if its
@@ -651,15 +636,19 @@ def _ticker_rows(
     size_group = meta.get("size", "large")
     industry = meta.get("industry") or f"{sector} 기타"  # universe.industry_groups
     sec = _sec_prepare(sec_facts)
+    streak_starts = _dividend_streak_starts(payments)
+    if not fund_df.empty:
+        fund_df = fund_df.sort_values("available_date", kind="stable")
 
     rows = []
     for as_of in as_of_dates:
-        window = price_df[price_df["date"] <= as_of].tail(260)
-        if window.empty or (as_of - window["date"].iloc[-1]).days > MAX_PRICE_STALENESS_DAYS:
+        end = price_df["date"].searchsorted(as_of, side="right")  # rows up to and including as_of
+        if end == 0 or (as_of - price_df["date"].iloc[end - 1]).days > MAX_PRICE_STALENESS_DAYS:
             continue
+        window = price_df.iloc[max(0, end - 260):end]
         close = window["close"].reset_index(drop=True)
         volume = window["volume"].reset_index(drop=True)
-        quoted_now = quoted[quoted["date"] <= as_of]
+        quoted_now = quoted.iloc[:quoted["date"].searchsorted(as_of, side="right")]
         price = quoted_now["price"].iloc[-1] if len(quoted_now) else np.nan
 
         row = {"as_of": as_of, "ticker": ticker, "sector": sector, "industry": industry, "size_group": size_group,
@@ -669,8 +658,9 @@ def _ticker_rows(
         period_price = _rescale_multiples(row, quoted_now)
         row.update(_size_features(row, period_price))
         # already at the as_of price (no Finnhub period-end price involved)
+        # PER on 3-year average EPS: a one-off quarter weighs 1/12 instead of 1/4
         row["normalized_pe"] = price / (4 * row["eps_avg_3y"]) if row["eps_avg_3y"] > 0 else np.nan
-        row.update(_dividend_features(payments, as_of, price))
+        row.update(_dividend_features(payments, as_of, price, streak_starts))
         row.update(_technicals_asof(close, volume))
         row.update(_anomaly_signals_asof(close, volume))
         for h in HORIZONS_MONTHS:

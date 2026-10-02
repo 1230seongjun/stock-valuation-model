@@ -1,103 +1,16 @@
 """
-Ticker universe (281 tickers, 11 GICS sectors).
+Ticker universe: a 281-name large-cap core (11 GICS sectors) plus the S&P
+MidCap 400 / SmallCap 600 members (load_universe).
 
-Sector is the only industry information the fair-value model gets, and GICS
-sectors are coarse: hardware vs. software (HPQ vs. ADBE) or airlines vs.
-defense (DAL vs. LMT) share a sector but not a normal multiple. Stocks from
-structurally cheaper sub-industries therefore tend to show up as "저평가".
-Finer industry labels would be the first thing to add if that matters.
-
-v3 (2026-09-18) — expanded from 66 (11 sectors x 6) toward ~30/sector, per
-user request after the first two real-data runs (66 tickers) came back
-0/52 and 0/60 statistically significant factor tests. Same rationale as the
-original 33->66 expansion (2026-09-14, see git history / prior chat):
-well-known value/quality factors are normally validated on hundreds to
-thousands of stocks over decades, not a few dozen — this is the other lever
-(besides the 16y Train window already in config.py) for real statistical
-power. Also folds in two other 2026-09-18 decisions:
-
-1. Per-sector model splitting is explicitly NOT done yet, on purpose. A
-   separate model per sector only makes sense once each sector has enough
-   tickers to support its own regression — 6/sector clearly wasn't enough,
-   and even the sectors below that only reached the high teens/20s (Energy,
-   Materials, Communication Services, Real Estate — see note at the bottom)
-   are still thin for a fully separate per-sector model. Sector enters the
-   fair-value model as a one-hot level shift instead (fair_value.py), and
-   every _pct column is sector-relative (features.add_percentile_scores).
-
-2. A handful of tickers below are deliberately NOT S&P 500-only picks, and
-   a handful are deliberately chosen for being awkward cases (meme-stock
-   volatility, "value trap" reputations) rather than clean blue chips — see
-   the MEME_STOCK_WATCHLIST / VALUE_TRAP_WATCHLIST lists at the bottom. The
-   point is to have real examples of the two failure modes the user flagged
-   ("밈주식이라 갑자기 고평가", "저평가인데 평생 못 오르는 주식") actually
-   sitting in the training data, so any future anomaly-detection/filtering
-   logic has real cases to be tested against instead of being designed in
-   the abstract. They are NOT excluded from anything — screening.py's
-   meme_flag / value_trap_flag are what's meant to surface them.
-
-HOW THIS LIST WAS BUILT — please read this before trusting it blindly:
-Sector/ticker membership for the "core" names was cross-checked against
-Wikipedia's "List of S&P 500 companies" (fetched 2026-09-18) grouped by
-GICS sector. Everything beyond that core list (older delistings, spinoffs,
-which tickers have decades of trading history vs. a handful of years) is
-from general knowledge, NOT re-verified against a live data feed per
-ticker — that verification is exactly what the pipeline's own
-data.data_quality_report() does at collection time
-("no price history" flags). Treat any ticker flagged there as suspect —
-see the 2026-09-18 correction note below for what that turned up the first
-time this ran on 283 tickers.
-
-CORRECTION (2026-09-18, after the first 283-ticker real run flagged 10
-tickers as "no price history"): checked each one via web search rather than
-guessing. 7 were real — all completed M&A/going-private deals that
-post-date this assistant's knowledge cutoff (Jan 2026), so they weren't
-caught when this list was first built:
-  - IPG merged into Omnicom (OMC, already in this universe), delisted
-    2025-11-28
-  - ANSS acquired by Synopsys (SNPS, already in this universe), completed
-    2025-07
-  - JNPR acquired by HPE (not in this universe), completed 2025-07
-  - MRO acquired by ConocoPhillips (COP, already in this universe), 2024
-  - HES acquired by Chevron (CVX, already in this universe), completed
-    2025-07
-  - WBA taken private by Sycamore Partners, completed 2025-08
-  - SEE (Sealed Air) taken private by CD&R, 2025
-All 7 are removed below rather than replaced 1:1 with something equally
-acquisition-prone — see the per-sector replacement notes. 1 was a ticker
-rename, not a delisting: BK -> BNY (Bank of New York Mellon renamed its
-ticker; the company itself is unaffected and is kept, just relabeled). The
-remaining 2 (FI, K) had no delisting evidence — K (Kellanova) WAS
-subsequently confirmed acquired by Mars (completed 2025-12) and is removed;
-FI (Fiserv) is still actively trading under that exact ticker per every
-source checked, so its "no price history" is presumed a transient
-yfinance/network hiccup, not a real problem — left as-is, but if it keeps
-showing up in data_quality_report, that's worth a second look (possibly
-try the pre-2023 ticker FISV as a fallback).
-
-FOLLOW-UP (2026-09-23): FI flagged "no price history" again on the next
-real run, so it was checked directly — yfinance now returns 404 / "possibly
-delisted" for FI, while FISV returns current prices (through 2026-09-22).
-Fiserv's ticker is FISV again, not a delisting — relabeled FI -> FISV
-below, same treatment as BK -> BNY. (Checked on yfinance only; if Finnhub
-still expects the old symbol, data_quality_report will show it.)
-
-This will keep happening — completed M&A is exactly the kind of "special
-case" the user's meme-stock/value-trap discussion was about, just from the
-opposite direction (the company stops existing rather than staying
-mispriced). Treat every data_quality_report "no price history" flag as
-"go check if this ticker still trades" before assuming it's a bug.
-
-WHY SECTORS AREN'T ALL ~30: Energy, Materials, Communication Services and
-Real Estate are GICS sectors with fewer genuine large, long-listed (pre-
-2004) public companies to begin with — padding them to exactly 30 would
-mean including recent IPOs/spinoffs that contribute almost no Train-period
-data (defeats the point) or thin unrelated small-caps just to hit a round
-number. Better to have fewer, real, long-history tickers per sector than a
-round number full of near-empty rows. Same "handle missing history as NaN,
-don't crash" rule from before still applies (see build_raw_panel) — a
-partial-history ticker (TSLA, META, GME, etc.) just contributes less to the
-earliest Train years rather than breaking anything.
+- The core list was cross-checked against Wikipedia's S&P 500 list
+  (2026-09-18); the rest is general knowledge. A "no price history" flag in
+  data.data_quality_report usually means a completed M&A or a ticker change
+  (BK -> BNY, FI -> FISV), so check that before assuming a bug.
+- Energy, Materials, Communication Services and Real Estate have fewer names:
+  there are fewer long-listed large companies, and padding with recent IPOs
+  adds almost no Train-period data. Partial histories are simply NaN early on.
+- A few awkward names (meme stocks GME/AMC/KOSS/BB, "value traps" T/VZ/MO...)
+  are kept on purpose as real cases for screening's meme / value-trap flags.
 """
 from __future__ import annotations
 
@@ -135,7 +48,7 @@ UNIVERSE: dict[str, dict[str, str]] = {
     "ADSK": {"name": "Autodesk", "sector": "Technology"},
     "CTSH": {"name": "Cognizant", "sector": "Technology"},
     "ACN": {"name": "Accenture", "sector": "Technology"},
-    "FISV": {"name": "Fiserv", "sector": "Technology"},  # FISV -> FI (2023) -> back to FISV; see 2026-09-23 follow-up in docstring
+    "FISV": {"name": "Fiserv", "sector": "Technology"},  # FISV -> FI (2023) -> back to FISV
     "TER": {"name": "Teradyne", "sector": "Technology"},
     "ADI": {"name": "Analog Devices", "sector": "Technology"},
     "TYL": {"name": "Tyler Technologies", "sector": "Technology"},
@@ -268,7 +181,7 @@ UNIVERSE: dict[str, dict[str, str]] = {
     "EFX": {"name": "Equifax", "sector": "Industrials"},
     "NDSN": {"name": "Nordson Corporation", "sector": "Industrials"},
 
-    # ---- Energy (15 — see docstring on why this sector is smaller) ----
+    # ---- Energy (15) ----
     "XOM": {"name": "ExxonMobil", "sector": "Energy"},
     "CVX": {"name": "Chevron", "sector": "Energy"},
     "COP": {"name": "ConocoPhillips", "sector": "Energy"},
@@ -285,7 +198,7 @@ UNIVERSE: dict[str, dict[str, str]] = {
     "NOV": {"name": "NOV Inc.", "sector": "Energy"},
     "BKR": {"name": "Baker Hughes", "sector": "Energy"},
 
-    # ---- Materials (18 — see docstring on why this sector is smaller) ----
+    # ---- Materials (18) ----
     "LIN": {"name": "Linde", "sector": "Materials"},
     "SHW": {"name": "Sherwin-Williams", "sector": "Materials"},
     "APD": {"name": "Air Products and Chemicals", "sector": "Materials"},
@@ -344,7 +257,7 @@ UNIVERSE: dict[str, dict[str, str]] = {
     "KOSS": {"name": "Koss Corporation", "sector": "Consumer Discretionary"},  # meme-stock watchlist — NOT in a major index
     "M": {"name": "Macy's", "sector": "Consumer Discretionary"},  # value-trap watchlist
 
-    # ---- Communication Services (13 — see docstring on why this sector is smaller) ----
+    # ---- Communication Services (13) ----
     "GOOGL": {"name": "Alphabet", "sector": "Communication Services"},
     "DIS": {"name": "Disney", "sector": "Communication Services"},
     "VZ": {"name": "Verizon", "sector": "Communication Services"},  # value-trap watchlist
@@ -386,7 +299,7 @@ UNIVERSE: dict[str, dict[str, str]] = {
     "CMS": {"name": "CMS Energy", "sector": "Utilities"},
     "SRE": {"name": "Sempra", "sector": "Utilities"},
 
-    # ---- Real Estate (22 — see docstring on why this sector is smaller) ----
+    # ---- Real Estate (22) ----
     "PLD": {"name": "Prologis", "sector": "Real Estate"},
     "AMT": {"name": "American Tower", "sector": "Real Estate"},
     "SPG": {"name": "Simon Property Group", "sector": "Real Estate"},
@@ -415,59 +328,21 @@ TICKERS: list[str] = list(UNIVERSE.keys())
 
 SECTORS: list[str] = sorted({meta["sector"] for meta in UNIVERSE.values()})
 
-# Deliberately included as stress-test cases for the still-undesigned
-# anomaly-detection/filtering step (2026-09-18 discussion) — NOT excluded
-# from anything by default. When that filtering logic exists, these are the
-# tickers to check it against first, since we already know which failure
-# mode each one represents:
-#   - meme-stock: sudden, largely fundamentals-detached overvaluation
-#     episodes (GME/AMC 2021, KOSS 2021, BB periodically)
-#   - value-trap: persistently "cheap" on valuation percentiles without
-#     re-rating (legacy telecom/tobacco names with high yield, declining
-#     structural outlook)
-# These are reputational/anecdotal labels from general knowledge, not a
-# statistical finding from this pipeline — don't treat them as ground truth
-# for evaluating a filter, just as known interesting cases to look at.
-MEME_STOCK_WATCHLIST: list[str] = ["GME", "AMC", "KOSS", "BB"]
-VALUE_TRAP_WATCHLIST: list[str] = ["T", "VZ", "MO", "PM", "F", "M", "LUMN"]
-
 
 # ---- Mid/small-cap extension (2026-09-29) ---------------------------------
-# The 281 names above are the "large" core. Per user request the universe is
-# extended with the S&P MidCap 400 and SmallCap 600 constituents (~1,000
-# more), for statistical power and because published evidence that
-# fair-value residuals predict returns (Bartram & Grinblatt 2018) leans on
-# smaller, less efficiently priced stocks. Results are reported per
-# size_group as well as overall.
-#
-# SOURCE: Wikipedia's constituent tables, fetched once on the first build and
-# frozen as CSV under <cache_dir>/universe/ (delete the file to refresh), so
-# later runs use the same list. The cloud session that wrote this could not
-# reach Wikipedia; the column matching below is deliberately loose.
-#
-# LIMITS — read before trusting a return result from the extended universe:
-#   - survivorship: today's members only. Small caps delist far more often
-#     than large caps and yfinance has no history for most delisted tickers,
-#     so cheap stocks that later failed are missing — a return test on this
-#     universe is biased toward "cheap stocks did well". The fair-value fit
-#     (each date compared within itself) is much less affected.
-#   - size_group is today's index membership, used only to split reports,
-#     never as a model input (it is decided by market cap, i.e. price).
-#     Core names that aren't S&P 500 members (GME, AMC, KOSS, BB...) stay
-#     "large" unless the fetched lists place them in 400/600.
+# Wikipedia constituent tables, fetched on the first build and frozen as CSV
+# under <cache_dir>/universe/ (delete to refresh). Today's members only, so a
+# return test on small caps is survivorship-biased toward "cheap did well".
+# size_group comes from index membership (market cap, i.e. price): reports only,
+# never a model input.
 INDEX_PAGES = {
     "sp400": ("mid", "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"),
     "sp600": ("small", "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies"),
 }
 # Wikipedia uses GICS names; the core list uses these two shorter ones.
 _GICS_TO_SECTOR = {"Information Technology": "Technology", "Health Care": "Healthcare"}
-# Mortgage REITs that Wikipedia's tables still list under Real Estate. GICS
-# moved the Mortgage REITs sub-industry to Financials in 2023 (the other
-# mortgage REITs in the lists, AGNC/NLY/ABR/RITM/STWD/BXMT, already read
-# Financials). Their "sales", EBITDA and FCF are interest flows, so under
-# Real Estate they were judged on PSR/EV/EBITDA/P/FCF as well: on 2026-09-29
-# PMT, FBRT and ARR were 저평가 at ranks 97.9-99.8. Found by the "Mortgage
-# REITs" sub-industry of the 2026-09-29 Wikipedia pages.
+# Mortgage REITs Wikipedia still lists under Real Estate (GICS moved them to
+# Financials in 2023); their "sales", EBITDA and FCF are interest flows.
 _SECTOR_OVERRIDES = {"ADAM": "Financials", "ARR": "Financials", "FBRT": "Financials", "PMT": "Financials"}
 
 

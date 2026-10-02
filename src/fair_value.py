@@ -1,75 +1,27 @@
 """
-Fair-value model: what multiples (PER, PBR, PSR, EV/EBITDA, P/FCF — see
-config.FAIR_VALUE_TARGETS) would the market normally pay for THIS company's
-fundamentals, and how far are the actual multiples from that? The views are
-combined into one verdict (valuation_gap, with gap_agreement = how many of
-them point the same way); a stock is only called cheap/expensive when that
-combined view is in the tails.
+Fair-value model: what multiple (config.FAIR_VALUE_TARGETS) would the market
+normally pay for this company's fundamentals, and how far is the actual
+multiple from it? The "fair" multiple is the market's reference level for
+these fundamentals at that date, not an intrinsic value.
 
-WHY: a plain "PER vs. sector peers" rank calls every high-growth, high-ROE
-company expensive and every shrinking, low-return one cheap. A human analyst
-adjusts for that; this model does the same adjustment systematically.
+Per as_of date and multiple:
+  1. Rows = stocks at that date with the multiple inside [min, max], minus
+     exclude_sectors.
+  2. Features = FAIR_VALUE_FEATURES + extra_features, as percentiles within
+     the date (median-imputed, + missing flags), plus sector one-hot.
+     Target = log(multiple).
+  3. Ridge, out-of-fold by ticker (GroupKFold): a stock's fair multiple comes
+     from a model that never saw it, so its own price can't pull it along.
+  4. fair_<m> = exp(prediction), <m>_gap = log(actual / fair);
+     valuation_gap = mean of the in-verdict gaps (loss-makers: see loss_flag).
 
-METHOD (per as_of date, per multiple in config.FAIR_VALUE_TARGETS):
-  1. Cross-section = every stock at that as_of whose multiple is within the
-     config bounds [min, max] (outside = undefined, distorted or bad data),
-     minus the multiple's exclude_sectors (Financials for PSR, EV/EBITDA and
-     P/FCF — see config).
-  2. Features = config.FAIR_VALUE_FEATURES + the multiple's extra_features,
-     turned into percentiles (or winsorized, FAIR_VALUE_FEATURE_TRANSFORM)
-     and median-imputed within that cross-section (+ a missing flag per
-     feature), plus sector one-hot. Target = log(multiple).
-  3. Ridge regression, out-of-fold by ticker (GroupKFold): each stock's fair
-     multiple comes from a model that never saw that stock, so its own price
-     cannot pull its own fair value toward itself.
-  4. fair_<m> = exp(prediction); <m>_gap = log(actual / fair). A gap of
-     -0.3 means the stock trades ~26% below the multiple its fundamentals
-     would justify at that date.
-  5. valuation_gap = mean of the available <m>_gap values (none for
-     loss-makers — see loss_flag). On the 2026-09-23 panel the PER and PBR
-     gaps had a mean per-date Spearman correlation of 0.64, and 97% of
-     labelled stocks had both pointing the same way, so the combined verdict
-     is not driven by one multiple.
-
-POINT-IN-TIME: step 1 uses only rows of the same as_of, which features.py
-already restricted to data known on that date. No future rows, no forward
-returns. Each date's market-wide multiple level is learned from that date
-itself, so a market-wide re-rating shifts fair values rather than labeling
-every stock cheap/expensive at once.
-
-EXPLANATION: with standardized features, prediction = mean(log multiple) +
-sum_j coef_j * z_j, so <m>_contrib_<feature> (in log units) says how much
-each fundamental moved this stock's fair multiple away from the average
-stock at that date — e.g. +0.20 on return_on_equity for PBR means "high ROE
-justifies a ~22% higher PBR than average".
-
-RESULT ON THE REAL PANEL (2026-09-23, 280 tickers, snapshots up to
-2026-07-01, out-of-fold R^2 of log multiple averaged over dates):
-               sector-median baseline   Ridge (this model)
-    PBR train        0.20                  0.47
-        val          0.25                  0.52
-        test         0.16                  0.55
-    PER train        0.12                  0.27
-        val          0.16                  0.31
-        test         0.16                  0.28
-Fundamentals explain PBR well (ROE's coefficient had the same sign on 100%
-of dates) and PER only moderately — PER depends on expected future earnings,
-which trailing fundamentals don't capture. Typical out-of-fold error is
-~0.32-0.43 in log units, so a gap of +-20% is within noise; only the tails
-(screening's top/bottom 20%) carry information. gap_return_test on the same
-panel: 0/24 significant after FDR — cheap-vs-fair did not predict returns.
-PSR (added 2026-09-28): sector median 0.19/0.12/0.11 -> Ridge 0.45/0.37/0.48;
-operating margin's coefficient had the same sign on 99% of dates. Finnhub's
-psTTM confirmed trailing-12-month and period-end priced (rescaled AAPL 10.60
-vs. yfinance 10.66). Run `python src/main.py evaluate` for current numbers.
-
-LIMITATIONS:
-  - The residual is "cheap relative to what this model can see". Anything
-    the model can't see (brand, moat, pipeline, pending M&A, one-off
-    earnings) ends up in the gap, which is why screening shows the drivers.
-  - A gap is not a return forecast. gap_return_test checks whether cheap
-    stocks later outperformed — treat its result as a hypothesis test, not a
-    selling point.
+Only rows of the same as_of are used (features.py already limited them to
+what was known then), so a market-wide re-rating moves fair values instead
+of labelling everything cheap or expensive. <m>_contrib_<feature> is each
+feature's model contribution in log units, not a cause. Anything the model
+can't see (moat, pipeline, M&A, one-offs) ends up in the gap, and a gap is
+not a return forecast (gap_return_test). R^2 vs. the sector-median baseline:
+`python src/main.py evaluate`.
 """
 from __future__ import annotations
 
@@ -145,6 +97,10 @@ FEATURE_LABELS_KO = {
 }
 
 
+# multiples a loss-maker still has (no PER): its own verdict, see loss_flag
+LOSS_VIEW_KEYS = ("ps", "pb", "ev_ebitda", "pfcf")
+
+
 def loss_flag(df: pd.DataFrame) -> pd.Series:
     """PER unavailable AND (latest EPS <= 0 or TTM ROE < 0 or TTM EPS <= 0):
     the company is losing money, not just missing data (ROE catches TTM
@@ -153,17 +109,11 @@ def loss_flag(df: pd.DataFrame) -> pd.Series:
     missing — AAL, CAR, CCOI, PTCT were 저평가 on 2026-09-30, AAL #1, on a
     single positive quarter).
 
-    These rows keep their per-multiple gaps for reference but get no
-    valuation_gap, i.e. no verdict ("판단 보류(적자)" in screening):
-      - PBR alone: with no PER and a negative ROE the fair PBR is an
-        extrapolation (XRX came out as the #2 "저평가" stock).
-      - PSR alone (tried 2026-09-28, reverted the same day): 8 of the 15
-        loss-makers landed in the 15 cheapest / 15 most expensive of 278.
-        One-off impairments (GILD, APD, TTWO, ARE, INTC) turn TTM operating
-        margin negative, and since margin is the PSR model's strongest
-        driver their fair PSR collapsed (+200~700% "고평가"); structurally
-        shrinking names (XRX, F, AMC) looked cheap on sales — a value trap,
-        not a mispricing. A loss year says too little about which case it is."""
+    They get no valuation_gap (a lone PBR or PSR view put one-off impairments
+    and structural decliners at the extremes). Their own verdict is
+    loss_valuation_gap on LOSS_VIEW_KEYS, ranked against every stock's gap
+    on the same multiples (screening "적자 · <band>"); one-off vs. structural
+    losses are still not told apart."""
     pe_missing = df["trailing_pe"].isna() | (df["trailing_pe"] <= 0)
     losing = (df["eps"] <= 0) | (df["return_on_equity"] < 0)
     if "eps_ttm" in df.columns:  # panels built before 2026-09-29 lack it
@@ -370,6 +320,17 @@ def add_fair_value(
     labels = [spec["label"] for spec in verdict.values()]
     df["valuation_basis"] = gaps.notna().apply(
         lambda row: "+".join(lbl for lbl, has in zip(labels, row) if has), axis=1
+    )
+    # loss-makers' own verdict (see loss_flag): the multiples a loss leaves, loss rows only
+    loss_keys = [k for k in LOSS_VIEW_KEYS if k in verdict]
+    lg = df[[f"{k}_gap" for k in loss_keys]].where(df["loss_flag"], axis=0)
+    df["loss_valuation_gap"] = lg.mean(axis=1, skipna=True)
+    df["loss_n_gaps"] = lg.notna().sum(axis=1)
+    same_side = np.sign(lg).eq(np.sign(df["loss_valuation_gap"]), axis=0) & lg.notna()
+    df["loss_gap_agreement"] = (same_side.sum(axis=1) / df["loss_n_gaps"]).where(df["loss_n_gaps"] > 0)
+    loss_labels = [verdict[k]["label"] for k in loss_keys]
+    df["loss_valuation_basis"] = lg.notna().apply(
+        lambda row: "+".join(lbl for lbl, has in zip(loss_labels, row) if has), axis=1
     )
     return df, pd.DataFrame(diagnostics)
 

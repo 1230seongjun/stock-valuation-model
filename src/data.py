@@ -1,39 +1,18 @@
 """
-Raw data collection: yfinance (daily prices + dividend history) + Finnhub
-(point-in-time quarterly fundamentals), with a per-ticker Parquet cache.
+Raw data collection with a per-ticker Parquet cache under `cache_dir`:
+  - yfinance: daily prices and dividend payments.
+  - Finnhub (free tier, 50 calls/min): quarterly fundamentals keyed by fiscal
+    `period` end, no filing date (features.py applies the reporting lag).
+    salesPerShare is the QUARTER's sales, so PSR comes from psTTM.
+  - SEC XBRL company facts (load_sec_facts): net income, operating cash flow
+    and assets WITH filing dates, for accruals. sec.gov blocks scripted
+    downloads (403), so the bulk files are saved by hand into <cache_dir>/sec/;
+    without them accruals are just empty.
 
-FINNHUB FIELD NAMES — every quarterly series key was listed from a live
-account on 2026-09-28 (AAPL) before the multiples/quality fields below were
-added. Note salesPerShare is the QUARTER's sales (AAPL 7.44 vs. ~27 TTM), so
-PSR comes from psTTM, and TTM sales per share is summed in features.py.
-Derived in features.py from raw components fetched here:
-- revenue_growth_yoy / revenue_cagr_3y ~ from salesPerShare (biased if
-  buybacks move the share count a lot)
-- dividend_yield / dividend features ~ from yfinance's actual dividend
-  history (ex-dividend dates), not from payoutRatioTTM (30% missing)
-
-Finnhub gives only the fiscal `period` end date, not the filing date, so
-features.py treats each quarter as known from period + REPORTING_LAG_DAYS.
-
-SEC XBRL company facts (load_sec_facts, 2026-10-01): net income, operating
-cash flow and total assets WITH their filing dates, for the accruals feature
-(features._accruals_asof). sec.gov refuses scripted downloads from some
-networks ("Undeclared Automated Tool", 403), so the two bulk files are
-downloaded by hand into <cache_dir>/sec/ (see SEC_* below). Without them the
-feature is simply empty and the model fits as before. XBRL starts 2009-2011,
-so earlier snapshots have no accruals either.
-
-CACHE: fetching the whole universe takes minutes (Finnhub free tier is 50
-calls/min), and a past quarter's fundamentals or a past day's price never
-change, so each ticker's raw response is stored under `cache_dir` and reused.
-The newest quarter / last few days CAN still change — pass
-force_refresh=True before a run whose conclusions matter. Cached prices
-older than PRICE_REFRESH_DAYS are re-fetched automatically (until
-2026-09-29 they never were, so a later build's "today" snapshot silently
-used the prices of the day the cache was made); a re-fetch that comes back
-as a short delisting stub does not replace a longer cached history. In Colab the cache
-lives on local disk and is lost on a runtime restart unless cache_dir points
-into a mounted Google Drive.
+Past quarters and past prices don't change, so responses are reused. Prices
+older than PRICE_REFRESH_DAYS are re-fetched; a re-fetch that comes back as a
+short delisting stub never replaces a longer cached history. Use
+force_refresh=True before a run whose conclusions matter.
 """
 from __future__ import annotations
 

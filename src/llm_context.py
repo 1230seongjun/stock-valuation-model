@@ -23,8 +23,8 @@ import numpy as np
 import pandas as pd
 
 from config import (
-    CHEAP_THRESHOLD,
-    EXPENSIVE_THRESHOLD,
+    LABEL_BANDS,
+    LABELS,
     FAIR_VALUE_FEATURE_EXCLUDE_SECTORS,
     FAIR_VALUE_FEATURES,
     FAIR_VALUE_TARGETS,
@@ -33,18 +33,25 @@ from config import (
 from fair_value import FEATURE_LABELS_KO, target_features
 from screening import DENOMINATOR_DRIVERS, MIN_DRIVER_EFFECT, multiple_status
 
-SCHEMA_VERSION = "1.1"  # 1.1: cash_backing, without_accruals, near_label_boundary
+SCHEMA_VERSION = "1.5"  # 1.1: cash_backing, without_accruals, near_label_boundary; 1.2: loss-maker verdicts;
+# 1.3: five 20% bands, loss-makers on the all-stock scale; 1.4: financial-risk withholding; 1.5: new-listing hold, heavy-debt warning
 MAX_DRIVERS = 3  # per direction and multiple
 BOUNDARY_POINTS = 3  # cheapness_rank this close to a label threshold -> near_label_boundary
-LABEL_EN = {"저평가": "cheap", "중립": "neutral", "고평가": "expensive",
-            "판단 보류(적자)": "withheld_loss", "데이터 부족": "insufficient_data"}
+_BAND_EN = dict(zip(LABELS, ["very_cheap", "cheap", "neutral", "expensive", "very_expensive"]))
+LABEL_EN = {**_BAND_EN, **{"적자 · " + k: "loss_maker_" + v for k, v in _BAND_EN.items()},
+            "판단 보류(적자)": "withheld_loss", "판단 보류(재무 위험)": "withheld_financial_risk",
+            "판단 보류(신규 상장)": "withheld_new_listing",
+            "데이터 부족": "insufficient_data"}
+BAND_EDGES = [edge for edge, _ in LABEL_BANDS]  # 80 / 60 / 40 / 20
 FLAGS = [  # (column, reason column, key, Korean title)
     ("fundamental_break_flag", "fundamental_break_reason", "fundamental_break", "최근 12개월 재무 단절"),
     ("report_lag_flag", "report_lag_reason", "price_moved_since_statements", "재무 기준일 이후 주가 급변"),
     ("single_view_flag", "single_view_reason", "single_multiple", "한 가지 배수로만 판단"),
+    ("financial_risk_flag", "financial_risk_reason", "loss_and_heavy_debt", "적자 + 재무 위험"),
+    ("heavy_debt_flag", "heavy_debt_reason", "heavy_debt", "빚 많은 흑자 기업"),
     ("value_trap_flag", "value_trap_reason", "persistent_discount_low_growth", "지속 할인·저성장 경고"),
     ("meme_flag", "meme_reason", "price_volume_anomaly", "단기 가격·거래량 이상"),
-    ("transition_flag", "transition_reason", "cheap_to_expensive", "저평가→고평가 전환"),
+    ("transition_flag", "transition_reason", "cheap_to_expensive", "매우 저평가→매우 고평가 전환"),
 ]
 FUNDAMENTALS = [*FAIR_VALUE_FEATURES, "roe_avg_3y", "net_debt_to_capital", "asset_turnover", "fcf_margin",
                 "cash_conversion_3y", "eps_volatility_3y", "accruals"]
@@ -55,7 +62,8 @@ INTERPRETATION_RULES = [
     "Fair multiple = the multiple the market typically gives stocks with these fundamentals on the same "
     "date (sector and size included). It is not intrinsic value; 저평가/고평가 mean below/above that "
     "baseline, not economically cheap/expensive.",
-    "Labels compare stocks on the same date: cheapest 20% = 저평가, most expensive 20% = 고평가.",
+    "Labels are five equal bands of the same-date rank: cheapest 20% = 매우 저평가, next 20% = 저평가, middle "
+    "20% = 중립, then 고평가, most expensive 20% = 매우 고평가. Loss-makers get the same bands with '적자 · '.",
     "Not a return forecast. Gaps showed no link to later returns among large caps (0/24 tests after FDR); "
     "never say a stock will rise or fall.",
     "Drivers are the model's contributions to the fair multiple, not causes. denominator_effect=true means "
@@ -77,8 +85,18 @@ INTERPRETATION_RULES = [
     "year earlier for the trend. The model lowers the fair PER for high accruals (Financials excepted).",
     "without_accruals shows the verdict the model gives without the accruals feature: when the label "
     "differs, say that the cash backing of earnings is what moved it.",
-    "near_label_boundary=true: the stock sits within a few rank points of the 저평가/고평가 cut-off, so a "
+    "near_label_boundary=true: the stock sits within a few rank points of a band edge (20/40/60/80), so a "
     "small change in price or fundamentals can change the label; describe it as borderline.",
+    "verdict.comparison_group='loss_makers': the company lost money over the last 12 months, so there is no "
+    "PER; its gap uses PSR/PBR (and EV/EBITDA, P/FCF when positive) and is ranked against ALL stocks' gaps on "
+    "those multiples that date (rank_among_loss_makers is for reference). Say so, and say "
+    "that whether the loss is a one-off (e.g. an impairment) or structural cannot be told from these figures.",
+    "Label '판단 보류(재무 위험)' or flag loss_and_heavy_debt: a loss-maker with heavy debt (negative equity or "
+    "very high net debt / capital). The model cannot measure default risk, so it does not call such a stock "
+    "cheap even when its multiples are low; say that the low price may reflect default or financing risk.",
+    "Label '판단 보류(신규 상장)': listed less than a year ago and comparable on one multiple only — too little "
+    "data to judge. Flag heavy_debt: profitable but heavily indebted; extreme labels are more common for such "
+    "stocks in both directions, so mention that the capital structure may explain part of the gap.",
     "Use only numbers present in this file; say 'not available' instead of estimating missing ones.",
 ]
 
@@ -182,8 +200,11 @@ def stock_context(row: pd.Series, ranks: pd.DataFrame, fit: dict, market_file: s
         else:
             m["status_reason"] = reason
         multiples.append(m)
-    n = int(row.get("n_gaps") or 0)
-    agree = row.get("gap_agreement")
+    loss_view = bool(row.get("loss_flag")) and pd.notna(row.get("loss_valuation_gap"))
+    pre = "loss_" if loss_view else ""
+    n = int(row.get(f"{pre}n_gaps") or 0)
+    agree = row.get(f"{pre}gap_agreement")
+    rank = row.get("loss_cheapness_rank") if loss_view else row.get("cheapness_rank")
     detail = row.get("label_detail") if isinstance(row.get("label_detail"), str) else ""
     fundamentals = {}
     for f in ranks.columns:
@@ -199,15 +220,18 @@ def stock_context(row: pd.Series, ranks: pd.DataFrame, fit: dict, market_file: s
         "verdict": {
             "label": row.get("valuation_label"), "label_en": LABEL_EN.get(row.get("valuation_label")),
             "label_detail": detail or None, "view": row.get("valuation_view"),
-            "cheapness_rank": _num(row.get("cheapness_rank"), 0),
-            "cheapness_rank_note": "percentile among stocks on this date, 100 = cheapest",
-            "combined_gap_pct": _pct(row.get("valuation_gap")),
-            "basis": [b for b in str(row.get("valuation_basis") or "").split("+") if b],
+            "comparison_group": "loss_makers" if loss_view else "all_stocks",
+            "cheapness_rank": _num(rank, 0),
+            "cheapness_rank_note": ("percentile against ALL stocks on the same four multiples (PSR, PBR, EV/EBITDA, "
+                                    "P/FCF)" if loss_view else "percentile among stocks on this date") + ", 100 = cheapest",
+            "combined_gap_pct": _pct(row.get(f"{pre}valuation_gap")),
+            "basis": [b for b in str(row.get(f"{pre}valuation_basis") or "").split("+") if b],
             "multiples_used": n, "multiples_agreeing": int(round(agree * n)) if pd.notna(agree) and n else None,
             "loss_making": bool(row.get("loss_flag")),
-            "near_label_boundary": bool(pd.notna(row.get("cheapness_rank")) and min(
-                abs(row["cheapness_rank"] - CHEAP_THRESHOLD), abs(row["cheapness_rank"] - EXPENSIVE_THRESHOLD)) <= BOUNDARY_POINTS),
-            "label_thresholds": {"저평가": f"rank >= {CHEAP_THRESHOLD:.0f}", "고평가": f"rank <= {EXPENSIVE_THRESHOLD:.0f}"},
+            "near_label_boundary": bool(pd.notna(rank) and min(abs(rank - e) for e in BAND_EDGES) <= BOUNDARY_POINTS),
+            "label_bands": {"매우 저평가": "rank >= 80", "저평가": "60-80", "중립": "40-60", "고평가": "20-40",
+                            "매우 고평가": "rank <= 20"},
+            "rank_among_loss_makers": _num(row.get("loss_peer_rank"), 0) if loss_view else None,
         },
         "without_accruals": _without_accruals(alt),
         "multiples": multiples,
