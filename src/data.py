@@ -428,6 +428,133 @@ def load_sec_facts(
     return out
 
 
+# ---- Sentiment descriptors (2026-10-02) --------------------------------------
+# FINRA short interest and English Wikipedia page views, for screening's
+# descriptive "심리 지표" only — never model inputs (they move with the price).
+# One file each under <cache_dir>/sentiment/, re-fetched as a whole when older
+# than the max age; a ticker whose re-fetch fails keeps its cached rows.
+SENTIMENT_DIR = "sentiment"
+SHORT_INTEREST_FILE = "short_interest.parquet"  # ticker, settlement, short_qty, avg_volume, days_to_cover
+WIKI_VIEWS_FILE = "wiki_monthly.parquet"         # ticker, month, views
+WIKI_ARTICLES_FILE = "wiki_articles.csv"         # ticker, article
+FINRA_SHORT_URL = "https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest"
+WIKI_VIEWS_URL = ("https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia/all-access/user/"
+                  "{article}/monthly/2015070100/{end}")
+# Wikimedia asks for an identifying User-Agent and throttles bursts (429 + Retry-After)
+WIKI_UA = "stock-valuation-model/1.0 (research; github.com/1230seongjun/stock-valuation-model)"
+WIKI_INTERVAL_SEC = 1.0
+# Wikidata: tickers listed on NYSE, NASDAQ, NYSE American, NYSE Arca -> English article
+_WIKIDATA_QUERY = """SELECT ?t ?article WHERE {
+  ?item p:P414 ?s . ?s ps:P414 ?ex ; pq:P249 ?t .
+  VALUES ?ex { wd:Q13677 wd:Q82059 wd:Q846626 wd:Q2416282 }
+  ?article schema:about ?item ; schema:isPartOf <https://en.wikipedia.org/> .
+}"""
+
+
+def fetch_short_interest(ticker: str) -> pd.DataFrame:
+    """Twice-monthly short interest of one ticker from FINRA (2018 onward)."""
+    import requests
+
+    body = {"limit": 5000, "compareFilters": [{"compareType": "equal", "fieldName": "symbolCode", "fieldValue": ticker}],
+            "dateRangeFilters": [{"fieldName": "settlementDate", "startDate": "2017-01-01", "endDate": "2099-12-31"}]}
+    r = requests.post(FINRA_SHORT_URL, json=body, headers={"Accept": "application/json"}, timeout=60)
+    r.raise_for_status()
+    rows = r.json() if r.text.strip() else []
+    return pd.DataFrame({
+        "settlement": pd.to_datetime([x["settlementDate"] for x in rows]),
+        "short_qty": [x["currentShortPositionQuantity"] for x in rows],
+        "avg_volume": [x["averageDailyVolumeQuantity"] for x in rows],
+        "days_to_cover": [x["daysToCoverQuantity"] for x in rows],
+    })
+
+
+def fetch_wiki_views(article: str) -> pd.DataFrame:
+    """Monthly page views (human users) of one English Wikipedia article."""
+    import requests
+
+    end = (pd.Timestamp.today().normalize() + pd.offsets.MonthEnd(0)).strftime("%Y%m%d00")
+    url = WIKI_VIEWS_URL.format(article=requests.utils.quote(article, safe=""), end=end)
+    for _ in range(6):
+        r = requests.get(url, headers={"User-Agent": WIKI_UA}, timeout=30)
+        if r.status_code != 429:
+            break
+        time.sleep(float(r.headers.get("retry-after", 30)) + 1)
+    if r.status_code == 404:
+        return pd.DataFrame(columns=["month", "views"])
+    r.raise_for_status()
+    items = r.json()["items"]
+    return pd.DataFrame({"month": pd.to_datetime([x["timestamp"][:8] for x in items]), "views": [x["views"] for x in items]})
+
+
+def wiki_articles(tickers: list[str], cache_dir: str | Path = DEFAULT_CACHE_DIR) -> dict[str, str]:
+    """ticker -> English Wikipedia article via Wikidata's exchange listings,
+    cached in <cache_dir>/sentiment/wiki_articles.csv (delete to refresh).
+    A ticker that maps to several articles is left out."""
+    path = Path(cache_dir) / SENTIMENT_DIR / WIKI_ARTICLES_FILE
+    if not path.exists():
+        import requests
+
+        r = requests.get("https://query.wikidata.org/sparql", params={"query": _WIKIDATA_QUERY, "format": "json"},
+                         headers={"User-Agent": WIKI_UA}, timeout=180)
+        r.raise_for_status()
+        pairs = pd.DataFrame([(b["t"]["value"].upper().strip().replace("-", ".").replace("/", "."),
+                               requests.utils.unquote(b["article"]["value"].rsplit("/", 1)[-1]))
+                              for b in r.json()["results"]["bindings"]], columns=["ticker", "article"]).drop_duplicates()
+        unique = pairs.groupby("ticker")["article"].transform("nunique") == 1
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pairs[unique].drop_duplicates("ticker").to_csv(path, index=False)
+    m = pd.read_csv(path)
+    return {t: a for t, a in zip(m["ticker"], m["article"]) if t in set(tickers)}
+
+
+def _refresh_by_ticker(path: Path, tickers: list[str], fetch, max_age_days: float, label: str,
+                       interval: float = 0.0) -> pd.DataFrame | None:
+    """The cached long table at `path`, re-fetched ticker by ticker when older
+    than max_age_days. Tickers whose fetch fails keep their cached rows."""
+    cached = pd.read_parquet(path) if path.exists() else None
+    if cached is not None and _file_age_days(path) <= max_age_days:
+        return cached
+    print(f"{label} for {len(tickers)} tickers...")
+    parts, failed = [], []
+    for i, t in enumerate(tickers, start=1):
+        try:
+            parts.append(fetch(t).assign(ticker=t))
+        except Exception:  # noqa: BLE001 — network / API: keep this ticker's cached rows
+            failed.append(t)
+            if cached is not None:
+                parts.append(cached[cached["ticker"] == t])
+        if i % _PROGRESS_EVERY == 0:
+            print(f"  {label} {i}/{len(tickers)}")
+        if interval:
+            time.sleep(interval)
+    if failed:
+        print(f"  {len(failed)} failed (cached rows kept): {', '.join(failed[:_MAX_LISTED])}")
+    parts = [p for p in parts if not p.empty]
+    if not parts:
+        return cached
+    out = pd.concat(parts, ignore_index=True)
+    out = out[["ticker", *[c for c in out.columns if c != "ticker"]]]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(path)
+    return out
+
+
+def collect_short_interest(tickers: list[str], cache_dir: str | Path = DEFAULT_CACHE_DIR,
+                           max_age_days: float = 7) -> pd.DataFrame | None:
+    """FINRA short interest for every ticker (long table), cached."""
+    return _refresh_by_ticker(Path(cache_dir) / SENTIMENT_DIR / SHORT_INTEREST_FILE, tickers, fetch_short_interest,
+                              max_age_days, "Short interest (FINRA)", interval=0.3)
+
+
+def collect_wiki_views(tickers: list[str], cache_dir: str | Path = DEFAULT_CACHE_DIR,
+                       max_age_days: float = 14) -> pd.DataFrame | None:
+    """Monthly Wikipedia page views for the tickers with an article, cached."""
+    articles = wiki_articles(tickers, cache_dir)
+    return _refresh_by_ticker(Path(cache_dir) / SENTIMENT_DIR / WIKI_VIEWS_FILE, list(articles),
+                              lambda t: fetch_wiki_views(articles[t]), max_age_days, "Wikipedia page views",
+                              interval=WIKI_INTERVAL_SEC)
+
+
 _MAX_LISTED = 25  # tickers printed per issue; the rest are counted
 
 

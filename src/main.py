@@ -37,7 +37,15 @@ from config import (
     TRAIN_START,
     UNIVERSE_INDEXES,
 )
-from data import DEFAULT_CACHE_DIR, collect, collect_fiscal_year_ends, data_quality_report, load_sec_facts
+from data import (
+    DEFAULT_CACHE_DIR,
+    collect,
+    collect_fiscal_year_ends,
+    collect_short_interest,
+    collect_wiki_views,
+    data_quality_report,
+    load_sec_facts,
+)
 from fair_value import (
     add_fair_value,
     coefficient_summary,
@@ -49,7 +57,7 @@ from fair_value import (
     summarize_diagnostics,
     target_features,
 )
-from features import add_percentile_scores, build_as_of_dates, build_raw_panel
+from features import add_percentile_scores, add_sentiment_features, build_as_of_dates, build_raw_panel
 from llm_context import export_date
 from market_context import context_lines, load_market_data, market_context
 from screening import (
@@ -79,6 +87,20 @@ def _universe(cache_dir: str | Path) -> dict[str, dict[str, str]]:
     return {t: {**meta, "industry": groups[t]} for t, meta in universe.items()}
 
 
+def _with_sentiment(panel: pd.DataFrame, tickers: list[str], cache_dir: str | Path) -> pd.DataFrame:
+    """Short interest and Wikipedia attention (descriptive only, features.add_sentiment_features),
+    recomputed for every row from the cached sources. A source that can't be
+    fetched leaves its column empty; the rest of the run is unaffected."""
+    sources = {}
+    for name, collect_fn in (("short_interest", collect_short_interest), ("wiki_views", collect_wiki_views)):
+        try:
+            sources[name] = collect_fn(tickers, cache_dir=cache_dir)
+        except Exception as exc:  # network / API: the verdicts don't depend on it
+            print(f"  {name}: not available ({type(exc).__name__}: {exc})")
+    base = panel.drop(columns=["short_ratio", "wiki_views_3m"], errors="ignore")
+    return add_sentiment_features(base, **sources)
+
+
 def build(api_key: str | None = None, cache_dir: str | Path = DEFAULT_CACHE_DIR, force_refresh: bool = False,
           panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
     api_key = api_key or os.environ.get("FINNHUB_API_KEY")
@@ -96,6 +118,7 @@ def build(api_key: str | None = None, cache_dir: str | Path = DEFAULT_CACHE_DIR,
           f"({as_of_dates[0].date()} ~ {as_of_dates[-1].date()})...")
     panel = add_percentile_scores(build_raw_panel(tickers, prices, fundamentals, universe, as_of_dates,
                                                   fiscal_year_ends=fiscal_year_ends, sec_facts=sec_facts))
+    panel = _with_sentiment(panel, tickers, cache_dir)
     if panel.empty:
         raise RuntimeError("panel is empty — check that collection worked")
 
@@ -482,6 +505,7 @@ def publish(api_key: str | None = None, cache_dir: str | Path = DEFAULT_CACHE_DI
         _load(panel_path), build_as_of_dates(TRAIN_START), tickers, prices=prices, fundamentals=fundamentals,
         universe=universe, fiscal_year_ends=collect_fiscal_year_ends(tickers, api_key=api_key, cache_dir=cache_dir),
         sec_facts=load_sec_facts(tickers, cache_dir=cache_dir))
+    panel = _with_sentiment(panel, tickers, cache_dir)
     print(f"panel: {len(panel)} rows, added {', '.join(str(d.date()) for d in added) or 'nothing'}")
     tmp = Path(panel_path).with_suffix(".tmp")
     panel.to_parquet(tmp)

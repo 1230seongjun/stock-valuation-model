@@ -721,6 +721,46 @@ def build_raw_panel(
     return panel
 
 
+# FINRA publishes short interest about 8 business days after the settlement date.
+SHORT_INTEREST_LAG_DAYS = 10
+SHORT_INTEREST_MAX_AGE_DAYS = 45  # an older report counts as missing
+WIKI_MONTHS = 3  # complete months averaged
+
+
+def add_sentiment_features(panel: pd.DataFrame, short_interest: pd.DataFrame | None = None,
+                           wiki_views: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Descriptive sentiment columns (screening.add_sentiment), point in time:
+      - short_ratio: shares sold short / shares outstanding, from the latest
+        FINRA report published (settlement + SHORT_INTEREST_LAG_DAYS) by as_of;
+        shares = book value x PBR / price (the as_of price).
+      - wiki_views_3m: mean monthly Wikipedia page views over the WIKI_MONTHS
+        complete months before as_of's month (NaN unless all are there).
+    Never model inputs: both move with the price."""
+    df = panel.copy()
+    df["short_ratio"] = np.nan
+    df["wiki_views_3m"] = np.nan
+    if short_interest is not None and not short_interest.empty:
+        shares = (df["book_value"] * 1e6 * df["price_to_book"] / df["price"]).where(lambda x: x > 0)
+        si = short_interest.assign(known=pd.to_datetime(short_interest["settlement"]) + pd.Timedelta(days=SHORT_INTEREST_LAG_DAYS))
+        left = pd.DataFrame({"as_of": df["as_of"], "ticker": df["ticker"], "_row": np.arange(len(df))}).sort_values("as_of")
+        m = pd.merge_asof(left, si[["ticker", "known", "short_qty"]].sort_values("known"), left_on="as_of", right_on="known",
+                          by="ticker", direction="backward", tolerance=pd.Timedelta(days=SHORT_INTEREST_MAX_AGE_DAYS))
+        qty = pd.Series(m["short_qty"].to_numpy(), index=m["_row"].to_numpy()).sort_index().to_numpy()
+        df["short_ratio"] = qty / shares.to_numpy()
+    if wiki_views is not None and not wiki_views.empty:
+        views = wiki_views.pivot_table(index="month", columns="ticker", values="views")
+        views.index = pd.PeriodIndex(views.index, freq="M")
+        for as_of in df["as_of"].unique():
+            last = pd.Period(pd.Timestamp(as_of), "M") - 1
+            window = views.loc[last - (WIKI_MONTHS - 1):last]
+            mean = window.mean().where(window.notna().sum() == WIKI_MONTHS) if len(window) == WIKI_MONTHS else None
+            if mean is None:
+                continue
+            rows = df["as_of"] == as_of
+            df.loc[rows, "wiki_views_3m"] = df.loc[rows, "ticker"].map(mean).to_numpy()
+    return df
+
+
 def add_percentile_scores(panel: pd.DataFrame) -> pd.DataFrame:
     """<indicator>_pct = percentile (0-100) within the same (as_of, sector),
     flipped for lower_is_better so higher always means "better/cheaper".

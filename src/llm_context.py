@@ -33,8 +33,9 @@ from config import (
 from fair_value import FEATURE_LABELS_KO, target_features
 from screening import DENOMINATOR_DRIVERS, MIN_DRIVER_EFFECT, multiple_status
 
-SCHEMA_VERSION = "1.5"  # 1.1: cash_backing, without_accruals, near_label_boundary; 1.2: loss-maker verdicts;
-# 1.3: five 20% bands, loss-makers on the all-stock scale; 1.4: financial-risk withholding; 1.5: new-listing hold, heavy-debt warning
+SCHEMA_VERSION = "1.6"  # 1.1: cash_backing, without_accruals, near_label_boundary; 1.2: loss-maker verdicts;
+# 1.3: five 20% bands, loss-makers on the all-stock scale; 1.4: financial-risk withholding; 1.5: new-listing hold, heavy-debt warning;
+# 1.6: sentiment (short interest, Wikipedia attention)
 MAX_DRIVERS = 3  # per direction and multiple
 BOUNDARY_POINTS = 3  # cheapness_rank this close to a label threshold -> near_label_boundary
 _BAND_EN = dict(zip(LABELS, ["very_cheap", "cheap", "neutral", "expensive", "very_expensive"]))
@@ -97,8 +98,27 @@ INTERPRETATION_RULES = [
     "Label '판단 보류(신규 상장)': listed less than a year ago and comparable on one multiple only — too little "
     "data to judge. Flag heavy_debt: profitable but heavily indebted; extreme labels are more common for such "
     "stocks in both directions, so mention that the capital structure may explain part of the gap.",
+    "sentiment is descriptive and never part of the verdict. With size and sector held fixed, more heavily "
+    "shorted stocks trade at lower multiples and stocks with more Wikipedia attention at higher ones (together "
+    "about 8% of the gap). It is an association, not a cause: rising prices draw attention and weak prices draw "
+    "short sellers. Say 'may reflect' (skepticism / enthusiasm), never that sentiment caused the price or that "
+    "it predicts a move.",
     "Use only numbers present in this file; say 'not available' instead of estimating missing ones.",
 ]
+
+
+def _sentiment(row: pd.Series) -> dict | None:
+    short, attention = row.get("short_interest_pct"), row.get("attention_pct")
+    if pd.isna(short) and pd.isna(attention):
+        return None
+    return {
+        "short_interest_pct_of_shares": _x100(row.get("short_ratio")),
+        "short_interest_percentile_same_date": _num(short, 0),
+        "wikipedia_monthly_views": _num(row.get("wiki_views_3m"), 0),
+        "attention_percentile_same_size_group": _num(attention, 0),
+        "note": "percentiles: 100 = most shorted / most viewed; short interest from FINRA (published ~8 business days "
+                "after settlement), page views = mean of the last 3 complete months",
+    }
 
 
 def _num(v, digits: int = 2):
@@ -246,6 +266,7 @@ def stock_context(row: pd.Series, ranks: pd.DataFrame, fit: dict, market_file: s
                     "needs to return to the median PER after the horizon at the same discount rate",
         },
         "cash_backing": _cash_backing(row, year_ago, ranks),
+        "sentiment": _sentiment(row),
         "fundamentals": fundamentals,
         "flags": [{"type": key, "title": title, "reason": row.get(reason) or None}
                   for col, reason, key, title in FLAGS if bool(row.get(col))],

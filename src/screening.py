@@ -26,6 +26,9 @@ Flags (warnings, labels unchanged):
   - single_view_flag: a non-neutral verdict resting on one multiple.
   - financial_risk_flag / heavy_debt_flag: heavy debt on a loss-maker / a
     profitable stock (heavy_debt).
+
+Sentiment (add_sentiment): short interest and Wikipedia attention percentiles
+with a note in the explanation — context for the gap, not part of the verdict.
 """
 from __future__ import annotations
 
@@ -188,6 +191,46 @@ def add_labels(panel: pd.DataFrame) -> pd.DataFrame:
     df["quality_score"] = df[[f"{k}_pct" for k in QUALITY_INDICATORS]].mean(axis=1, skipna=True)
     df["momentum_score"] = df[[f"{k}_pct" for k in MOMENTUM_INDICATORS]].mean(axis=1, skipna=True)
     return df
+
+
+# A percentile this high / low counts as "high" / "low" in the sentiment note.
+SENTIMENT_HIGH, SENTIMENT_LOW = 80.0, 20.0
+
+
+def add_sentiment(panel: pd.DataFrame) -> pd.DataFrame:
+    """Descriptive sentiment next to the verdict (features.add_sentiment_features),
+    never part of it:
+      - short_interest_pct: percentile of short_ratio among the date's stocks
+        (100 = most shorted)
+      - attention_pct: percentile of Wikipedia page views within the date's
+        size group (big companies get more views anyway)
+    Tested 2026-10-02 against the combined gap with size and sector held
+    fixed: more shorted -> cheaper (partial r -0.16~-0.20), more attention ->
+    more expensive (+0.13~+0.16); together about 8% of the gap. Association,
+    not cause: a price rise draws attention and a weak price draws shorts."""
+    df = panel.copy()
+    nan = pd.Series(np.nan, index=df.index)
+    df["short_interest_pct"] = _pct_rank(df.get("short_ratio", nan), df["as_of"])
+    size = df["size_group"] if "size_group" in df.columns else pd.Series("all", index=df.index)
+    df["attention_pct"] = _pct_rank(df.get("wiki_views_3m", nan), df["as_of"].astype(str) + "|" + size.astype(str))
+    return df
+
+
+def _sentiment_text(row: pd.Series) -> str:
+    short, attention = row.get("short_interest_pct"), row.get("attention_pct")
+    parts = []
+    if pd.notna(short):
+        parts.append(f"공매도 비율 {row['short_ratio']:.1%} (같은 날 백분위 {short:.0f}, 100 = 가장 많음)")
+    if pd.notna(attention):
+        parts.append(f"위키피디아 관심도 같은 규모 그룹 백분위 {attention:.0f}")
+    if not parts:
+        return ""
+    text = "심리 지표(판정과 무관한 참고): " + ", ".join(parts)
+    if pd.notna(short) and short >= SENTIMENT_HIGH:
+        text += " — 공매도가 많은 종목은 같은 규모·섹터에서 대체로 더 싸게 거래됨(시장의 의심이 할인에 반영됐을 수 있음)"
+    elif pd.notna(attention) and attention >= SENTIMENT_HIGH and (pd.isna(short) or short <= SENTIMENT_LOW):
+        text += " — 관심이 높고 공매도가 적은 종목은 같은 규모·섹터에서 대체로 더 비싸게 거래됨(기대감이 프리미엄에 반영됐을 수 있음)"
+    return text + ". 원인과 결과는 구분하지 못함"
 
 
 def add_expectations(panel: pd.DataFrame, years: int = IMPLIED_GROWTH_YEARS) -> pd.DataFrame:
@@ -587,7 +630,7 @@ def explain(row: pd.Series) -> str:
         n = int(row["loss_n_gaps"])
         agree = int(round(row["loss_gap_agreement"] * n))
         side = "싸다" if row["loss_valuation_gap"] < 0 else "비싸다"
-        lines.append(f"최근 12개월 적자 — PER을 쓸 수 없어 적자 기업끼리 {row['loss_valuation_basis']}로 비교: "
+        lines.append(f"최근 12개월 적자 — PER을 쓸 수 없어 {row['loss_valuation_basis']}로 전체 종목과 비교: "
                      f"{n}개 관점 중 {agree}개가 '{side}' 쪽 (평균 괴리 {np.expm1(row['loss_valuation_gap']):+.0%}). "
                      "적자가 일회성 손상 때문인지 구조적 부진인지는 재무 지표만으로 구분할 수 없음")
         if row.get("financial_risk_withheld"):
@@ -608,6 +651,9 @@ def explain(row: pd.Series) -> str:
                      "— 다른 배수로 교차 확인할 수 없음")
     if row.get("new_listing_withheld"):
         lines.append("판단 보류(신규 상장): 상장 후 1년이 안 됐고 배수 하나로만 비교돼, 데이터가 부족해 판단하지 않음")
+    sentiment = _sentiment_text(row)
+    if sentiment:
+        lines.append(sentiment)
     return "\n".join(lines)
 
 
@@ -624,6 +670,7 @@ def screen(panel: pd.DataFrame) -> pd.DataFrame:
     df = flag_single_view(df)
     df = flag_financial_risk(df)
     df = add_expectations(df)
+    df = add_sentiment(df)
     df = add_label_detail(df)  # after the break flag, which it reads
     return classify_valuation_transition(df)
 
@@ -643,7 +690,7 @@ REPORT_COLUMNS = [
     "loss_n_gaps", "loss_gap_agreement", "meme_flag", "value_trap_flag", "transition_flag", "transition_type",
     "report_lag_flag", "price_move_since_report", "fundamental_break_flag", "single_view_flag",
     "financial_risk_flag", "financial_risk_withheld", "financial_risk_reason", "heavy_debt_flag", "heavy_debt_reason",
-    "new_listing_withheld",
+    "new_listing_withheld", "short_ratio", "short_interest_pct", "wiki_views_3m", "attention_pct",
     "meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason", "fundamental_break_reason",
     "single_view_reason", "explanation",
 ]

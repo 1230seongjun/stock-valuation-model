@@ -1211,6 +1211,63 @@ def test_report_lag_flag():
     assert not out.loc["OLD", "report_lag_flag"] and np.isclose(out.loc["OLD", "price_move_since_report"], 0.0)
 
 
+def test_sentiment_features_point_in_time():
+    from features import add_sentiment_features
+
+    panel = pd.DataFrame({"ticker": ["A", "A", "B"], "as_of": pd.to_datetime(["2024-03-01", "2024-04-01", "2024-03-01"]),
+                          "book_value": [100.0, 100.0, 100.0], "price_to_book": [2.0, 2.0, 2.0], "price": [10.0, 10.0, 10.0]})
+    short = pd.DataFrame({"ticker": ["A", "A"], "settlement": pd.to_datetime(["2024-02-15", "2024-02-25"]),
+                          "short_qty": [1e6, 2e6]})
+    months = pd.to_datetime(["2023-12-01", "2024-01-01", "2024-02-01", "2024-03-01"])
+    wiki = pd.concat([pd.DataFrame({"ticker": "A", "month": months, "views": [100, 200, 300, 1e6]}),
+                      pd.DataFrame({"ticker": "B", "month": months[1:], "views": [5, 5, 5]})])
+    out = add_sentiment_features(panel, short, wiki)
+    assert np.allclose(out["short_ratio"].iloc[:2], [0.05, 0.10]), "a report counts ~10 days after settlement"
+    assert out["wiki_views_3m"].iloc[0] == 200, "only complete months before as_of"
+    assert np.isclose(out["wiki_views_3m"].iloc[1], (200 + 300 + 1e6) / 3)
+    assert pd.isna(out["wiki_views_3m"].iloc[2]) and pd.isna(out["short_ratio"].iloc[2]), "a missing month or report -> NaN"
+    assert out[["ticker", "as_of"]].equals(panel[["ticker", "as_of"]]), "row order kept"
+
+
+def test_sentiment_is_descriptive_only():
+    import json
+    import tempfile
+    from llm_context import SCHEMA_VERSION, export_date
+
+    panel = build_synthetic_panel(n_tickers=80)
+    rng = np.random.default_rng(3)
+    with_sent = panel.assign(short_ratio=rng.uniform(0, 0.2, len(panel)), wiki_views_3m=rng.uniform(1e3, 1e6, len(panel)))
+    plain, sent = screen(panel), screen(with_sent)
+    assert plain["valuation_label"].equals(sent["valuation_label"]), "sentiment never changes a verdict"
+    report = report_at(sent)
+    assert report["explanation"].str.contains("심리 지표").all()
+    assert report["short_interest_pct"].between(0, 100).all() and report["attention_pct"].between(0, 100).all()
+    assert not report_at(plain)["explanation"].str.contains("심리 지표").any()
+    folder = export_date(sent, None, Path(tempfile.mkdtemp()))
+    ctx = json.loads(next(p for p in folder.glob("*.json") if p.name != "index.json").read_text(encoding="utf-8"))
+    assert ctx["schema_version"] == SCHEMA_VERSION and ctx["sentiment"]["short_interest_percentile_same_date"] is not None
+
+
+def test_sentiment_refresh_keeps_cached_rows_on_failure():
+    import os
+    import tempfile
+    import time
+    import data
+
+    path = Path(tempfile.mkdtemp()) / "short.parquet"
+    pd.DataFrame({"ticker": ["A", "B"], "settlement": pd.to_datetime(["2024-01-15"] * 2), "short_qty": [1.0, 2.0]}).to_parquet(path)
+    old = time.time() - 30 * 86400
+    os.utime(path, (old, old))
+
+    def fetch(t):
+        if t == "B":
+            raise ConnectionError("down")
+        return pd.DataFrame({"settlement": pd.to_datetime(["2024-02-15"]), "short_qty": [9.0]})
+    out = data._refresh_by_ticker(path, ["A", "B"], fetch, max_age_days=7, label="test")
+    assert out.set_index("ticker")["short_qty"].to_dict() == {"A": 9.0, "B": 2.0}
+    assert data._refresh_by_ticker(path, ["A", "B"], lambda t: 1 / 0, max_age_days=7, label="test").equals(out), "fresh file reused"
+
+
 def test_publish_update_matches_full_build():
     from publish import update_panel
 
