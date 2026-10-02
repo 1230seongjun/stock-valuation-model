@@ -130,16 +130,23 @@ def monthly_inputs(cape: pd.Series, fred: dict[str, pd.Series]) -> pd.DataFrame:
     }).sort_index()
 
 
+# Latest usable month: the last full month before as_of or the one before it.
+MAX_LAG_MONTHS = 2
+
+
 def market_context(data: pd.DataFrame, as_of: str | pd.Timestamp) -> dict | None:
     """The context for a snapshot dated as_of (JSON-ready), from monthly_inputs
-    rows up to the last full month before as_of only. None if that month or
+    rows up to the last full month before as_of only. Early in a month that
+    month may not be published yet, so the latest month within
+    MAX_LAG_MONTHS is used ("month" says which). None if there is none or
     MIN_FIT_MONTHS of fitting data are missing."""
     import statsmodels.api as sm
 
-    month = pd.Period(pd.Timestamp(as_of), "M") - 1
-    known = data[data.index <= month].dropna()
-    if known.empty or known.index[-1] != month:
+    last_full = pd.Period(pd.Timestamp(as_of), "M") - 1
+    known = data[data.index <= last_full].dropna()
+    if known.empty or (last_full - known.index[-1]).n >= MAX_LAG_MONTHS:
         return None
+    month = known.index[-1]
     fit_rows = known[(known.index >= FIT_START) & (known.index <= FIT_END)]
     if len(fit_rows) < MIN_FIT_MONTHS:
         return None

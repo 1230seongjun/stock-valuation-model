@@ -8,6 +8,7 @@ Entry point.
     python src/main.py screen    [--ticker AAPL] [--as-of 2026-07-01]   # + market_context_<date>.json
     python src/main.py export    [--as-of 2026-07-01]   # per-stock JSON for an LLM -> real_data_output/llm/<date>/
     python src/main.py explain   --tickers AAPL NVDA | --submit | --collect   # Korean explanations (Claude API)
+    python src/main.py publish   [--fundamentals-max-age 14]   # scheduled job: screen everything -> real_data_output/site/
 
 build needs FINNHUB_API_KEY (env var or --api-key). The other commands only
 need the saved panel, and recompute the fair-value model from it every time,
@@ -63,6 +64,7 @@ from universe import industry_groups, load_sub_industries, load_universe
 
 OUTPUT_DIR = Path("real_data_output")
 PANEL_PATH = OUTPUT_DIR / "panel.parquet"
+SITE_DIR = OUTPUT_DIR / "site"  # what the web/app reads (publish)
 # screen prints this many rows per flag (most extreme labels first); the CSV
 # has all of them (2026-09-29: 393 fundamental-break lines otherwise).
 MAX_FLAGGED_SHOWN = 15
@@ -71,12 +73,16 @@ pd.set_option("display.width", 250)
 pd.set_option("display.max_columns", 40)
 
 
+def _universe(cache_dir: str | Path) -> dict[str, dict[str, str]]:
+    universe = load_universe(cache_dir, UNIVERSE_INDEXES)
+    groups = industry_groups(universe, load_sub_industries(cache_dir), INDUSTRY_MIN_TICKERS)
+    return {t: {**meta, "industry": groups[t]} for t, meta in universe.items()}
+
+
 def build(api_key: str | None = None, cache_dir: str | Path = DEFAULT_CACHE_DIR, force_refresh: bool = False,
           panel_path: str | Path = PANEL_PATH) -> pd.DataFrame:
     api_key = api_key or os.environ.get("FINNHUB_API_KEY")
-    universe = load_universe(cache_dir, UNIVERSE_INDEXES)
-    groups = industry_groups(universe, load_sub_industries(cache_dir), INDUSTRY_MIN_TICKERS)
-    universe = {t: {**meta, "industry": groups[t]} for t, meta in universe.items()}
+    universe = _universe(cache_dir)
     tickers = list(universe)
     sizes = pd.Series({t: m["size"] for t, m in universe.items()}).value_counts()
     print(f"Universe: {len(tickers)} tickers ({', '.join(f'{k} {v}' for k, v in sizes.items())})")
@@ -455,6 +461,41 @@ def explain(as_of: str | None = None, tickers: list[str] | None = None, submit: 
         print(llm_explain.collect_batch(folder, **kw))
 
 
+def publish(api_key: str | None = None, cache_dir: str | Path = DEFAULT_CACHE_DIR, panel_path: str | Path = PANEL_PATH,
+            out_dir: str | Path = SITE_DIR, fundamentals_max_age: float = 14, keep: int = 14) -> Path:
+    """The scheduled job behind the web/app (publish.py): fresh prices, Finnhub
+    fundamentals only for caches older than `fundamentals_max_age` days (about
+    1/14 of the universe a day, well inside 50 calls/min), the snapshots the
+    saved panel lacks, every stock screened at once, site files written.
+    Needs a panel from `build` first."""
+    import time
+
+    from publish import update_panel, write_site
+
+    start = time.time()
+    api_key = api_key or os.environ.get("FINNHUB_API_KEY")
+    universe = _universe(cache_dir)
+    tickers = list(universe)
+    prices, fundamentals = collect(tickers, api_key=api_key, cache_dir=cache_dir, price_max_age_days=0,
+                                   fundamentals_max_age_days=fundamentals_max_age)
+    panel, added = update_panel(
+        _load(panel_path), build_as_of_dates(TRAIN_START), tickers, prices=prices, fundamentals=fundamentals,
+        universe=universe, fiscal_year_ends=collect_fiscal_year_ends(tickers, api_key=api_key, cache_dir=cache_dir),
+        sec_facts=load_sec_facts(tickers, cache_dir=cache_dir))
+    print(f"panel: {len(panel)} rows, added {', '.join(str(d.date()) for d in added) or 'nothing'}")
+    tmp = Path(panel_path).with_suffix(".tmp")
+    panel.to_parquet(tmp)
+    tmp.replace(panel_path)
+
+    screened = screen_panel(panel)
+    as_of = screened["as_of"].max()
+    latest = write_site(screened, out_dir, _market_context(as_of, save=False, cache_dir=cache_dir), keep=keep)
+    counts = screened.loc[screened["as_of"] == as_of, "valuation_label"].value_counts()
+    print(f"\npublished {as_of.date()} ({int(counts.sum())} stocks) -> {latest}  [{time.time() - start:.0f}s]")
+    print("  " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+    return latest
+
+
 # HON: all 5 views -77% on 2026-09-29 — a one-off gain + per-share break in
 # Finnhub's data (screening.flag_fundamental_break); prices matched yfinance.
 VERIFY_TICKERS = ["AAPL", "MSFT", "JPM", "XOM", "KO", "TSLA", "HON"]
@@ -540,7 +581,13 @@ def main() -> None:
     y.add_argument("--collect", action="store_true")
     y.add_argument("--model")
     y.add_argument("--effort")
-    for p in (b, v, c, e, s, x):
+    u = sub.add_parser("publish", help="scheduled job: refresh prices, screen every stock, write site files")
+    u.add_argument("--api-key")
+    u.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR))
+    u.add_argument("--out-dir", default=str(SITE_DIR))
+    u.add_argument("--fundamentals-max-age", type=float, default=14, help="re-fetch fundamentals older than this many days")
+    u.add_argument("--keep", type=int, default=14, help="date folders to keep")
+    for p in (b, v, c, e, s, x, u):
         p.add_argument("--panel", default=str(PANEL_PATH))
     args = parser.parse_args()
 
@@ -552,6 +599,8 @@ def main() -> None:
         compare_features(args.panel, drop_check=args.drop_check)
     elif args.command == "evaluate":
         evaluate(args.panel)
+    elif args.command == "publish":
+        publish(args.api_key, args.cache_dir, args.panel, args.out_dir, args.fundamentals_max_age, args.keep)
     elif args.command == "explain":
         explain(args.as_of, args.tickers, args.submit, args.collect, args.model, args.effort)
     elif args.command == "export":

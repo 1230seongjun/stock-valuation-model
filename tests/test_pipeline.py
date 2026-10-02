@@ -451,7 +451,8 @@ def test_market_context_point_in_time():
     later = data.copy()
     later.loc[later.index >= pd.Period("2026-09", "M"), "log_cape"] += 5
     assert market_context(later, "2026-09-30") == ctx, "data after the last full month is not used"
-    assert market_context(data.loc[: pd.Period("2026-07", "M")], "2026-09-30") is None, "August not in yet"
+    assert market_context(data.loc[: pd.Period("2026-07", "M")], "2026-09-30")["month"] == "2026-07", "August not out yet"
+    assert market_context(data.loc[: pd.Period("2026-06", "M")], "2026-09-30") is None, "too old"
 
 
 def test_llm_export_is_valid_and_matches_the_report():
@@ -1208,6 +1209,69 @@ def test_report_lag_flag():
     assert "2026-06-30" in out.loc["SPIN", "report_lag_reason"] and "-60%" in out.loc["SPIN", "report_lag_reason"]
     assert not out.loc["CALM", "report_lag_flag"] and out.loc["CALM", "report_lag_reason"] == ""
     assert not out.loc["OLD", "report_lag_flag"] and np.isclose(out.loc["OLD", "price_move_since_report"], 0.0)
+
+
+def test_publish_update_matches_full_build():
+    from publish import update_panel
+
+    tickers, universe, prices, fundamentals = make_raw_data(n_tickers=12)
+    dates = [*pd.date_range("2018-01-01", "2024-04-01", freq="QS"), pd.Timestamp("2024-05-15")]
+    full = add_percentile_scores(build_raw_panel(tickers, prices, fundamentals, universe, dates))
+    stale_today = add_percentile_scores(build_raw_panel(tickers, prices, fundamentals, universe,
+                                                        [*dates[:-2], pd.Timestamp("2024-02-20")]))
+    updated, added = update_panel(stale_today, dates, tickers, prices=prices, fundamentals=fundamentals, universe=universe)
+    assert added == dates[-2:], "the new quarter start and today are added, the old 'today' dropped"
+    pd.testing.assert_frame_equal(updated[full.columns], full)
+    same, none_added = update_panel(full, dates, tickers, prices=prices, fundamentals=fundamentals, universe=universe)
+    assert none_added == [] and len(same) == len(full)
+
+
+def test_publish_writes_site_files():
+    import json
+    import tempfile
+    from publish import write_site
+
+    screened = screen(build_synthetic_panel(n_tickers=80))
+    out = Path(tempfile.mkdtemp())
+    (out / "2000-01-01").mkdir()
+    latest = json.loads(write_site(screened, out, market=None, keep=1).read_text(encoding="utf-8"))
+    date = str(screened["as_of"].max().date())
+    assert latest["as_of"] == date and latest["dates"] == [date], "older folders pruned"
+    index = json.loads((out / latest["index"]).read_text(encoding="utf-8"))
+    assert index["n_stocks"] == latest["n_stocks"] == sum(latest["label_counts"].values())
+    assert all((out / date / f"{s['ticker']}.json").exists() for s in index["stocks"])
+    assert not (out / ".staging").exists()
+
+
+def test_fundamentals_refetched_only_when_old():
+    import os
+    import tempfile
+    import time
+    import data
+
+    cache = Path(tempfile.mkdtemp())
+    (cache / "prices").mkdir()
+    (cache / "fundamentals").mkdir()
+    today = pd.Timestamp.today().normalize()
+    px = pd.DataFrame({"date": [today], "close": [1.0], "close_raw": [1.0], "volume": [1.0], "dividend": [0.0]})
+    fund = pd.DataFrame({"period": [pd.Timestamp("2025-12-31")], **{k: [1.0] for k in data.FINNHUB_FIELD_MAP}})
+    for t in ("OLD", "NEW", "EMPTY"):
+        px.to_parquet(cache / "prices" / f"{t}.parquet")
+        fund.to_parquet(cache / "fundamentals" / f"{t}.parquet")
+    old = time.time() - 30 * 86400
+    for t in ("OLD", "EMPTY"):
+        os.utime(cache / "fundamentals" / f"{t}.parquet", (old, old))
+    calls = []
+    orig = data.fetch_fundamentals, data._MIN_INTERVAL_SEC
+    data.fetch_fundamentals = lambda t, key: calls.append(t) or (fund.assign(eps=2.0) if t == "OLD" else fund.iloc[:0])
+    data._MIN_INTERVAL_SEC = 0
+    try:
+        _, f = data.collect(["OLD", "NEW", "EMPTY"], api_key="x", cache_dir=cache, fundamentals_max_age_days=14)
+    finally:
+        data.fetch_fundamentals, data._MIN_INTERVAL_SEC = orig
+    assert calls == ["OLD", "EMPTY"]
+    assert f["OLD"]["eps"].iloc[0] == 2.0 and f["NEW"]["eps"].iloc[0] == 1.0
+    assert len(f["EMPTY"]) == 1, "an empty re-fetch keeps the cached history"
 
 
 def test_end_to_end():

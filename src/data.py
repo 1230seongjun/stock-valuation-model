@@ -216,10 +216,15 @@ def _cache_path(cache_dir: str | Path, kind: str, ticker: str) -> Path:
     return Path(cache_dir) / kind / f"{ticker}.parquet"
 
 
-def _prices_are_recent(cached: pd.DataFrame, today: pd.Timestamp | None = None) -> bool:
+def _prices_are_recent(cached: pd.DataFrame, today: pd.Timestamp | None = None,
+                       max_age_days: int = PRICE_REFRESH_DAYS) -> bool:
     today = (today or pd.Timestamp.today()).normalize()
     last = pd.to_datetime(cached["date"]).max() if len(cached) else pd.NaT
-    return pd.notna(last) and (today - last).days <= PRICE_REFRESH_DAYS
+    return pd.notna(last) and (today - last).days <= max_age_days
+
+
+def _file_age_days(path: Path) -> float:
+    return (time.time() - path.stat().st_mtime) / 86400
 
 
 def _cache_is_current(cached: pd.DataFrame, required: list[str]) -> bool:
@@ -249,10 +254,14 @@ def collect(
     api_key: str | None = None,
     cache_dir: str | Path = DEFAULT_CACHE_DIR,
     force_refresh: bool = False,
+    price_max_age_days: int = PRICE_REFRESH_DAYS,
+    fundamentals_max_age_days: float | None = None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     """Prices + fundamentals for every ticker, cache first. Only tickers
     that actually need a Finnhub call are rate-limited, so a full cache hit
-    returns in seconds.
+    returns in seconds. Prices whose last day is older than
+    price_max_age_days are re-fetched; fundamentals only when their cache
+    file is older than fundamentals_max_age_days (None = never).
 
     Network failures are retried (_with_retry); a ticker that still fails is
     left out and reported at the end. Empty results are not cached either,
@@ -270,7 +279,7 @@ def collect(
             cached = pd.read_parquet(path)
             # a delisted ticker's cache never becomes recent: re-fetching it
             # returns the same history (or nothing, then the cache is kept)
-            if _cache_is_current(cached, PRICE_COLUMNS) and _prices_are_recent(cached):
+            if _cache_is_current(cached, PRICE_COLUMNS) and _prices_are_recent(cached, max_age_days=price_max_age_days):
                 prices[ticker] = cached
                 continue
         df = _with_retry(fetch_price_history, ticker, "yfinance", retry_all=True)
@@ -304,13 +313,16 @@ def collect(
         path = _cache_path(cache_dir, "fundamentals", ticker)
         if path.exists() and not force_refresh:
             cached = pd.read_parquet(path)
-            if _cache_is_current(cached, list(FINNHUB_FIELD_MAP)):
+            fresh = fundamentals_max_age_days is None or _file_age_days(path) <= fundamentals_max_age_days
+            if _cache_is_current(cached, list(FINNHUB_FIELD_MAP)) and fresh:
                 fundamentals[ticker] = cached
                 continue
         if n_calls:
             time.sleep(_MIN_INTERVAL_SEC)
         n_calls += 1
         df = _with_retry(lambda t: fetch_fundamentals(t, api_key), ticker, "Finnhub")
+        if df is not None and df.empty and path.exists():
+            df = None  # an empty re-fetch never replaces cached history
         if df is None:
             failed.append(f"{ticker} (fundamentals)")
             if path.exists():  # outdated cache still beats nothing for this run
