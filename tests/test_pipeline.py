@@ -512,7 +512,7 @@ def test_llm_export_cash_backing_and_without_accruals():
             assert np.isclose(cb["cash_to_earnings"], row["sec_operating_cash_flow_ttm"] / row["sec_net_income_ttm"], atol=1e-3)
             assert cb["cash_to_earnings_1y_ago"] is not None, "a snapshot a year earlier exists"
             assert cb["used_by_model"] == (row["sector"] != "Financials")
-            assert ctx["without_accruals"]["label"] in ("매우 저평가", "저평가", "중립", "고평가", "매우 고평가", "판단 보류(적자)", "데이터 부족")
+            assert ctx["without_accruals"]["label"] in ("큰 할인", "할인", "중립", "프리미엄", "큰 프리미엄", "판단 보류(적자)", "데이터 부족")
             rank = ctx["verdict"]["cheapness_rank"]
             if rank is not None:
                 assert ctx["verdict"]["near_label_boundary"] == (min(abs(rank - e) for e in (80, 60, 40, 20)) <= 3)
@@ -528,19 +528,19 @@ def test_llm_explanation_check_and_call():
     from llm_explain import OUTPUT_SCHEMA, check, explain_one, request_params
 
     ctx = {"ticker": "XYZ", "as_of": "2026-09-30", "schema_version": "1.1",
-           "verdict": {"label": "고평가", "cheapness_rank": 19.0, "combined_gap_pct": 44.9, "near_label_boundary": True,
+           "verdict": {"label": "프리미엄", "cheapness_rank": 19.0, "combined_gap_pct": 44.9, "near_label_boundary": True,
                        "loss_making": False},
            "multiples": [{"name": "PER", "actual": 26.8, "fair": 18.4, "gap_pct": 45.7}],
            "without_accruals": {"label": "중립", "cheapness_rank": 22.0},
            "cash_backing": {"cash_to_earnings": 0.697, "net_income_ttm_usd_bn": 192.88},
            "flags": [], "interpretation_rules": ["rule one"]}
-    good = {"headline": "경계선에 있는 고평가예요", "summary": "PER 26.8배로 적정 18.4배보다 46% 높아요.",
+    good = {"headline": "경계선에 있는 프리미엄이에요", "summary": "PER 26.8배로 기준 18.4배보다 46% 높아요.",
             "reasons": ["이익 $192.9B 중 현금은 70%만 들어와서(현금 0.7배) 판정이 중립에서 바뀌었어요."],
             "cautions": ["순위 19로 기준 20에 가까워요."], "market_note": ""}
     assert check(good, ctx)["passed"], check(good, ctx)
     assert any("number" in i for i in check({**good, "summary": "PER 31.5배예요."}, ctx)["issues"])
     assert any("banned" in i for i in check({**good, "headline": "매수할 만한 경계선 종목이에요"}, ctx)["issues"])
-    assert any("boundary" in i for i in check({**good, "headline": "고평가예요", "cautions": []}, ctx)["issues"])
+    assert any("boundary" in i for i in check({**good, "headline": "프리미엄이에요", "cautions": []}, ctx)["issues"])
     assert any("cash backing" in i for i in check({**good, "reasons": ["이익이 커요."]}, ctx)["issues"])
 
     params = request_params(ctx, {"cape": 41.1, "interpretation_rules": ["market rule"]})
@@ -585,9 +585,9 @@ def test_distressed_loss_makers_are_not_called_cheap():
     panel.loc[panel["ticker"] == "T003", "net_debt_to_capital"] = 1.4  # profitable, heavy debt
     out = report_at(flag_financial_risk(screen_ready(add_fair_value(panel)[0]))).set_index("ticker")
     assert out.loc["T001", "valuation_label"] == "판단 보류(재무 위험)" and out.loc["T001", "financial_risk_flag"]
-    assert "저평가'로 판단하지 않음" in out.loc["T001", "financial_risk_reason"] and "재무 위험" in out.loc["T001", "explanation"]
-    assert out.loc["T005", "valuation_label"] == "적자 · 매우 저평가" and not out.loc["T005", "financial_risk_flag"]
-    assert out.loc["T017", "valuation_label"] == "적자 · 매우 고평가" and out.loc["T017", "financial_risk_flag"]
+    assert "'싸다'고 판단하지 않음" in out.loc["T001", "financial_risk_reason"] and "재무 위험" in out.loc["T001", "explanation"]
+    assert out.loc["T005", "valuation_label"] == "적자 · 큰 할인" and not out.loc["T005", "financial_risk_flag"]
+    assert out.loc["T017", "valuation_label"] == "적자 · 큰 프리미엄" and out.loc["T017", "financial_risk_flag"]
     assert not out.loc["T003", "financial_risk_flag"] and not out.loc["T003", "valuation_label"].startswith("판단 보류")
     assert out.loc["T003", "heavy_debt_flag"] and "흑자지만 빚이 많음" in out.loc["T003", "heavy_debt_reason"]
     # a lender's debt is its business: a Financials loss-maker is not held on leverage
@@ -607,7 +607,7 @@ def test_new_listing_single_multiple_is_withheld():
     out = report_at(flag_financial_risk(screen_ready(add_fair_value(panel)[0])), dates[-1]).set_index("ticker")
     assert out.loc["T001", "valuation_label"] == "판단 보류(신규 상장)" and out.loc["T001", "new_listing_withheld"]
     assert "신규 상장" in out.loc["T001", "explanation"]
-    assert out.loc["T005", "valuation_label"] == "매우 저평가" and not out.loc["T005", "new_listing_withheld"]
+    assert out.loc["T005", "valuation_label"] == "큰 할인" and not out.loc["T005", "new_listing_withheld"]
 
 
 def test_fiscal_q4_detection():
@@ -755,8 +755,8 @@ def test_fair_value_recovers_planted_mispricing():
     labelled = _labelled(panel)
     cheap = labelled[labelled["ticker"].isin([f"T{i:03d}" for i in range(15)])]
     rich = labelled[labelled["ticker"].isin([f"T{i:03d}" for i in range(15, 30)])]
-    assert (cheap["valuation_label"] == "매우 저평가").mean() > 0.8
-    assert (rich["valuation_label"] == "매우 고평가").mean() > 0.8
+    assert (cheap["valuation_label"] == "큰 할인").mean() > 0.8
+    assert (rich["valuation_label"] == "큰 프리미엄").mean() > 0.8
     assert np.isclose(np.expm1(cheap["valuation_gap"]).median(), np.expm1(-0.6), atol=0.1)
     # every multiple was mispriced the same way, so every view should agree;
     # Financials are only judged on PER/PBR (config exclude_sectors)
@@ -1110,7 +1110,7 @@ def test_value_trap_and_meme_flags():
     panel = pd.DataFrame({
         "ticker": ["TRAP"] * 5 + ["FRESH"] * 5,
         "as_of": list(dates) * 2,
-        "valuation_label": ["매우 저평가"] * 5 + ["중립"] * 4 + ["매우 저평가"],
+        "valuation_label": ["큰 할인"] * 5 + ["중립"] * 4 + ["큰 할인"],
         "revenue_growth_yoy_pct": [30.0] * 10,
         "price_spike_5d": [0.0] * 9 + [0.25],
         "volume_zscore_63d": [0.0] * 9 + [4.0],
@@ -1130,7 +1130,7 @@ def test_single_view_flag():
     panel.loc[only_pb, ["trailing_pe", "price_to_sales", "ev_to_ebitda", "price_to_fcf"]] = np.nan
     report = report_at(flag_single_view(screen_ready(add_fair_value(panel)[0]))).set_index("ticker")
     row = report.loc["T001"]
-    assert row["n_gaps"] == 1 and row["valuation_label"] == "매우 저평가"
+    assert row["n_gaps"] == 1 and row["valuation_label"] == "큰 할인"
     assert row["single_view_flag"] and "PBR 한 가지 배수" in row["single_view_reason"]
     assert "한 가지 관점으로만 판단" in row["explanation"]
     assert not report.drop("T001")["single_view_flag"].any()
@@ -1168,8 +1168,8 @@ def test_label_detail_splits_by_delivered_growth():
         "as_of": pd.Timestamp("2026-09-30"),
         "ticker": ["PROVEN", "HOPE", "GLOOM", "UNLOVED", "LOSS", "EVEN", "MID1", "MID2", "MIDHOPE", "MIDLOW",
                    "F1", "F2", "F3", "F4", "TURN", "TINYBASE"],
-        "valuation_label": ["매우 고평가", "매우 고평가", "매우 저평가", "매우 저평가", "매우 고평가", "매우 고평가", "중립", "중립", "중립", "중립",
-                            "중립", "중립", "중립", "중립", "매우 저평가", "매우 고평가"],
+        "valuation_label": ["큰 프리미엄", "큰 프리미엄", "큰 할인", "큰 할인", "큰 프리미엄", "큰 프리미엄", "중립", "중립", "중립", "중립",
+                            "중립", "중립", "중립", "중립", "큰 할인", "큰 프리미엄"],
         # median PER 20 (fillers F1-F4 keep it there): 40 needs +7.2%/yr over the median stock, 10 needs -6.7%/yr
         "trailing_pe": [40.0, 40.0, 10.0, 10.0, 40.0, 40.0, 20.0, 20.0, 40.0, 20.0, 20.0, 20.0, 20.0, 20.0, 150.0,
                         150.0],
@@ -1190,7 +1190,7 @@ def test_label_detail_splits_by_delivered_growth():
     assert out.loc["MIDLOW", "label_detail"] == "과거 성장 > 요구 성장 (일회성 손익 가능)"
     assert out.loc["TURN", "label_detail"] == "흑자 전환"
     assert out.loc["TINYBASE", "label_detail"] == "과거 성장 > 요구 성장 (기저 효과 가능)"  # BROS: +586%/yr
-    assert out.loc["HOPE", "valuation_view"] == "매우 고평가 · 요구 성장 > 과거 성장"
+    assert out.loc["HOPE", "valuation_view"] == "큰 프리미엄 · 요구 성장 > 과거 성장"
 
 
 def test_report_lag_flag():
@@ -1209,6 +1209,31 @@ def test_report_lag_flag():
     assert "2026-06-30" in out.loc["SPIN", "report_lag_reason"] and "-60%" in out.loc["SPIN", "report_lag_reason"]
     assert not out.loc["CALM", "report_lag_flag"] and out.loc["CALM", "report_lag_reason"] == ""
     assert not out.loc["OLD", "report_lag_flag"] and np.isclose(out.loc["OLD", "price_move_since_report"], 0.0)
+
+
+def test_gap_decomposition_and_label_streak():
+    from screening import _decomposition_text, add_gap_decomposition, add_label_streak
+
+    d0, d1, d2, d3 = pd.to_datetime(["2023-01-01", "2024-01-01", "2024-04-01", "2024-07-01"])
+    semis = pd.DataFrame({"ticker": list("ABCDEF"), "industry": ["Semiconductors"] * 6, "sector": "Tech",
+                          "size_group": ["large"] * 3 + ["small"] * 3, "valuation_gap": [0.6, 0.5, 0.4, 0.4, 0.3, 0.2]})
+    others = pd.DataFrame({"ticker": list("GHIJKL"), "industry": ["Tech 기타"] * 6, "sector": "Tech",
+                           "size_group": ["large"] * 3 + ["small"] * 3, "valuation_gap": [0.2, 0.1, 0.0, 0.0, -0.1, -0.2]})
+    now = pd.concat([semis, others]).assign(as_of=d1)
+    year_ago = now.assign(as_of=d0, valuation_gap=now["valuation_gap"] - 0.3)
+    out = add_gap_decomposition(pd.concat([year_ago, now], ignore_index=True))
+    a = out[(out["as_of"] == d1) & (out["ticker"] == "A")].iloc[0]
+    assert np.isclose(a["industry_gap"], 0.4) and np.isclose(a["industry_gap_1y"], 0.1), "group median now and a year earlier"
+    assert np.isclose(a["size_gap"], 0.1) and np.isclose(a["own_gap"], 0.1)
+    assert np.isclose(a["industry_gap"] + a["size_gap"] + a["own_gap"], a["valuation_gap"])
+    text = _decomposition_text(a)
+    assert "Semiconductors 업종 전체가 받는 몫 +49% (1년 전 +11%)" in text and "대형주라서 받는 몫" in text
+    lone = add_gap_decomposition(now.assign(industry=list("ABCDEFGHIJKL")))
+    assert lone["industry_gap"].isna().all() and np.allclose(lone["own_gap"] + lone["size_gap"], lone["valuation_gap"])
+    hist = pd.DataFrame({"ticker": ["A"] * 3 + ["B"] * 3, "as_of": [d1, d2, d3] * 2,
+                         "valuation_label": ["할인", "큰 할인", "큰 할인", "중립", "중립", "중립"]})
+    streak = add_label_streak(hist.iloc[::-1]).sort_values(["ticker", "as_of"])["label_streak"].tolist()
+    assert streak == [1, 1, 2, 1, 2, 3], "counted per ticker in date order, whatever the row order"
 
 
 def test_sentiment_features_point_in_time():
@@ -1336,11 +1361,11 @@ def test_end_to_end():
     screened = screen(panel)
     report = report_at(screened)
     assert len(report) == panel["ticker"].nunique()
-    assert report["valuation_label"].isin(["매우 저평가", "저평가", "중립", "고평가", "매우 고평가", "데이터 부족", "판단 보류(적자)",
-                                           *["적자 · " + b for b in ("매우 저평가", "저평가", "중립", "고평가", "매우 고평가")]]).all()
+    assert report["valuation_label"].isin(["큰 할인", "할인", "중립", "프리미엄", "큰 프리미엄", "데이터 부족", "판단 보류(적자)",
+                                           *["적자 · " + b for b in ("큰 할인", "할인", "중립", "프리미엄", "큰 프리미엄")]]).all()
     assert report["explanation"].str.len().gt(0).all()
     assert report["explanation"].str.contains("종합:").any()
-    labelled = report["valuation_label"].isin(["매우 저평가", "매우 고평가"])
+    labelled = report["valuation_label"].isin(["큰 할인", "큰 프리미엄"])
     assert 0.25 < labelled.mean() < 0.55, "top/bottom 20% should be labelled"
     assert report["n_gaps"].max() == 5
     tests = gap_return_test(screened)

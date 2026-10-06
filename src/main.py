@@ -264,8 +264,8 @@ def evaluate(panel_path: str | Path = PANEL_PATH) -> dict[str, pd.DataFrame]:
     _report_ttm_reliability(panel)
 
     print("\n=== 2c. Stability between consecutive snapshots (same tickers) ===")
-    print("    rank_corr = Spearman of the combined gap; label_changed = share whose 저평가/중립/고평가 changed;")
-    print("    cheap_rich_flip = share that jumped straight between 저평가 and 고평가")
+    print("    rank_corr = Spearman of the combined gap; label_changed = share whose 할인/중립/프리미엄 changed;")
+    print("    cheap_rich_flip = share that jumped straight between 할인 and 프리미엄")
     print(stability_summary(panel).round(3).to_string())
 
     by_size = "size_group" in panel.columns and panel["size_group"].nunique() > 1
@@ -357,7 +357,7 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
         else:
             row = match.iloc[0]
             rank = f"{row['cheapness_rank']:.0f}" if pd.notna(row["cheapness_rank"]) else "-"
-            print(f"{row['ticker']} ({row['sector']}, {row['size_group']}) {date}: {row['valuation_view']} (저평가 순위 {rank}/100)")
+            print(f"{row['ticker']} ({row['sector']}, {row['size_group']}) {date}: {row['valuation_view']} (할인 순위 {rank}/100)")
             print(row["explanation"])
             for col in ("meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason",
                         "fundamental_break_reason", "single_view_reason"):
@@ -398,24 +398,24 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
           f"     priced_in = yearly EPS growth above the median stock the PER needs for {IMPLIED_GROWTH_YEARS} years;\n"
           "     earn_3y = realized earnings growth per year, last 3 years (EPS, or net income without EPS)"
           + (f" (median stock {median_growth.iloc[0]:+.0%})" if len(median_growth) else "") + ")")
-    print("\n-- 매우 저평가 상위 15 --")
+    print("\n-- 큰 할인 상위 15 --")
     print(table[cols].head(15).to_string(index=False))
-    print("\n-- 매우 고평가 상위 15 --")
-    print(table[table["valuation_label"] == "매우 고평가"][cols].tail(15).iloc[::-1].to_string(index=False))
+    print("\n-- 큰 프리미엄 상위 15 --")
+    print(table[table["valuation_label"] == "큰 프리미엄"][cols].tail(15).iloc[::-1].to_string(index=False))
     loss = report[report["loss_cheapness_rank"].notna()].sort_values("loss_cheapness_rank", ascending=False)
     if not loss.empty:
         loss_table = loss.assign(rank=loss["loss_cheapness_rank"].round(0), gap=pct(loss["loss_valuation_gap_pct"]),
                                  basis=loss["loss_valuation_basis"])[["ticker", "sector", "size_group", "valuation_label",
                                                                       "rank", "gap", "basis"]]
         print(f"\n-- 적자 기업 {len(loss)}개 (PER 없음, 주로 PSR·PBR; rank = 같은 배수 기준 전체 종목 중 백분위) --")
-        print("  저평가 쪽 10:\n" + loss_table.head(10).to_string(index=False))
-        print("  고평가 쪽 10:\n" + loss_table.tail(10).iloc[::-1].to_string(index=False))
+        print("  할인 쪽 10:\n" + loss_table.head(10).to_string(index=False))
+        print("  프리미엄 쪽 10:\n" + loss_table.tail(10).iloc[::-1].to_string(index=False))
 
     # flagged rows nearest the label extremes first; the full lists are in the CSV
     extremeness = (report["cheapness_rank"] - 50).abs().fillna(-1)
     for flag, reason, title in [("meme_flag", "meme_reason", "단기 가격·거래량 이상"),
                                 ("value_trap_flag", "value_trap_reason", "지속 할인·저성장 경고"),
-                                ("transition_flag", "transition_reason", "매우 저평가→매우 고평가 전환"),
+                                ("transition_flag", "transition_reason", "큰 할인→큰 프리미엄 전환"),
                                 ("report_lag_flag", "report_lag_reason", "재무 기준일 이후 주가 급변"),
                                 ("fundamental_break_flag", "fundamental_break_reason", "최근 12개월 재무 단절"),
                                 ("single_view_flag", "single_view_reason", "한 가지 배수로만 판단"),

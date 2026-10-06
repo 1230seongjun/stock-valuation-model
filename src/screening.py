@@ -16,9 +16,9 @@ stays as sector_valuation_rank for reference.
 Flags (warnings, labels unchanged):
   - meme_flag: |5-day move| > 15% and volume > 3 std above its 63-day mean;
     only sees the 5 days before each snapshot.
-  - value_trap_flag: 매우 저평가 for 4 snapshots in a row with revenue growth in
+  - value_trap_flag: 큰 할인 for 4 snapshots in a row with revenue growth in
     the sector's bottom 40% (never validated as a value-trap detector).
-  - transition_flag/type: 매우 저평가 <-> 매우 고평가 flips, attributed to price vs. EPS.
+  - transition_flag/type: 큰 할인 <-> 큰 프리미엄 flips, attributed to price vs. EPS.
   - report_lag_flag: price moved > REPORT_LAG_MOVE_LIMIT (log) since the
     fundamentals' quarter end, so the rescaled multiples may be stale.
   - fundamental_break_flag: a one-off EPS or per-share break inside the TTM
@@ -90,7 +90,7 @@ LOSS_LABEL_PREFIX = "적자 · "  # loss-makers, ranked on the all-stock scale
 def valuation_label(cheapness_rank: float) -> str:
     if pd.isna(cheapness_rank):
         return "데이터 부족"
-    # extremes: >= CHEAP_THRESHOLD / <= EXPENSIVE_THRESHOLD; then 저평가 >= 60, 중립 >= 40, 고평가 > 20
+    # extremes: >= CHEAP_THRESHOLD / <= EXPENSIVE_THRESHOLD; then 할인 >= 60, 중립 >= 40, 프리미엄 > 20
     if cheapness_rank >= CHEAP_THRESHOLD:
         return VERY_CHEAP_LABEL
     if cheapness_rank <= EXPENSIVE_THRESHOLD:
@@ -140,13 +140,13 @@ def flag_financial_risk(panel: pd.DataFrame) -> pd.DataFrame:
             continue
         what = "자본잠식" if pd.notna(book) and book <= 0 else (f"순부채/총자본 {ndc:.2f}" if pd.notna(ndc) else "빚 부담 큼")
         reasons.append(f"적자 + 빚 부담 큼({what}) — 부도·재무 위험이 가격에 반영됐을 수 있는데 모델은 이 위험을 측정하지 못함"
-                       + (": 그래서 '저평가'로 판단하지 않음" if withheld else ": 고평가 쪽 판단은 오히려 덜 잡혔을 수 있음"))
+                       + (": 그래서 '싸다'고 판단하지 않음" if withheld else ": 프리미엄 쪽 판단은 오히려 덜 잡혔을 수 있음"))
     df["financial_risk_reason"] = reasons
     if "heavy_debt_flag" not in df.columns:
         df["heavy_debt_flag"] = heavy_debt(df) & ~df["financial_risk_flag"] & ~df.get("loss_flag", False)
     df["heavy_debt_reason"] = np.where(
         df["heavy_debt_flag"],
-        "흑자지만 빚이 많음 — 자본 구조·재무 위험이 배수에 반영돼 매우 저평가·매우 고평가 같은 극단 판정이 나오기 쉬움 "
+        "흑자지만 빚이 많음 — 자본 구조·재무 위험이 배수에 반영돼 큰 할인·큰 프리미엄 같은 극단 판정이 나오기 쉬움 "
         "(빚 많은 흑자 기업은 양 끝 비율이 각각 약 26%, 보통 20%)", "")
     return df
 
@@ -178,7 +178,7 @@ def add_labels(panel: pd.DataFrame) -> pd.DataFrame:
     df.loc[df["loss_flag"] & df["valuation_label"].eq("데이터 부족"), "valuation_label"] = "판단 보류(적자)"
     # distressed loss-makers: the model can't see default risk -> no cheap verdict (config)
     df["financial_risk_flag"] = financial_risk(df)
-    cheap_side = df["valuation_label"].isin([LOSS_LABEL_PREFIX + VERY_CHEAP_LABEL, LOSS_LABEL_PREFIX + "저평가"])
+    cheap_side = df["valuation_label"].isin([LOSS_LABEL_PREFIX + VERY_CHEAP_LABEL, LOSS_LABEL_PREFIX + "할인"])
     df["financial_risk_withheld"] = df["financial_risk_flag"] & cheap_side
     df.loc[df["financial_risk_withheld"], "valuation_label"] = FINANCIAL_RISK_LABEL
     df["heavy_debt_flag"] = heavy_debt(df) & ~df["loss_flag"].astype(bool)
@@ -191,6 +191,79 @@ def add_labels(panel: pd.DataFrame) -> pd.DataFrame:
     df["quality_score"] = df[[f"{k}_pct" for k in QUALITY_INDICATORS]].mean(axis=1, skipna=True)
     df["momentum_score"] = df[[f"{k}_pct" for k in MOMENTUM_INDICATORS]].mean(axis=1, skipna=True)
     return df
+
+
+# A sector x size group needs this many stocks with a gap on the date to give a shared part.
+GROUP_GAP_MIN_STOCKS = 5
+
+
+def _group_median(values: pd.Series, by: list) -> pd.Series:
+    grouped = values.groupby(by)
+    return grouped.transform("median").where((grouped.transform("count") >= GROUP_GAP_MIN_STOCKS) & values.notna())
+
+
+def add_gap_decomposition(panel: pd.DataFrame) -> pd.DataFrame:
+    """Splits the combined gap (log) into three descriptive parts; the verdict
+    still uses the whole gap:
+      - industry_gap: median gap of the stock's industry group on the date
+        (GICS sub-industry with enough members, else "<sector> 기타"), e.g. a
+        premium the whole semiconductor group gets beyond its fundamentals;
+        industry_gap_1y: the same group's value about a year earlier
+      - size_gap: median of what is left within the date's size group
+        (e.g. the small-cap discount)
+      - own_gap: the rest, the company's own part
+    A part needs GROUP_GAP_MIN_STOCKS stocks, otherwise it is NaN (and counts as 0)."""
+    df = panel.copy()
+    group = df["industry"].fillna(df["sector"]) if "industry" in df.columns else df["sector"]
+    size = df["size_group"] if "size_group" in df.columns else pd.Series("all", index=df.index)
+    gap = df["valuation_gap"]
+    df["industry_gap"] = _group_median(gap, [df["as_of"], group])
+    rest = gap - df["industry_gap"].fillna(0.0)
+    df["size_gap"] = _group_median(rest, [df["as_of"], size])
+    df["own_gap"] = rest - df["size_gap"].fillna(0.0)
+    # the group's value a year earlier: the snapshot closest to as_of - 365 days, within 45 days
+    table = df["industry_gap"].groupby([df["as_of"], group]).first()
+    dates = np.array(sorted(df["as_of"].unique()), dtype="datetime64[ns]")
+    prior = {}
+    for d in dates:
+        target = d - np.timedelta64(365, "D")
+        i = int(np.abs(dates - target).argmin())
+        if abs(dates[i] - target) <= np.timedelta64(45, "D"):
+            prior[pd.Timestamp(d)] = pd.Timestamp(dates[i])
+    keys = zip(df["as_of"].map(prior), group)
+    df["industry_gap_1y"] = pd.Series([table.get(k, np.nan) if pd.notna(k[0]) else np.nan for k in keys],
+                                      index=df.index, dtype=float)
+    df["industry_group"] = group
+    return df
+
+
+def add_label_streak(panel: pd.DataFrame) -> pd.DataFrame:
+    """label_streak: how many snapshots in a row (quarter starts + today) the
+    stock has had its current label, this one included."""
+    df = panel.copy()
+    order = df.sort_values(["ticker", "as_of"], kind="stable").index
+    label, ticker = df.loc[order, "valuation_label"], df.loc[order, "ticker"]
+    run = ((label != label.shift()) | (ticker != ticker.shift())).cumsum()
+    df.loc[order, "label_streak"] = label.groupby(run).cumcount().to_numpy() + 1
+    df["label_streak"] = df["label_streak"].astype(int)
+    return df
+
+
+_SIZE_KO = {"large": "대형주", "mid": "중형주", "small": "소형주"}
+
+
+def _decomposition_text(row: pd.Series) -> str:
+    if pd.isna(row.get("valuation_gap")) or (pd.isna(row.get("industry_gap")) and pd.isna(row.get("size_gap"))):
+        return ""
+    parts = []
+    if pd.notna(row.get("industry_gap")):
+        year = f" (1년 전 {np.expm1(row['industry_gap_1y']):+.0%})" if pd.notna(row.get("industry_gap_1y")) else ""
+        parts.append(f"{row['industry_group']} 업종 전체가 받는 몫 {np.expm1(row['industry_gap']):+.0%}{year}")
+    if pd.notna(row.get("size_gap")):
+        size = row.get("size_group")
+        parts.append(f"{_SIZE_KO.get(size, size)}라서 받는 몫 {np.expm1(row['size_gap']):+.0%}")
+    parts.append(f"이 회사만의 몫 {np.expm1(row['own_gap']):+.0%}")
+    return "괴리 나누기: " + ", ".join(parts) + " (log 기준으로 나눈 값이라 %로는 정확히 더해지지 않음)"
 
 
 # A percentile this high / low counts as "high" / "low" in the sentiment note.
@@ -273,7 +346,7 @@ def add_label_detail(panel: pd.DataFrame, band: float = LABEL_DETAIL_BAND) -> pd
     the growth the company delivered, both relative to the median stock:
       realized_excess_growth = (1 + earnings_cagr_3y) / (1 + median) - 1
     within `band` of each other -> SIMILAR; otherwise PAST_ABOVE or
-    REQUIRED_ABOVE by which one is higher (for every label: a 저평가 stock
+    REQUIRED_ABOVE by which one is higher (for every label: a 할인 stock
     whose price requires less growth than it delivered is PAST_ABOVE). A loss 3 years ago and a profit now (growth
     undefined; 155 of the 283 undivided verdicts on 2026-09-30) -> 흑자 전환;
     anything else without a growth rate (a loss now, under 3 years of
@@ -281,7 +354,7 @@ def add_label_detail(panel: pd.DataFrame, band: float = LABEL_DETAIL_BAND) -> pd
     growth may be a one-off, and above BASE_EFFECT_CAGR a tiny base, so the
     detail says so. valuation_label itself
     is unchanged (the flags key on it); label_detail is added and
-    valuation_view = "고평가 · 요구 성장 > 과거 성장" for the report. "Delivered" = the
+    valuation_view = "프리미엄 · 요구 성장 > 과거 성장" for the report. "Delivered" = the
     past 3 years' growth rate — a description of the price, not a forecast."""
     df = panel.copy()
     median = df["earnings_cagr_3y_median"]
@@ -346,7 +419,7 @@ def flag_meme_stock(panel: pd.DataFrame) -> pd.DataFrame:
 
 def flag_value_trap(panel: pd.DataFrame, lookback_periods: int = VALUE_TRAP_LOOKBACK_PERIODS) -> pd.DataFrame:
     """Flags a row when that ticker's last `lookback_periods` snapshots up to
-    and including it (past rows only) were all 저평가 and its
+    and including it (past rows only) were all 할인 and its
     revenue_growth_yoy_pct is <= VALUE_TRAP_WEAK_GROWTH_PERCENTILE. Works for
     any as_of, not just the latest. Tickers with a shorter history are left
     unflagged, not guessed; a stock that only just became cheap is not
@@ -358,7 +431,7 @@ def flag_value_trap(panel: pd.DataFrame, lookback_periods: int = VALUE_TRAP_LOOK
     df["value_trap_flag"] = ((streak == lookback_periods) & weak_growth).fillna(False).astype(bool)
     df["value_trap_reason"] = np.where(
         df["value_trap_flag"],
-        f"최근 {lookback_periods}개 시점 연속 매우 저평가 + 매출성장률은 섹터 하위 "
+        f"최근 {lookback_periods}개 시점 연속 큰 할인 + 매출성장률은 섹터 하위 "
         f"{VALUE_TRAP_WEAK_GROWTH_PERCENTILE:.0f}% 이내 — 모델이 못 보는 이유로 계속 싼 것일 수 있음 "
         "(지속 할인·저성장 경고; 밸류트랩인지는 검증하지 않은 규칙)",
         "",
@@ -412,7 +485,7 @@ def flag_fundamental_break(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def flag_single_view(panel: pd.DataFrame) -> pd.DataFrame:
-    """single_view_flag: a non-neutral label (매우 저평가 ... 매우 고평가, loss-makers
+    """single_view_flag: a non-neutral label (큰 할인 ... 큰 프리미엄, loss-makers
     too) from ONE multiple, because the
     others were out of range, missing or excluded for the sector — nothing
     cross-checks it (see module docstring)."""
@@ -446,7 +519,7 @@ def classify_valuation_transition(
     price_threshold: float = TRANSITION_PRICE_THRESHOLD,
     earnings_threshold: float = TRANSITION_EARNINGS_THRESHOLD,
 ) -> pd.DataFrame:
-    """Flags each snapshot where a ticker's label went 저평가 -> 고평가 versus
+    """Flags each snapshot where a ticker's label went 할인 -> 프리미엄 versus
     its previous snapshot, and attributes it with that ticker's own price
     and EPS log changes over the same gap:
       price up, EPS held         -> 주가 상승형 (re-rating)
@@ -490,18 +563,18 @@ def classify_valuation_transition(
             if price_rose and eps_fell:
                 kind, reason = "복합형", f"주가 {p} 상승과 EPS {e} 하락이 겹침 — 단순 재평가로 읽으면 안 됨"
             elif price_rose:
-                kind, reason = "주가 상승형", f"주가가 {p} 오르며 적정가를 넘어섬 (EPS {e})"
+                kind, reason = "주가 상승형", f"주가가 {p} 오르며 기준 배수를 넘어섬 (EPS {e})"
             elif eps_fell:
                 kind, reason = "실적 악화형", f"EPS가 {e} 줄며 배수가 기계적으로 상승 (주가 {p}) — 재평가보다 이익 훼손에 가까움"
             elif price_fell:
                 kind, reason = (
                     "가격 급락형",
-                    f"주가가 {p} 떨어졌는데도 고평가로 전환 (EPS {e}) — ROE·성장률 등 펀더멘털이 더 크게 나빠져 적정 배수가 내려갔을 가능성",
+                    f"주가가 {p} 떨어졌는데도 프리미엄으로 전환 (EPS {e}) — ROE·성장률 등 펀더멘털이 더 크게 나빠져 기준 배수가 내려갔을 가능성",
                 )
             else:
                 kind, reason = (
                     "불분명",
-                    f"주가({p})·EPS({e}) 움직임으로는 설명되지 않음 — 다른 재무 지표 변화로 적정 배수가 바뀌었거나 시장 전체의 가격 결정이 달라진 영향",
+                    f"주가({p})·EPS({e}) 움직임으로는 설명되지 않음 — 다른 재무 지표 변화로 기준 배수가 바뀌었거나 시장 전체의 가격 결정이 달라진 영향",
                 )
             idx = group.index[i]
             df.loc[idx, ["transition_flag", "transition_type", "transition_reason"]] = [True, kind, reason]
@@ -594,7 +667,7 @@ def explain(row: pd.Series) -> str:
                 excluded = " [참고용, 종합 판단 제외]"
             particle = "를" if spec["label"].endswith(("EBITDA", "FCF")) else "을"  # 에이/에프 end in a vowel
             lines.append(
-                f"{spec['label']} {actual:.1f}배 (적정 {fair:.1f}배, {np.expm1(gap):+.0%}){excluded} — 적정 "
+                f"{spec['label']} {actual:.1f}배 (기준 {fair:.1f}배, {np.expm1(gap):+.0%}){excluded} — 기준 "
                 f"{spec['label']}{particle} {_driver_text(row, key)}"
             )
         elif status == "excluded_sector":
@@ -635,7 +708,7 @@ def explain(row: pd.Series) -> str:
                      "적자가 일회성 손상 때문인지 구조적 부진인지는 재무 지표만으로 구분할 수 없음")
         if row.get("financial_risk_withheld"):
             lines.append("판단 보류(재무 위험): 위 비교로는 싼 쪽이지만, 빚이 많아 부도·재무 위험이 가격에 반영됐을 수 있고 "
-                         "모델은 그 위험을 측정하지 못해 '저평가'로 판단하지 않음")
+                         "모델은 그 위험을 측정하지 못해 '싸다'고 판단하지 않음")
     elif row.get("loss_flag"):
         lines.append(
             "최근 12개월 적자 — 일회성 손상인지 구조적 부진인지 재무 지표만으로 구분할 수 없어 판단을 보류함 "
@@ -651,6 +724,11 @@ def explain(row: pd.Series) -> str:
                      "— 다른 배수로 교차 확인할 수 없음")
     if row.get("new_listing_withheld"):
         lines.append("판단 보류(신규 상장): 상장 후 1년이 안 됐고 배수 하나로만 비교돼, 데이터가 부족해 판단하지 않음")
+    decomposition = _decomposition_text(row)
+    if decomposition:
+        lines.append(decomposition)
+    if row.get("label_streak", 0) >= 2 and not str(row.get("valuation_label")).startswith(("판단 보류", "데이터 부족")):
+        lines.append(f"라벨 유지: 최근 {int(row['label_streak'])}개 기준일 연속 '{row['valuation_label']}'")
     sentiment = _sentiment_text(row)
     if sentiment:
         lines.append(sentiment)
@@ -663,6 +741,8 @@ def screen(panel: pd.DataFrame) -> pd.DataFrame:
     so a saved panel never carries a stale model."""
     df, _ = add_fair_value(panel)
     df = add_labels(df)
+    df = add_gap_decomposition(df)
+    df = add_label_streak(df)
     df = flag_meme_stock(df)
     df = flag_value_trap(df)
     df = flag_report_lag(df)
@@ -690,7 +770,8 @@ REPORT_COLUMNS = [
     "loss_n_gaps", "loss_gap_agreement", "meme_flag", "value_trap_flag", "transition_flag", "transition_type",
     "report_lag_flag", "price_move_since_report", "fundamental_break_flag", "single_view_flag",
     "financial_risk_flag", "financial_risk_withheld", "financial_risk_reason", "heavy_debt_flag", "heavy_debt_reason",
-    "new_listing_withheld", "short_ratio", "short_interest_pct", "wiki_views_3m", "attention_pct",
+    "new_listing_withheld", "industry_group", "industry_gap", "industry_gap_1y", "size_gap", "own_gap",
+    "label_streak", "short_ratio", "short_interest_pct", "wiki_views_3m", "attention_pct",
     "meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason", "fundamental_break_reason",
     "single_view_reason", "explanation",
 ]

@@ -400,7 +400,7 @@ def load_universe(cache_dir: str | Path, indexes: tuple[str, ...] = tuple(INDEX_
 
 # GICS sub-industry per ticker (2026-09-30): sectors are broad (hardware and
 # software, airlines and defense, mortgage REITs and banks share one), so
-# sub-industries that are cheap by nature land in 저평가 together. Fetched
+# sub-industries that are cheap by nature land in 할인 together. Fetched
 # once from the three Wikipedia index pages — the S&P 500 page covers most of
 # the core list — and frozen like the constituents. Membership is NOT taken
 # from these pages; only the ticker -> sub-industry map is.

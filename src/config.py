@@ -11,6 +11,10 @@ import pandas as pd
 TRAIN_START = pd.Timestamp("2004-01-01")
 TRAIN_END = pd.Timestamp("2019-12-31")
 VAL_END = pd.Timestamp("2023-12-31")
+# Design frozen 2026-10-06. Train/Val/Test have all been looked at while choosing
+# features, so snapshots from this date on are the untouched hold-out ("sealed"):
+# no design choice may use them, and they are evaluated once a year at most.
+SEALED_TEST_START = pd.Timestamp("2027-01-01")
 
 REBALANCE_FREQ = "QS"            # quarterly snapshots (+ today's date)
 HORIZONS_MONTHS = [1, 3, 6, 12]  # forward returns: labels for gap_return_test only, never features
@@ -113,9 +117,9 @@ BASE_EFFECT_CAGR = 1.0      # 3-year earnings growth above this per year -> "(�
 # cheapness_rank = percentile (0-100) of -gap among the date's stocks; five 20% bands.
 CHEAP_THRESHOLD = 80.0
 EXPENSIVE_THRESHOLD = 20.0
-VERY_CHEAP_LABEL, VERY_EXPENSIVE_LABEL = "매우 저평가", "매우 고평가"
-LABEL_BANDS = [(80.0, VERY_CHEAP_LABEL), (60.0, "저평가"), (40.0, "중립"), (20.0, "고평가")]  # rank >= edge; <= 20: 매우 고평가
-LABELS = [VERY_CHEAP_LABEL, "저평가", "중립", "고평가", VERY_EXPENSIVE_LABEL]
+VERY_CHEAP_LABEL, VERY_EXPENSIVE_LABEL = "큰 할인", "큰 프리미엄"
+LABEL_BANDS = [(80.0, VERY_CHEAP_LABEL), (60.0, "할인"), (40.0, "중립"), (20.0, "프리미엄")]  # rank >= edge; <= 20: 큰 프리미엄
+LABELS = [VERY_CHEAP_LABEL, "할인", "중립", "프리미엄", VERY_EXPENSIVE_LABEL]
 
 # Heavy debt = negative equity, or (outside Financials, whose debt is their
 # business) net debt / capital above the limit or in the date's top share among

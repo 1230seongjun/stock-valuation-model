@@ -33,12 +33,13 @@ from config import (
 from fair_value import FEATURE_LABELS_KO, target_features
 from screening import DENOMINATOR_DRIVERS, MIN_DRIVER_EFFECT, multiple_status
 
-SCHEMA_VERSION = "1.6"  # 1.1: cash_backing, without_accruals, near_label_boundary; 1.2: loss-maker verdicts;
+SCHEMA_VERSION = "1.7"  # 1.1: cash_backing, without_accruals, near_label_boundary; 1.2: loss-maker verdicts;
 # 1.3: five 20% bands, loss-makers on the all-stock scale; 1.4: financial-risk withholding; 1.5: new-listing hold, heavy-debt warning;
-# 1.6: sentiment (short interest, Wikipedia attention)
+# 1.6: sentiment (short interest, Wikipedia attention); 1.7: labels renamed to discount/premium,
+# gap_decomposition, label_streak
 MAX_DRIVERS = 3  # per direction and multiple
 BOUNDARY_POINTS = 3  # cheapness_rank this close to a label threshold -> near_label_boundary
-_BAND_EN = dict(zip(LABELS, ["very_cheap", "cheap", "neutral", "expensive", "very_expensive"]))
+_BAND_EN = dict(zip(LABELS, ["large_discount", "discount", "neutral", "premium", "large_premium"]))
 LABEL_EN = {**_BAND_EN, **{"적자 · " + k: "loss_maker_" + v for k, v in _BAND_EN.items()},
             "판단 보류(적자)": "withheld_loss", "판단 보류(재무 위험)": "withheld_financial_risk",
             "판단 보류(신규 상장)": "withheld_new_listing",
@@ -52,7 +53,7 @@ FLAGS = [  # (column, reason column, key, Korean title)
     ("heavy_debt_flag", "heavy_debt_reason", "heavy_debt", "빚 많은 흑자 기업"),
     ("value_trap_flag", "value_trap_reason", "persistent_discount_low_growth", "지속 할인·저성장 경고"),
     ("meme_flag", "meme_reason", "price_volume_anomaly", "단기 가격·거래량 이상"),
-    ("transition_flag", "transition_reason", "cheap_to_expensive", "매우 저평가→매우 고평가 전환"),
+    ("transition_flag", "transition_reason", "cheap_to_expensive", "큰 할인→큰 프리미엄 전환"),
 ]
 FUNDAMENTALS = [*FAIR_VALUE_FEATURES, "roe_avg_3y", "net_debt_to_capital", "asset_turnover", "fcf_margin",
                 "cash_conversion_3y", "eps_volatility_3y", "accruals"]
@@ -61,10 +62,10 @@ UNITS = {"debt_to_equity": "ratio", "asset_turnover": "ratio", "cash_conversion_
          "volatility_63d": "fraction (annualized)"}
 INTERPRETATION_RULES = [
     "Fair multiple = the multiple the market typically gives stocks with these fundamentals on the same "
-    "date (sector and size included). It is not intrinsic value; 저평가/고평가 mean below/above that "
+    "date (sector and size included). It is not intrinsic value; 할인/프리미엄 mean below/above that "
     "baseline, not economically cheap/expensive.",
-    "Labels are five equal bands of the same-date rank: cheapest 20% = 매우 저평가, next 20% = 저평가, middle "
-    "20% = 중립, then 고평가, most expensive 20% = 매우 고평가. Loss-makers get the same bands with '적자 · '.",
+    "Labels are five equal bands of the same-date rank: cheapest 20% = 큰 할인, next 20% = 할인, middle "
+    "20% = 중립, then 프리미엄, most expensive 20% = 큰 프리미엄. Loss-makers get the same bands with '적자 · '.",
     "Not a return forecast. Gaps showed no link to later returns among large caps (0/24 tests after FDR); "
     "never say a stock will rise or fall.",
     "Drivers are the model's contributions to the fair multiple, not causes. denominator_effect=true means "
@@ -77,7 +78,7 @@ INTERPRETATION_RULES = [
     "which one will turn out right.",
     "Flags ask for a second look (one-off items, stale statements, a single multiple); they do not change "
     "the label.",
-    "Small caps lean 저평가 and large caps 고평가 because the size discount is left in the gap.",
+    "Small caps lean 할인 and large caps 프리미엄 because the size discount is left in the gap.",
     "fundamentals: unit 'fraction' means 0.18 = 18%; percentile_same_date ranks the value among all stocks "
     "on this date (100 = highest); used_by_model=false means the model ignores it for this sector.",
     "cash_backing.cash_to_earnings < 1 means part of the last 12 months' net income has not come in as "
@@ -98,6 +99,13 @@ INTERPRETATION_RULES = [
     "Label '판단 보류(신규 상장)': listed less than a year ago and comparable on one multiple only — too little "
     "data to judge. Flag heavy_debt: profitable but heavily indebted; extreme labels are more common for such "
     "stocks in both directions, so mention that the capital structure may explain part of the gap.",
+    "gap_decomposition: industry_gap_pct is the premium or discount the whole industry group gets on this date "
+    "beyond its fundamentals (e.g. money flowing into semiconductors); compare it with industry_gap_1y_ago_pct to "
+    "say whether that group premium has grown. size_gap_pct is what the size group adds (e.g. the small-cap "
+    "discount); own_gap_pct is left for the company. When most of the gap is the industry's or size group's, say "
+    "the label mostly reflects its group rather than the company. label_streak_snapshots: "
+    "how many snapshots in a row (quarter starts + today) the stock has had this label; extreme labels usually "
+    "persist (about 70% still there a quarter later), middle ones change about half the time.",
     "sentiment is descriptive and never part of the verdict. With size and sector held fixed, more heavily "
     "shorted stocks trade at lower multiples and stocks with more Wikipedia attention at higher ones (together "
     "about 8% of the gap). It is an association, not a cause: rising prices draw attention and weak prices draw "
@@ -249,9 +257,10 @@ def stock_context(row: pd.Series, ranks: pd.DataFrame, fit: dict, market_file: s
             "multiples_used": n, "multiples_agreeing": int(round(agree * n)) if pd.notna(agree) and n else None,
             "loss_making": bool(row.get("loss_flag")),
             "near_label_boundary": bool(pd.notna(rank) and min(abs(rank - e) for e in BAND_EDGES) <= BOUNDARY_POINTS),
-            "label_bands": {"매우 저평가": "rank >= 80", "저평가": "60-80", "중립": "40-60", "고평가": "20-40",
-                            "매우 고평가": "rank <= 20"},
+            "label_bands": {"큰 할인": "rank >= 80", "할인": "60-80", "중립": "40-60", "프리미엄": "20-40",
+                            "큰 프리미엄": "rank <= 20"},
             "rank_among_loss_makers": _num(row.get("loss_peer_rank"), 0) if loss_view else None,
+            "label_streak_snapshots": int(row["label_streak"]) if pd.notna(row.get("label_streak")) else None,
         },
         "without_accruals": _without_accruals(alt),
         "multiples": multiples,
@@ -267,6 +276,14 @@ def stock_context(row: pd.Series, ranks: pd.DataFrame, fit: dict, market_file: s
         },
         "cash_backing": _cash_backing(row, year_ago, ranks),
         "sentiment": _sentiment(row),
+        "gap_decomposition": None if pd.isna(row.get("own_gap")) else {
+            "industry_group": row.get("industry_group"),
+            "industry_gap_pct": _pct(row.get("industry_gap")),
+            "industry_gap_1y_ago_pct": _pct(row.get("industry_gap_1y")),
+            "size_group": row.get("size_group"), "size_gap_pct": _pct(row.get("size_gap")),
+            "own_gap_pct": _pct(row.get("own_gap")),
+            "note": "industry = median gap of the industry group on this date; size = median of the rest within the "
+                    "size group; own = what is left (split in log units, so the percents do not add up exactly)"},
         "fundamentals": fundamentals,
         "flags": [{"type": key, "title": title, "reason": row.get(reason) or None}
                   for col, reason, key, title in FLAGS if bool(row.get(col))],

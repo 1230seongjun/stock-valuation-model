@@ -43,6 +43,7 @@ from config import (
     HORIZONS_MONTHS,
     N_JOBS,
     RIDGE_ALPHAS,
+    SEALED_TEST_START,
     TRAIN_END,
     VAL_END,
 )
@@ -106,7 +107,7 @@ def loss_flag(df: pd.DataFrame) -> pd.Series:
     the company is losing money, not just missing data (ROE catches TTM
     losses whose latest quarter happens to be positive, e.g. HAS/TAP after
     impairments; TTM EPS catches them when equity is negative and ROE is
-    missing — AAL, CAR, CCOI, PTCT were 저평가 on 2026-09-30, AAL #1, on a
+    missing — AAL, CAR, CCOI, PTCT were 할인 on 2026-09-30, AAL #1, on a
     single positive quarter).
 
     They get no valuation_gap (a lone PBR or PSR view put one-off impairments
@@ -126,7 +127,7 @@ def split_of(as_of: pd.Timestamp) -> str:
         return "train"
     if as_of <= VAL_END:
         return "val"
-    return "test"
+    return "sealed" if as_of >= SEALED_TEST_START else "test"
 
 
 def target_features(spec: dict, base: list[str] = FAIR_VALUE_FEATURES) -> list[str]:
@@ -444,7 +445,7 @@ def coefficient_summary(diagnostics: pd.DataFrame) -> pd.DataFrame:
 
 
 def _labels_from_gap(gap: pd.Series, as_of: pd.Series) -> pd.Series:
-    """저평가 / 중립 / 고평가 by the same 20% tails as screening, from a
+    """할인 / 중립 / 프리미엄 by the same 20% tails as screening, from a
     combined gap (lower = cheaper)."""
     rank = (-gap).groupby(as_of).rank(pct=True)
     return pd.Series(np.where(rank > 0.8, "cheap", np.where(rank <= 0.2, "rich", "mid")), index=gap.index).where(rank.notna())
@@ -453,8 +454,8 @@ def _labels_from_gap(gap: pd.Series, as_of: pd.Series) -> pd.Series:
 def stability_summary(panel: pd.DataFrame, gap_col: str = "valuation_gap") -> pd.DataFrame:
     """How much the verdict moves between consecutive snapshots, for tickers
     present in both: Spearman of the combined gap, the share whose 3-way
-    label changed, and the share that jumped straight between 저평가 and
-    고평가. Mean per split. A tool that relabels half the market every
+    label changed, and the share that jumped straight between 할인 and
+    프리미엄. Mean per split. A tool that relabels half the market every
     quarter would be describing noise."""
     df = panel[["ticker", "as_of", gap_col]].dropna()
     df = df.assign(label=_labels_from_gap(df[gap_col], df["as_of"]))

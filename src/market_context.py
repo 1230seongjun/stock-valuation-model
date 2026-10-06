@@ -46,7 +46,7 @@ INTERPRETATION_RULES = [
     "A high gap can persist for years (2021 averaged +0.34 log).",
     "CAPE has drifted up structurally (index composition, buybacks, accounting), so part of a positive "
     "gap may be structural rather than temporary.",
-    "Stock labels (저평가/중립/고평가) compare stocks on the same date and do not depend on this value; "
+    "Stock labels (할인/중립/프리미엄) compare stocks on the same date and do not depend on this value; "
     "a stock can be cheap relative to its peers while the whole market is expensive.",
     "Effective sample is about 2-3 business cycles; treat the numbers as approximate.",
 ]
