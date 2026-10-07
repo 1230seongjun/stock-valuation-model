@@ -45,7 +45,7 @@ QUALITY_INDICATORS = ["return_on_equity", "debt_to_equity", "operating_margin", 
 MOMENTUM_INDICATORS = ["ma50_vs_ma200", "pct_from_52w_high"]
 
 # ---- Universe ---------------------------------------------------------------
-UNIVERSE_INDEXES = ("sp400", "sp600")  # on top of the 281-name core list (universe.py)
+UNIVERSE_INDEXES = ("sp500", "sp400", "sp600")  # on top of the 282-name core list (universe.py)
 INDUSTRY_MIN_TICKERS = 20              # a GICS sub-industry with fewer members falls back to "<sector> 기타"
 
 # ---- Fair-value model (fair_value.py) -------------------------------------

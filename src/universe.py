@@ -1,6 +1,8 @@
 """
-Ticker universe: a 281-name large-cap core (11 GICS sectors) plus the S&P
-MidCap 400 / SmallCap 600 members (load_universe).
+Ticker universe: a 282-name large-cap core (11 GICS sectors) plus the S&P 500,
+MidCap 400 and SmallCap 600 members (load_universe). The core came first, by
+hand, and missed S&P 500 names such as AVGO and PLTR; the whole S&P 500 was
+added on 2026-10-07.
 
 - The core list was cross-checked against Wikipedia's S&P 500 list
   (2026-09-18); the rest is general knowledge. A "no price history" flag in
@@ -20,7 +22,7 @@ from pathlib import Path
 import pandas as pd
 
 UNIVERSE: dict[str, dict[str, str]] = {
-    # ---- Technology (34) ----
+    # ---- Technology (35) ----
     "AAPL": {"name": "Apple", "sector": "Technology"},
     "MSFT": {"name": "Microsoft", "sector": "Technology"},
     "ORCL": {"name": "Oracle", "sector": "Technology"},
@@ -41,6 +43,7 @@ UNIVERSE: dict[str, dict[str, str]] = {
     "KLAC": {"name": "KLA Corporation", "sector": "Technology"},
     "AMAT": {"name": "Applied Materials", "sector": "Technology"},
     "HPQ": {"name": "HP Inc.", "sector": "Technology"},
+    "DELL": {"name": "Dell Technologies", "sector": "Technology"},  # added 2026-10-06 (AI servers)
     "XRX": {"name": "Xerox", "sector": "Technology"},
     "NTAP": {"name": "NetApp", "sector": "Technology"},
     "WDC": {"name": "Western Digital", "sector": "Technology"},
@@ -336,6 +339,7 @@ SECTORS: list[str] = sorted({meta["sector"] for meta in UNIVERSE.values()})
 # size_group comes from index membership (market cap, i.e. price): reports only,
 # never a model input.
 INDEX_PAGES = {
+    "sp500": ("large", "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"),  # all of it since 2026-10-07
     "sp400": ("mid", "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"),
     "sp600": ("small", "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies"),
 }
@@ -400,14 +404,11 @@ def load_universe(cache_dir: str | Path, indexes: tuple[str, ...] = tuple(INDEX_
 
 # GICS sub-industry per ticker (2026-09-30): sectors are broad (hardware and
 # software, airlines and defense, mortgage REITs and banks share one), so
-# sub-industries that are cheap by nature land in 할인 together. Fetched
+# sub-industries that are cheap by nature land in the discount bands together. Fetched
 # once from the three Wikipedia index pages — the S&P 500 page covers most of
 # the core list — and frozen like the constituents. Membership is NOT taken
 # from these pages; only the ticker -> sub-industry map is.
-SUB_INDUSTRY_PAGES = {
-    "sp500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-    **{k: url for k, (_, url) in INDEX_PAGES.items()},
-}
+SUB_INDUSTRY_PAGES = {k: url for k, (_, url) in INDEX_PAGES.items()}
 
 
 def parse_sub_industries(html: str) -> dict[str, str]:

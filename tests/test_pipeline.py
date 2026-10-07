@@ -21,7 +21,7 @@ for _candidate in (_this_dir, _this_dir.parent / "src"):
 import numpy as np
 import pandas as pd
 
-from config import FAIR_VALUE_FEATURES, HORIZONS_MONTHS
+from config import FAIR_VALUE_FEATURES, FAIR_VALUE_TARGETS, HORIZONS_MONTHS
 from fair_value import (
     add_fair_value,
     compare_feature_sets,
@@ -42,6 +42,8 @@ from features import (
     is_fiscal_q4,
 )
 from screening import (
+    explain,
+    multiple_status,
     _driver_text,
     _expectation_text,
     add_expectations,
@@ -796,7 +798,7 @@ def test_contributions_add_up():
     assert implied_intercept.std() < 0.05
 
 
-def test_out_of_range_multiples_get_no_gap():
+def test_out_of_range_multiples():
     # all non-Financials tickers (i % 4 != 2), so every multiple applies
     panel = make_fair_value_panel(n_dates=1)
     panel.loc[panel["ticker"] == "T049", "trailing_pe"] = 400.0   # above max
@@ -810,10 +812,13 @@ def test_out_of_range_multiples_get_no_gap():
     out, _ = add_fair_value(panel)
     out = _labelled(out).set_index("ticker")
     assert out.loc["T059", "loss_flag"] and out.loc["T059", "valuation_label"].startswith("적자 · ")
-    assert pd.isna(out.loc["T049", "pe_gap"]) and pd.notna(out.loc["T049", "pb_gap"])
-    assert out.loc["T049", "valuation_basis"] == "PBR+PSR+EV/EBITDA+P/FCF" and out.loc["T049", "n_gaps"] == 4
-    assert pd.isna(out.loc["T051", "pb_gap"])
-    assert pd.isna(out.loc["T057", "ps_gap"]) and "PSR" not in out.loc["T057", "valuation_basis"]
+    # above the range: judged at the upper bound ("at least this expensive"), below it: no gap
+    pe_max, ps_max = FAIR_VALUE_TARGETS["pe"]["max"], FAIR_VALUE_TARGETS["ps"]["max"]
+    assert out.loc["T049", "pe_capped"] and np.isclose(out.loc["T049", "pe_gap"], max(np.log(pe_max / out.loc["T049", "fair_pe"]), 0))
+    assert out.loc["T049", "n_gaps"] == 5 and "PER" in out.loc["T049", "valuation_basis"]
+    assert pd.isna(out.loc["T051", "pb_gap"]) and not out.loc["T051", "pb_capped"]
+    assert out.loc["T057", "ps_capped"] and np.isclose(out.loc["T057", "ps_gap"], max(np.log(ps_max / out.loc["T057", "fair_ps"]), 0))
+    assert not out.drop(index=["T049", "T057"])[["pe_capped", "ps_capped"]].any().any()
     # loss-makers stay out of the main verdict but are compared among themselves (PSR/PBR/...)
     for t in ("T053", "T055"):
         row = out.loc[t]
@@ -826,6 +831,24 @@ def test_out_of_range_multiples_get_no_gap():
     lone = panel[panel["ticker"] == "T055"].assign(ticker="LONE", price_to_book=np.nan, ev_to_ebitda=np.nan, price_to_fcf=np.nan)
     out2 = _labelled(add_fair_value(pd.concat([panel, lone], ignore_index=True))[0]).set_index("ticker")
     assert out2.loc["LONE", "valuation_label"] == "판단 보류(적자)"
+
+
+def test_capped_multiples_leave_the_fit_unchanged():
+    panel = make_fair_value_panel(n_dates=1)
+    high = panel["ticker"].isin(["T049", "T061"])
+    with_high = panel.copy()
+    with_high.loc[high, "trailing_pe"] = [400.0, 900.0]
+    without = panel.copy()
+    without.loc[high, "trailing_pe"] = np.nan
+    a, da = add_fair_value(with_high, n_jobs=1)
+    b, db = add_fair_value(without, n_jobs=1)
+    pd.testing.assert_frame_equal(da, db), "rows above the range never enter the fit"
+    keep = ~high.to_numpy()
+    assert np.allclose(a.loc[keep, "pe_gap"], b.loc[keep, "pe_gap"], equal_nan=True)
+    assert a.loc[high.to_numpy(), "pe_capped"].all() and (a.loc[high.to_numpy(), "pe_gap"] >= 0).all()
+    row = _labelled(a).set_index("ticker").loc["T049"]
+    status, why = multiple_status(row, "pe")
+    assert status == "capped" and "상한" in why and "최소" in explain(row)
 
 
 def test_per_multiple_features_and_reference_view():

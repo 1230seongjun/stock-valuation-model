@@ -33,10 +33,10 @@ from config import (
 from fair_value import FEATURE_LABELS_KO, target_features
 from screening import DENOMINATOR_DRIVERS, MIN_DRIVER_EFFECT, multiple_status
 
-SCHEMA_VERSION = "1.7"  # 1.1: cash_backing, without_accruals, near_label_boundary; 1.2: loss-maker verdicts;
+SCHEMA_VERSION = "1.8"  # 1.1: cash_backing, without_accruals, near_label_boundary; 1.2: loss-maker verdicts;
 # 1.3: five 20% bands, loss-makers on the all-stock scale; 1.4: financial-risk withholding; 1.5: new-listing hold, heavy-debt warning;
 # 1.6: sentiment (short interest, Wikipedia attention); 1.7: labels renamed to discount/premium,
-# gap_decomposition, label_streak
+# gap_decomposition, label_streak; 1.8: multiples above the fit range judged at the upper bound (status 'capped')
 MAX_DRIVERS = 3  # per direction and multiple
 BOUNDARY_POINTS = 3  # cheapness_rank this close to a label threshold -> near_label_boundary
 _BAND_EN = dict(zip(LABELS, ["large_discount", "discount", "neutral", "premium", "large_premium"]))
@@ -111,6 +111,9 @@ INTERPRETATION_RULES = [
     "about 8% of the gap). It is an association, not a cause: rising prices draw attention and weak prices draw "
     "short sellers. Say 'may reflect' (skepticism / enthusiasm), never that sentiment caused the price or that "
     "it predicts a move.",
+    "multiples[].status='capped': the actual multiple is above the range the model is fitted on (capped_at), so "
+    "its gap is computed at that upper bound and means 'at least this much above the reference' (gap_pct is a "
+    "floor, the real premium is larger). Say so; do not present it as an exact premium.",
     "Use only numbers present in this file; say 'not available' instead of estimating missing ones.",
 ]
 
@@ -221,12 +224,14 @@ def stock_context(row: pd.Series, ranks: pd.DataFrame, fit: dict, market_file: s
         status, reason = multiple_status(row, key)
         m = {"name": spec["label"], "key": key, "in_verdict": spec.get("in_verdict", True), "status": status,
              "actual": _num(row.get(spec["column"])), "fair": None, "gap_pct": None, "drivers_up": [], "drivers_down": []}
-        if status == "evaluated":
+        if status in ("evaluated", "capped"):
             m["fair"] = _num(row.get(f"fair_{key}"))
             m["gap_pct"] = _pct(row.get(f"{key}_gap"))
             m["drivers_up"], m["drivers_down"] = _drivers(row, key)
-        else:
+        if status != "evaluated":
             m["status_reason"] = reason
+        if status == "capped":
+            m["capped_at"] = spec["max"]
         multiples.append(m)
     loss_view = bool(row.get("loss_flag")) and pd.notna(row.get("loss_valuation_gap"))
     pre = "loss_" if loss_view else ""

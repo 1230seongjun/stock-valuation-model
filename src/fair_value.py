@@ -176,6 +176,39 @@ def _prepare_features(
     return X, groups
 
 
+def _score_features(train: pd.DataFrame, rows: pd.DataFrame, X_train: pd.DataFrame, groups: dict[str, list[str]],
+                    transform: str = FAIR_VALUE_FEATURE_TRANSFORM) -> pd.DataFrame:
+    """Design matrix for `rows` that were not in the fit, on the scale of
+    _prepare_features(train): a value becomes its percentile among the
+    training rows ("rank") or is clipped to their quantiles ("winsor"); a
+    missing one gets the training median and its missing flag."""
+    X = pd.DataFrame(0.0, index=rows.index, columns=X_train.columns)
+    for feat, cols in groups.items():
+        if feat == "sector":
+            for c in cols:
+                X[c] = (rows["sector"] == c[len("sector_"):]).astype(float)
+            continue
+        if feat in CATEGORICAL_FEATURES:
+            for c in cols:
+                X[c] = (rows[feat] == c[len(feat) + 1:]).astype(float)
+            continue
+        excluded = FAIR_VALUE_FEATURE_EXCLUDE_SECTORS.get(feat, ())
+        ref = train[feat].astype(float).where(~train["sector"].isin(excluded)).dropna()
+        raw = rows[feat].astype(float).where(~rows["sector"].isin(excluded))
+        if transform == "rank":
+            ranks = np.searchsorted(np.sort(ref.to_numpy()), raw.fillna(0.0).to_numpy(), side="right") / max(len(ref), 1)
+            val = pd.Series(ranks, index=raw.index).where(raw.notna())
+        else:
+            lo, hi = ref.quantile([FAIR_VALUE_WINSOR_QUANTILE, 1 - FAIR_VALUE_WINSOR_QUANTILE]) if len(ref) >= 3 else (None, None)
+            val = raw.clip(lo, hi)
+        known = X_train[feat][X_train[f"{feat}_na"] == 0] if f"{feat}_na" in X_train else X_train[feat]
+        median = known.median()
+        X[feat] = val.fillna(0.0 if pd.isna(median) else median)
+        if f"{feat}_na" in cols:
+            X[f"{feat}_na"] = raw.isna().astype(float)
+    return X
+
+
 def _fit_ridge(X: pd.DataFrame, y: pd.Series) -> tuple[RidgeCV, pd.Series, pd.Series]:
     """Ridge on standardized columns. Constant columns (e.g. a sector absent
     from this fold) get scale 1 so they standardize to 0 instead of NaN."""
@@ -222,7 +255,7 @@ def _fit_cross_section(
         sector_median = y.loc[tr].groupby(eligible.loc[tr, "sector"]).median()
         baseline.loc[te] = eligible.loc[te, "sector"].map(sector_median).fillna(y.loc[tr].median()).to_numpy()
 
-    full_model, _, _ = _fit_ridge(X, y)
+    full_model, full_mean, full_scale = _fit_ridge(X, y)
     coefs = pd.Series(full_model.coef_, index=X.columns)
 
     out = None
@@ -232,6 +265,23 @@ def _fit_cross_section(
         out[f"{key}_gap"] = y - pred
         for driver in groups:
             out[f"{key}_contrib_{driver}"] = contrib[driver]
+        out[f"{key}_capped"] = False
+        # A multiple above the range stays out of the fit (near-zero denominators
+        # would pull every fair multiple), but still counts in the verdict: the
+        # date's model gives its fair multiple and the gap is log(max / fair),
+        # "at least this expensive". Dropping it would hide the most expensive view.
+        high = cs[in_scope & (cs[col] > spec["max"])] if spec.get("in_verdict", True) else cs.iloc[:0]
+        if not high.empty:
+            z = (_score_features(eligible, high, X, groups, transform)[X.columns] - full_mean) / full_scale
+            fair = np.exp(full_model.predict(z))
+            capped = pd.DataFrame(index=high.index)
+            capped[f"fair_{key}"] = fair
+            capped[f"{key}_gap"] = np.log(spec["max"] / fair).clip(min=0.0)
+            terms = z * full_model.coef_
+            for driver, cols in groups.items():
+                capped[f"{key}_contrib_{driver}"] = terms[cols].sum(axis=1)
+            capped[f"{key}_capped"] = True
+            out = pd.concat([out, capped])
 
     sst = float(((y - y.mean()) ** 2).sum())
     diag = {
@@ -305,10 +355,12 @@ def add_fair_value(
 
     for key, frames in pieces.items():
         drivers = [*_model_features(FAIR_VALUE_TARGETS[key], features, drop), "sector"]
-        cols = [f"fair_{key}", f"{key}_gap"] + [f"{key}_contrib_{d}" for d in drivers]
+        cols = [f"fair_{key}", f"{key}_gap", f"{key}_capped"] + [f"{key}_contrib_{d}" for d in drivers]
         fitted = pd.concat(frames) if frames else pd.DataFrame(columns=cols, dtype=float)
         df = df.drop(columns=[c for c in cols if c in df.columns]).join(fitted.reindex(columns=cols))
 
+    for key in FAIR_VALUE_TARGETS:
+        df[f"{key}_capped"] = df[f"{key}_capped"].fillna(False).astype(bool)
     df = df.copy()  # defragment after the per-multiple joins
     df["loss_flag"] = loss_flag(df)
     verdict = {k: s for k, s in FAIR_VALUE_TARGETS.items() if s.get("in_verdict", True)}

@@ -623,12 +623,26 @@ def _driver_text(row: pd.Series, key: str) -> str:
     return " / ".join(parts)
 
 
+_HIGH_REASON = {
+    "pe": "이익이 작거나 가격이 매우 높아",
+    "pb": "자본이 작거나(자사주 매입 등) 가격이 매우 높아",
+    "ps": "매출 대비 가격이 매우 높아",
+    "ev_ebitda": "EBITDA가 작거나 가격이 매우 높아",
+    "pfcf": "잉여현금흐름이 작거나 가격이 매우 높아",
+    "pe_norm": "3년 평균 이익이 작아",
+}
+
+
 def multiple_status(row: pd.Series, key: str) -> tuple[str, str]:
     """Why a multiple was or wasn't compared for this stock: (status, Korean
-    reason). status: evaluated | excluded_sector | not_available | too_high |
-    too_low | no_peers (shared by explain and llm_context)."""
+    reason). status: evaluated | capped | excluded_sector | not_available |
+    too_high | too_low | no_peers (shared by explain and llm_context).
+    capped: above the fit range, judged at the range's upper bound."""
     spec = FAIR_VALUE_TARGETS[key]
     actual, gap = row.get(spec["column"]), row.get(f"{key}_gap")
+    if pd.notna(gap) and row.get(f"{key}_capped"):
+        return "capped", (f"{_HIGH_REASON.get(key, '기준 범위를 벗어나')} 학습 범위({spec['max']:g}배)를 넘음 — "
+                          f"상한 {spec['max']:g}배로 계산한 '최소한 이만큼 비싸다'는 값")
     if pd.notna(gap):
         return "evaluated", ""
     if row.get("sector") in spec.get("exclude_sectors", ()):
@@ -637,15 +651,7 @@ def multiple_status(row: pd.Series, key: str) -> tuple[str, str]:
         return "not_available", ("적자라 계산 불가" if key == "pe" and row.get("loss_flag")
                                  else "값 없음(적자·자본잠식 또는 데이터 누락)")
     if actual > spec["max"]:
-        base = {
-            "pe": "이익이 너무 작아",
-            "pb": "자본이 너무 작아(자사주 매입 등)",
-            "ps": "매출 대비 가격이 너무 높아",
-            "ev_ebitda": "EBITDA가 너무 작아",
-            "pfcf": "잉여현금흐름이 너무 작아",
-            "pe_norm": "3년 평균 이익이 너무 작아",
-        }.get(key, "기준 범위를 벗어나")
-        return "too_high", f"{base} 배수로 비교하기 어려움"
+        return "too_high", f"{_HIGH_REASON.get(key, '기준 범위를 벗어나')} 배수로 비교하기 어려움"
     if actual < spec["min"]:
         return "too_low", "비정상적으로 작은 값 — 데이터 오류 가능성"
     return "no_peers", "같은 시점 비교 종목 부족"
@@ -670,6 +676,8 @@ def explain(row: pd.Series) -> str:
                 f"{spec['label']} {actual:.1f}배 (기준 {fair:.1f}배, {np.expm1(gap):+.0%}){excluded} — 기준 "
                 f"{spec['label']}{particle} {_driver_text(row, key)}"
             )
+        elif status == "capped":
+            lines.append(f"{spec['label']} {actual:.0f}배 (기준 {fair:.1f}배, 최소 {np.expm1(gap):+.0%}) — {why}")
         elif status == "excluded_sector":
             continue  # one summary line below instead of one per multiple
         elif status == "too_high":
