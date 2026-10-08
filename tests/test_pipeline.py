@@ -1283,19 +1283,19 @@ def test_gap_decomposition_and_label_streak():
     assert "Semiconductors 업종 전체가 받는 몫 +49% (1년 전 +11%)" in text and "대형주라서 받는 몫" in text
     lone = add_gap_decomposition(now.assign(industry=list("ABCDEFGHIJKL")))
     assert lone["industry_gap"].isna().all() and np.allclose(lone["own_gap"] + lone["size_gap"], lone["valuation_gap"])
-    assert out["mega_gap"].isna().all() and not out["mega_cap"].any(), "no market-cap columns -> no mega part"
-    # mega part: the MEGA_CAP_COUNT largest by market cap share the median of what is left after size
+    assert out["mega_gap"].isna().all() and not out["mega_cap"].any(), "no revenue column -> no mega part"
+    # mega part: the MEGA_CAP_COUNT largest by revenue share the median of what is left after size
     import screening
     n = 60
     big = pd.DataFrame({"ticker": [f"T{i}" for i in range(n)], "industry": "X", "sector": "Tech", "size_group": "large",
-                        "as_of": d1, "book_value": np.arange(n, 0, -1, dtype=float), "price_to_book": 1.0,
+                        "as_of": d1, "log_revenue": np.arange(n, 0, -1, dtype=float),
                         "valuation_gap": np.r_[np.full(screening.MEGA_CAP_COUNT, 0.5), np.zeros(n - screening.MEGA_CAP_COUNT)]})
     m = add_gap_decomposition(big)
     assert m["mega_cap"].sum() == screening.MEGA_CAP_COUNT and m.loc[m["mega_cap"], "ticker"].iloc[0] == "T0"
     assert m["mega_gap"].notna().sum() == screening.MEGA_CAP_COUNT and m.loc[~m["mega_cap"], "mega_gap"].isna().all()
     parts = m[["industry_gap", "size_gap", "mega_gap", "own_gap"]].fillna(0.0).sum(axis=1)
     assert np.allclose(parts, m["valuation_gap"]), "the four parts add up to the gap"
-    assert "초대형주라서 받는 몫" in _decomposition_text(m.iloc[0])
+    assert "최대 기업이라서 받는 몫" in _decomposition_text(m.iloc[0])
     hist = pd.DataFrame({"ticker": ["A"] * 3 + ["B"] * 3, "as_of": [d1, d2, d3] * 2,
                          "valuation_label": ["할인", "큰 할인", "큰 할인", "중립", "중립", "중립"]})
     streak = add_label_streak(hist.iloc[::-1]).sort_values(["ticker", "as_of"])["label_streak"].tolist()

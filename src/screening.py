@@ -198,19 +198,11 @@ def add_labels(panel: pd.DataFrame) -> pd.DataFrame:
 
 # A sector x size group needs this many stocks with a gap on the date to give a shared part.
 GROUP_GAP_MIN_STOCKS = 5
-# The mega-cap group of the gap decomposition: the date's largest stocks by market cap.
-# Market cap has the price in it, so this only splits the description, never a model input.
+# The largest-company group of the gap decomposition: the date's top stocks by REVENUE.
+# Not by market cap: market cap = multiple x fundamentals, so its top picks the stocks
+# that already trade rich and "finds" a premium it selected for (2026-10-08: the
+# top-10-by-market-cap premium of +42% in 2021-26 was +6% for the top 10 by revenue).
 MEGA_CAP_COUNT = 50
-
-
-def _market_cap(df: pd.DataFrame) -> pd.Series:
-    """Market cap (millions): book x PBR, else PSR x revenue (negative book). NaN without the columns."""
-    if not {"book_value", "price_to_book"} <= set(df.columns):
-        return pd.Series(np.nan, index=df.index)
-    cap = df["book_value"] * df["price_to_book"]
-    if {"price_to_sales", "log_revenue"} <= set(df.columns):
-        cap = cap.fillna(df["price_to_sales"] * np.exp(df["log_revenue"]))
-    return cap
 
 
 def _group_median(values: pd.Series, by: list) -> pd.Series:
@@ -227,10 +219,10 @@ def add_gap_decomposition(panel: pd.DataFrame) -> pd.DataFrame:
         industry_gap_1y: the same group's value about a year earlier
       - size_gap: median of what is left within the date's size group
         (e.g. the small-cap discount)
-      - mega_gap: for the date's MEGA_CAP_COUNT largest stocks (mega_cap), the
-        median of what is left after size_gap among them — the premium the
-        largest stocks have shared since about 2020, which industry, R&D
-        accounting and passive (ETF) ownership did not explain (2026-10-08)
+      - mega_gap: for the date's MEGA_CAP_COUNT largest companies by revenue
+        (mega_cap), the median of what is left after size_gap among them —
+        what the very largest companies share beyond other large caps (a
+        discount of about 5-15% in most years since 2004)
       - own_gap: the rest, the company's own part
     A part needs GROUP_GAP_MIN_STOCKS stocks, otherwise it is NaN (and counts as 0)."""
     df = panel.copy()
@@ -241,7 +233,8 @@ def add_gap_decomposition(panel: pd.DataFrame) -> pd.DataFrame:
     rest = gap - df["industry_gap"].fillna(0.0)
     df["size_gap"] = _group_median(rest, [df["as_of"], size])
     rest = rest - df["size_gap"].fillna(0.0)
-    df["mega_cap"] = _market_cap(df).groupby(df["as_of"]).rank(ascending=False) <= MEGA_CAP_COUNT
+    revenue = df["log_revenue"] if "log_revenue" in df.columns else pd.Series(np.nan, index=df.index)
+    df["mega_cap"] = revenue.groupby(df["as_of"]).rank(ascending=False) <= MEGA_CAP_COUNT
     df["mega_gap"] = _group_median(rest.where(df["mega_cap"]), [df["as_of"]]).where(df["mega_cap"])
     df["own_gap"] = rest - df["mega_gap"].fillna(0.0)
     # the group's value a year earlier: the snapshot closest to as_of - 365 days, within 45 days
@@ -286,8 +279,7 @@ def _decomposition_text(row: pd.Series) -> str:
         size = row.get("size_group")
         parts.append(f"{_SIZE_KO.get(size, size)}라서 받는 몫 {np.expm1(row['size_gap']):+.0%}")
     if pd.notna(row.get("mega_gap")):
-        parts.append(f"시가총액 상위 {MEGA_CAP_COUNT} 초대형주라서 받는 몫 {np.expm1(row['mega_gap']):+.0%} "
-                     f"(2020년 무렵부터 커진 현상, 업종·R&D 회계·ETF 보유로는 설명되지 않음)")
+        parts.append(f"매출 상위 {MEGA_CAP_COUNT} 최대 기업이라서 받는 몫 {np.expm1(row['mega_gap']):+.0%}")
     parts.append(f"이 회사만의 몫 {np.expm1(row['own_gap']):+.0%}")
     return "괴리 나누기: " + ", ".join(parts) + " (log 기준으로 나눈 값이라 %로는 정확히 더해지지 않음)"
 

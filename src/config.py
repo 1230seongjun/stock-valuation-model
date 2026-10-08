@@ -18,6 +18,9 @@ VAL_END = pd.Timestamp("2023-12-31")
 # features, net margin, a direct market-cap model, buyback/M&A features, a
 # rule-based financial-health grade. Point-in-time S&P 500 membership: gains vanish
 # once the own multiple and market-cap rank two years earlier are controlled for.
+# WITHDRAWN 2026-10-08 before any sealed data: criterion (b) measures the top-10-by-
+# market-cap premium, which turned out to be mostly a selection effect (top 10 by revenue:
+# +6%, not +42%), so nothing is left to halve. Kept for the record:
 # Pre-registered for the first sealed evaluation (2026-10-08, judged once, not re-tried
 # before then): ix_size_margin = (log_revenue - that date's median log_revenue) x
 # (operating_margin's percentile that date - 0.5), entered untransformed into every
@@ -35,6 +38,13 @@ VAL_END = pd.Timestamp("2023-12-31")
 # by >= +0.01, (b) by >= +0.005 more than (2), and (c) (1) added to PSR and EV/EBITDA
 # (not tied to ROE by an identity, unlike PBR = PER x ROE) raises at least one by
 # >= +0.005. (Train / Val / Test so far: PBR +0.016 / +0.011 / +0.009.)
+# Judged ONLY on sealed quarter-start dates (2027-01-01 on), never on Train/Val numbers.
+# The +0.005 bars in (b) and (c) were set after seeing Train/Val results.
+# Noise (Train+Val, sd of the per-date R^2 difference): S-RIM vs current PBR 0.0097,
+# S-RIM vs plain ROE size 0.0079, PSR 0.0053, EV/EBITDA 0.0097. A 4-date mean has a standard
+# error above half of the (b)/(c) bars, so the judgement waits for 8 sealed quarter-start
+# dates (2027-01-01 .. 2028-10-01), and each condition must also hold in direction on at
+# least 6 of those 8 dates (Train+Val: positive on 99% / 91% / 98% of dates for PBR / vs-ROE / PSR).
 SEALED_TEST_START = pd.Timestamp("2027-01-01")
 
 REBALANCE_FREQ = "QS"            # quarterly snapshots (+ today's date)

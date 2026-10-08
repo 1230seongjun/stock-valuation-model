@@ -106,9 +106,9 @@ INTERPRETATION_RULES = [
     "gap_decomposition: industry_gap_pct is the premium or discount the whole industry group gets on this date "
     "beyond its fundamentals (e.g. a semiconductor-wide premium); compare it with industry_gap_1y_ago_pct to "
     "say whether that group premium has grown. size_gap_pct is what the size group adds (e.g. the small-cap "
-    "discount). mega_gap_pct (only for the 50 largest stocks by market cap) is the premium those stocks share; "
-    "it grew from about 2020 and was not explained by industry, R&D accounting or passive (ETF) ownership — "
-    "do not attribute it to ETF flows or to growth expectations, call it unexplained by the model's inputs. "
+    "discount). mega_gap_pct (only for the 50 largest companies by revenue) is what those companies share beyond "
+    "other large caps, usually a small discount. Do not describe the largest stocks BY MARKET CAP as carrying a "
+    "shared premium: picking by market cap selects the stocks that already trade rich. "
     "own_gap_pct is left for the company. When most of the gap is the industry's or size group's, say "
     "the label mostly reflects its group rather than the company. label_streak_snapshots: "
     "how many snapshots in a row (quarter starts + today) the stock has had this label; extreme labels usually "
@@ -309,7 +309,7 @@ def stock_context(row: pd.Series, ranks: pd.DataFrame, fit: dict, market_file: s
             "mega_cap": bool(row.get("mega_cap", False)), "mega_gap_pct": _pct(row.get("mega_gap")),
             "own_gap_pct": _pct(row.get("own_gap")),
             "note": "industry = median gap of the industry group on this date; size = median of the rest within the "
-                    "size group; mega = for the 50 largest stocks by market cap, the median of what is left among them; "
+                    "size group; mega = for the 50 largest companies by revenue, the median of what is left among them; "
                     "own = what is left (split in log units, so the percents do not add up exactly)"},
         "fundamentals": fundamentals,
         "flags": [{"type": key, "title": title, "reason": row.get(reason) or None}
