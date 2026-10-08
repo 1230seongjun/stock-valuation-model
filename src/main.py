@@ -402,9 +402,9 @@ def screen(panel_path: str | Path = PANEL_PATH, as_of: str | None = None, ticker
     print(table[cols].head(15).to_string(index=False))
     print("\n-- 큰 프리미엄 상위 15 --")
     print(table[table["valuation_label"] == "큰 프리미엄"][cols].tail(15).iloc[::-1].to_string(index=False))
-    loss = report[report["loss_cheapness_rank"].notna()].sort_values("loss_cheapness_rank", ascending=False)
+    loss = report[report["loss_flag"].fillna(False).astype(bool) & report["cheapness_rank"].notna()].sort_values("cheapness_rank", ascending=False)
     if not loss.empty:
-        loss_table = loss.assign(rank=loss["loss_cheapness_rank"].round(0), gap=pct(loss["loss_valuation_gap_pct"]),
+        loss_table = loss.assign(rank=loss["cheapness_rank"].round(0), gap=pct(loss["loss_valuation_gap_pct"]),
                                  basis=loss["loss_valuation_basis"])[["ticker", "sector", "size_group", "valuation_label",
                                                                       "rank", "gap", "basis"]]
         print(f"\n-- 적자 기업 {len(loss)}개 (PER 없음, 주로 PSR·PBR; rank = 같은 배수 기준 전체 종목 중 백분위) --")

@@ -33,16 +33,19 @@ from config import (
 from fair_value import FEATURE_LABELS_KO, target_features
 from screening import DENOMINATOR_DRIVERS, MIN_DRIVER_EFFECT, multiple_status
 
-SCHEMA_VERSION = "1.8"  # 1.1: cash_backing, without_accruals, near_label_boundary; 1.2: loss-maker verdicts;
+SCHEMA_VERSION = "2.0"  # 1.1: cash_backing, without_accruals, near_label_boundary; 1.2: loss-maker verdicts;
 # 1.3: five 20% bands, loss-makers on the all-stock scale; 1.4: financial-risk withholding; 1.5: new-listing hold, heavy-debt warning;
 # 1.6: sentiment (short interest, Wikipedia attention); 1.7: labels renamed to discount/premium,
-# gap_decomposition, label_streak; 1.8: multiples above the fit range judged at the upper bound (status 'capped')
+# gap_decomposition, label_streak; 1.8: multiples above the fit range judged at the upper bound (status 'capped');
+# 1.9: earnings-deterioration risk, withheld discount labels, label outcome history;
+# 2.0: loss-makers on the same labels and rank as everyone (no '적자 · ' labels), loss_type
 MAX_DRIVERS = 3  # per direction and multiple
 BOUNDARY_POINTS = 3  # cheapness_rank this close to a label threshold -> near_label_boundary
 _BAND_EN = dict(zip(LABELS, ["large_discount", "discount", "neutral", "premium", "large_premium"]))
-LABEL_EN = {**_BAND_EN, **{"적자 · " + k: "loss_maker_" + v for k, v in _BAND_EN.items()},
+LABEL_EN = {**_BAND_EN,
             "판단 보류(적자)": "withheld_loss", "판단 보류(재무 위험)": "withheld_financial_risk",
             "판단 보류(신규 상장)": "withheld_new_listing",
+            "판단 보류(실적 악화 위험)": "withheld_deterioration_risk",
             "데이터 부족": "insufficient_data"}
 BAND_EDGES = [edge for edge, _ in LABEL_BANDS]  # 80 / 60 / 40 / 20
 FLAGS = [  # (column, reason column, key, Korean title)
@@ -65,7 +68,8 @@ INTERPRETATION_RULES = [
     "date (sector and size included). It is not intrinsic value; 할인/프리미엄 mean below/above that "
     "baseline, not economically cheap/expensive.",
     "Labels are five equal bands of the same-date rank: cheapest 20% = 큰 할인, next 20% = 할인, middle "
-    "20% = 중립, then 프리미엄, most expensive 20% = 큰 프리미엄. Loss-makers get the same bands with '적자 · '.",
+    "20% = 중립, then 프리미엄, most expensive 20% = 큰 프리미엄. Loss-makers are on the same rank and labels "
+    "(on the multiples a loss leaves); verdict.loss_type says what kind of result the last 12 months were.",
     "Not a return forecast. Gaps showed no link to later returns among large caps (0/24 tests after FDR); "
     "never say a stock will rise or fall.",
     "Drivers are the model's contributions to the fair multiple, not causes. denominator_effect=true means "
@@ -90,9 +94,9 @@ INTERPRETATION_RULES = [
     "near_label_boundary=true: the stock sits within a few rank points of a band edge (20/40/60/80), so a "
     "small change in price or fundamentals can change the label; describe it as borderline.",
     "verdict.comparison_group='loss_makers': the company lost money over the last 12 months, so there is no "
-    "PER; its gap uses PSR/PBR (and EV/EBITDA, P/FCF when positive) and is ranked against ALL stocks' gaps on "
-    "those multiples that date (rank_among_loss_makers is for reference). Say so, and say "
-    "that whether the loss is a one-off (e.g. an impairment) or structural cannot be told from these figures.",
+    "PER; its gap uses PSR/PBR (and EV/EBITDA, P/FCF when positive) and it sits on the same rank and labels as every "
+    "other stock (rank_among_loss_makers is for reference). Mention verdict.loss_type (e.g. a one-off loss with an "
+    "operating profit recovered far more often than a structural loss).",
     "Label '판단 보류(재무 위험)' or flag loss_and_heavy_debt: a loss-maker with heavy debt (negative equity or "
     "very high net debt / capital). The model cannot measure default risk, so it does not call such a stock "
     "cheap even when its multiples are low; say that the low price may reflect default or financing risk.",
@@ -111,6 +115,11 @@ INTERPRETATION_RULES = [
     "about 8% of the gap). It is an association, not a cause: rising prices draw attention and weak prices draw "
     "short sellers. Say 'may reflect' (skepticism / enthusiasm), never that sentiment caused the price or that "
     "it predicts a move.",
+    "verdict.deterioration_risk_pct: estimated chance that 12-month EPS falls 10% or more, or turns to a loss, "
+    "within a year (a separate risk model; it uses price trends too). Label '판단 보류(실적 악화 위험)': the stock "
+    "looked discounted on its multiples but that chance is 50% or more, so it is not called a discount — a "
+    "shrinking business trading low is not cheap. Always mention label_history for discount labels: historically "
+    "the deepest discounts often had falling earnings a year later.",
     "multiples[].status='capped': the actual multiple is above the range the model is fitted on (capped_at), so "
     "its gap is computed at that upper bound and means 'at least this much above the reference' (gap_pct is a "
     "floor, the real premium is larger). Say so; do not present it as an exact premium.",
@@ -237,7 +246,7 @@ def stock_context(row: pd.Series, ranks: pd.DataFrame, fit: dict, market_file: s
     pre = "loss_" if loss_view else ""
     n = int(row.get(f"{pre}n_gaps") or 0)
     agree = row.get(f"{pre}gap_agreement")
-    rank = row.get("loss_cheapness_rank") if loss_view else row.get("cheapness_rank")
+    rank = row.get("cheapness_rank")
     detail = row.get("label_detail") if isinstance(row.get("label_detail"), str) else ""
     fundamentals = {}
     for f in ranks.columns:
@@ -255,17 +264,25 @@ def stock_context(row: pd.Series, ranks: pd.DataFrame, fit: dict, market_file: s
             "label_detail": detail or None, "view": row.get("valuation_view"),
             "comparison_group": "loss_makers" if loss_view else "all_stocks",
             "cheapness_rank": _num(rank, 0),
-            "cheapness_rank_note": ("percentile against ALL stocks on the same four multiples (PSR, PBR, EV/EBITDA, "
-                                    "P/FCF)" if loss_view else "percentile among stocks on this date") + ", 100 = cheapest",
+            "cheapness_rank_note": ("percentile among all stocks on this date; this loss-maker's gap uses PSR, PBR, EV/EBITDA, "
+                                    "P/FCF" if loss_view else "percentile among stocks on this date") + ", 100 = cheapest",
             "combined_gap_pct": _pct(row.get(f"{pre}valuation_gap")),
             "basis": [b for b in str(row.get(f"{pre}valuation_basis") or "").split("+") if b],
             "multiples_used": n, "multiples_agreeing": int(round(agree * n)) if pd.notna(agree) and n else None,
             "loss_making": bool(row.get("loss_flag")),
+            "loss_type": row.get("loss_type") if isinstance(row.get("loss_type"), str) else None,
             "near_label_boundary": bool(pd.notna(rank) and min(abs(rank - e) for e in BAND_EDGES) <= BOUNDARY_POINTS),
             "label_bands": {"큰 할인": "rank >= 80", "할인": "60-80", "중립": "40-60", "프리미엄": "20-40",
                             "큰 프리미엄": "rank <= 20"},
             "rank_among_loss_makers": _num(row.get("loss_peer_rank"), 0) if loss_view else None,
             "label_streak_snapshots": int(row["label_streak"]) if pd.notna(row.get("label_streak")) else None,
+            "deterioration_risk_pct": _x100(row.get("deterioration_risk")),
+            "label_history": None if pd.isna(row.get("label_deteriorated_rate")) else {
+                "deteriorated_pct": _x100(row.get("label_deteriorated_rate")),
+                "turned_loss_pct": _x100(row.get("label_turned_loss_rate")),
+                "cases": int(row["label_outcome_cases"]),
+                "note": "share of stocks with this label in history whose 12-month EPS fell 10%+ or turned to a "
+                        "loss a year later"},
         },
         "without_accruals": _without_accruals(alt),
         "multiples": multiples,

@@ -588,13 +588,13 @@ def test_distressed_loss_makers_are_not_called_cheap():
     out = report_at(flag_financial_risk(screen_ready(add_fair_value(panel)[0]))).set_index("ticker")
     assert out.loc["T001", "valuation_label"] == "판단 보류(재무 위험)" and out.loc["T001", "financial_risk_flag"]
     assert "'싸다'고 판단하지 않음" in out.loc["T001", "financial_risk_reason"] and "재무 위험" in out.loc["T001", "explanation"]
-    assert out.loc["T005", "valuation_label"] == "적자 · 큰 할인" and not out.loc["T005", "financial_risk_flag"]
-    assert out.loc["T017", "valuation_label"] == "적자 · 큰 프리미엄" and out.loc["T017", "financial_risk_flag"]
+    assert out.loc["T005", "valuation_label"] == "큰 할인" and out.loc["T005", "loss_flag"] and not out.loc["T005", "financial_risk_flag"]
+    assert out.loc["T017", "valuation_label"] == "큰 프리미엄" and out.loc["T017", "financial_risk_flag"]
     assert not out.loc["T003", "financial_risk_flag"] and not out.loc["T003", "valuation_label"].startswith("판단 보류")
     assert out.loc["T003", "heavy_debt_flag"] and "흑자지만 빚이 많음" in out.loc["T003", "heavy_debt_reason"]
     # a lender's debt is its business: a Financials loss-maker is not held on leverage
     assert out.loc["T002", "sector"] == "Financials" and not out.loc["T002", "financial_risk_flag"]
-    assert out.loc["T002", "valuation_label"].startswith("적자 · ")
+    assert out.loc["T002", "loss_flag"] and out.loc["T002", "valuation_label"] in ("큰 할인", "할인", "중립", "프리미엄", "큰 프리미엄")
 
 
 def test_new_listing_single_multiple_is_withheld():
@@ -811,7 +811,7 @@ def test_out_of_range_multiples():
     panel.loc[panel["ticker"] == "T059", ["trailing_pe", "return_on_equity", "eps_ttm"]] = [np.nan, np.nan, -0.5]
     out, _ = add_fair_value(panel)
     out = _labelled(out).set_index("ticker")
-    assert out.loc["T059", "loss_flag"] and out.loc["T059", "valuation_label"].startswith("적자 · ")
+    assert out.loc["T059", "loss_flag"] and out.loc["T059", "valuation_label"] in ("큰 할인", "할인", "중립", "프리미엄", "큰 프리미엄")
     # above the range: judged at the upper bound ("at least this expensive"), below it: no gap
     pe_max, ps_max = FAIR_VALUE_TARGETS["pe"]["max"], FAIR_VALUE_TARGETS["ps"]["max"]
     assert out.loc["T049", "pe_capped"] and np.isclose(out.loc["T049", "pe_gap"], max(np.log(pe_max / out.loc["T049", "fair_pe"]), 0))
@@ -822,8 +822,9 @@ def test_out_of_range_multiples():
     # loss-makers stay out of the main verdict but are compared among themselves (PSR/PBR/...)
     for t in ("T053", "T055"):
         row = out.loc[t]
-        assert row["loss_flag"] and row["valuation_label"].startswith("적자 · ")
-        assert pd.isna(row["valuation_gap"]) and pd.isna(row["cheapness_rank"]) and pd.notna(row["loss_cheapness_rank"])
+        assert row["loss_flag"] and row["valuation_label"] in ("큰 할인", "할인", "중립", "프리미엄", "큰 프리미엄")
+        assert pd.isna(row["valuation_gap"]) and pd.notna(row["cheapness_rank"]), "same rank as everyone, on the loss gap"
+        assert np.isclose(row["ranked_gap"], row["loss_valuation_gap"])
     assert pd.notna(out.loc["T053", "ps_gap"]) and pd.notna(out.loc["T053", "pb_gap"])
     assert "PSR" in out.loc["T053", "loss_valuation_basis"] and "PSR" not in out.loc["T055", "loss_valuation_basis"]
     assert np.isclose(out.loc["T053", "loss_valuation_gap"], out.loc["T053", ["ps_gap", "pb_gap", "ev_ebitda_gap", "pfcf_gap"]].mean())
@@ -1234,6 +1235,35 @@ def test_report_lag_flag():
     assert not out.loc["OLD", "report_lag_flag"] and np.isclose(out.loc["OLD", "price_move_since_report"], 0.0)
 
 
+def test_deterioration_risk_is_point_in_time_and_withholds_only_discounts():
+    import deterioration
+    from screening import add_deterioration_risk
+
+    panel = build_synthetic_panel(n_tickers=80)
+    rng = np.random.default_rng(7)
+    panel["eps_ttm"] = np.abs(rng.normal(5, 2, len(panel))) + 0.1
+    labelled = add_labels(add_fair_value(panel)[0])
+    orig = deterioration.DETERIORATION_MIN_TRAIN_ROWS
+    deterioration.DETERIORATION_MIN_TRAIN_ROWS = 200
+    try:
+        out = add_deterioration_risk(labelled)
+        later = labelled.copy()
+        cut = pd.Timestamp("2023-01-01")
+        later.loc[later["as_of"] > cut, "eps_ttm"] = rng.uniform(0.1, 9, int((later["as_of"] > cut).sum()))
+        out2 = add_deterioration_risk(later)
+    finally:
+        deterioration.DETERIORATION_MIN_TRAIN_ROWS = orig
+    year = out["as_of"].dt.year == 2023
+    assert out.loc[year, "deterioration_risk"].notna().any()
+    assert np.allclose(out.loc[year, "deterioration_risk"], out2.loc[year, "deterioration_risk"], equal_nan=True), \
+        "a year's model only uses outcomes known by January 1"
+    w = out["deterioration_withheld"]
+    assert (out.loc[w, "valuation_label"] == "판단 보류(실적 악화 위험)").all()
+    assert labelled.loc[w, "valuation_label"].isin(["큰 할인", "할인"]).all(), "only discount labels are withheld"
+    assert (out.loc[w, "deterioration_risk"] >= 0.5).all()
+    assert out["label_deteriorated_rate"].dropna().between(0, 1).all()
+
+
 def test_gap_decomposition_and_label_streak():
     from screening import _decomposition_text, add_gap_decomposition, add_label_streak
 
@@ -1384,8 +1414,7 @@ def test_end_to_end():
     screened = screen(panel)
     report = report_at(screened)
     assert len(report) == panel["ticker"].nunique()
-    assert report["valuation_label"].isin(["큰 할인", "할인", "중립", "프리미엄", "큰 프리미엄", "데이터 부족", "판단 보류(적자)",
-                                           *["적자 · " + b for b in ("큰 할인", "할인", "중립", "프리미엄", "큰 프리미엄")]]).all()
+    assert report["valuation_label"].isin(["큰 할인", "할인", "중립", "프리미엄", "큰 프리미엄", "데이터 부족", "판단 보류(적자)"]).all()
     assert report["explanation"].str.len().gt(0).all()
     assert report["explanation"].str.contains("종합:").any()
     labelled = report["valuation_label"].isin(["큰 할인", "큰 프리미엄"])

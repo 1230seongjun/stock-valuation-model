@@ -113,7 +113,7 @@ def loss_flag(df: pd.DataFrame) -> pd.Series:
     They get no valuation_gap (a lone PBR or PSR view put one-off impairments
     and structural decliners at the extremes). Their own verdict is
     loss_valuation_gap on LOSS_VIEW_KEYS, ranked against every stock's gap
-    on the same multiples (screening "적자 · <band>"); one-off vs. structural
+    on the same scale as every other stock (screening.add_labels); one-off vs. structural
     losses are still not told apart."""
     pe_missing = df["trailing_pe"].isna() | (df["trailing_pe"] <= 0)
     losing = (df["eps"] <= 0) | (df["return_on_equity"] < 0)

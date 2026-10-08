@@ -14,6 +14,9 @@ VAL_END = pd.Timestamp("2023-12-31")
 # Design frozen 2026-10-06. Train/Val/Test have all been looked at while choosing
 # features, so snapshots from this date on are the untouched hold-out ("sealed"):
 # no design choice may use them, and they are evaluated once a year at most.
+# 2026-10-08 (all rejected, README 실험 이력): standardized gap ranking, loss-maker
+# features, net margin, a direct market-cap model, buyback/M&A features, a
+# rule-based financial-health grade.
 SEALED_TEST_START = pd.Timestamp("2027-01-01")
 
 REBALANCE_FREQ = "QS"            # quarterly snapshots (+ today's date)
@@ -132,3 +135,12 @@ FINANCIAL_RISK_LABEL = "판단 보류(재무 위험)"
 # A verdict on one multiple within this many days of a stock's first snapshot is withheld.
 NEW_LISTING_DAYS = 365
 NEW_LISTING_LABEL = "판단 보류(신규 상장)"
+# Earnings-deterioration risk (deterioration.py): P(trailing EPS down this much or a loss a year later).
+# A 큰 할인 / 할인 label with a risk at or above the threshold is withheld: a shrinking business priced low
+# is not a discount.
+DETERIORATION_DROP = 0.10
+# For a loss-maker, "deteriorated" = still a loss a year later and the loss not even halved.
+DETERIORATION_LOSS_IMPROVEMENT = 0.5
+DETERIORATION_THRESHOLD = 0.5
+DETERIORATION_MIN_TRAIN_ROWS = 5000
+DETERIORATION_LABEL = "판단 보류(실적 악화 위험)"

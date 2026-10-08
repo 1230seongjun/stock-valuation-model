@@ -8,7 +8,7 @@ its fundamentals usually get". Not a return forecast (gap_return_test).
 Labels: cheapness_rank = percentile of -valuation_gap among all stocks of the
 same as_of, cut into five 20% bands (config.LABEL_BANDS). Loss-makers are
 ranked on the same scale using the multiples that still work for them
-(LOSS_VIEW_KEYS) and labelled "적자 · <band>". Verdicts are withheld for
+(LOSS_VIEW_KEYS) and get the same labels; loss_type is shown for reference. Verdicts are withheld for
 heavily indebted loss-makers on the cheap side and for new listings judged on
 one multiple (config FINANCIAL_RISK_* / NEW_LISTING_*). The naive sector rank
 stays as sector_valuation_rank for reference.
@@ -27,6 +27,11 @@ Flags (warnings, labels unchanged):
   - financial_risk_flag / heavy_debt_flag: heavy debt on a loss-maker / a
     profitable stock (heavy_debt).
 
+Earnings-deterioration risk (add_deterioration_risk, deterioration.py): a
+큰 할인 / 할인 label is withheld when the chance of EPS falling 10%+ or a loss
+within a year is 50% or more; every label shows what happened a year later to
+stocks with the same label in history.
+
 Sentiment (add_sentiment): short interest and Wikipedia attention percentiles
 with a note in the explanation — context for the gap, not part of the verdict.
 """
@@ -43,6 +48,8 @@ from config import (
     FINANCIAL_RISK_TOP_SHARE,
     NEW_LISTING_DAYS,
     NEW_LISTING_LABEL,
+    DETERIORATION_LABEL,
+    DETERIORATION_THRESHOLD,
     LABEL_BANDS,
     LABELS,
     VERY_CHEAP_LABEL,
@@ -84,7 +91,6 @@ def _pct_rank(values: pd.Series, by: pd.Series) -> pd.Series:
     return (100.0 * grouped.rank(method="max") / counts).where(counts >= 3)
 
 
-LOSS_LABEL_PREFIX = "적자 · "  # loss-makers, ranked on the all-stock scale
 
 
 def valuation_label(cheapness_rank: float) -> str:
@@ -152,33 +158,30 @@ def flag_financial_risk(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_labels(panel: pd.DataFrame) -> pd.DataFrame:
-    """cheapness_rank + valuation_label from valuation_gap, plus context
-    columns: sector_valuation_rank (naive multiple-vs-sector view),
-    quality_score, momentum_score (means of sector percentiles).
-    Loss-makers (fair_value.loss_flag) have no valuation_gap. Their
-    loss_valuation_gap (PSR/PBR/EV-EBITDA/P-FCF) is ranked against EVERY
-    stock's gap on the same four multiples that date (loss_cheapness_rank,
-    2026-10-02: ranked among loss-makers only, 20% of "적자 · 중립" were in
-    the most expensive 20% of all stocks) and labelled "적자 · " + the same
-    five bands; loss_peer_rank keeps the rank among loss-makers for
-    reference. No multiple at all: "판단 보류(적자)"."""
+    """cheapness_rank + valuation_label, plus context columns:
+    sector_valuation_rank (naive multiple-vs-sector view), quality_score,
+    momentum_score (means of sector percentiles).
+    Every stock is ranked on one scale (2026-10-07): ranked_gap is
+    valuation_gap, or for a loss-maker (fair_value.loss_flag, no PER)
+    loss_valuation_gap on the multiples a loss leaves (PSR/PBR/EV-EBITDA/
+    P-FCF), and the same five bands apply to all. loss_peer_rank keeps the
+    rank among loss-makers for reference. No multiple at all: "판단 보류(적자)"."""
     df = panel.copy()
     if "loss_flag" not in df.columns:
         df["loss_flag"] = loss_flag(df)
 
-    df["cheapness_rank"] = _pct_rank(-df["valuation_gap"], df["as_of"])
-    df["valuation_label"] = df["cheapness_rank"].apply(valuation_label)
-    # loss-makers: their gap ranked against every stock's gap on the same multiples
+    loss = df["loss_flag"].astype(bool)
+    gap = df["valuation_gap"]
     if "loss_valuation_gap" in df.columns:
-        same_basis = df[[f"{k}_gap" for k in LOSS_VIEW_KEYS if f"{k}_gap" in df.columns]].mean(axis=1, skipna=True)
-        df["loss_cheapness_rank"] = _pct_rank(-same_basis, df["as_of"]).where(df["loss_valuation_gap"].notna())
+        gap = gap.where(~loss, df["loss_valuation_gap"])
         df["loss_peer_rank"] = _pct_rank(-df["loss_valuation_gap"], df["as_of"])
-        ranked = df["loss_flag"] & df["loss_cheapness_rank"].notna()
-        df.loc[ranked, "valuation_label"] = df.loc[ranked, "loss_cheapness_rank"].map(lambda r: LOSS_LABEL_PREFIX + valuation_label(r))
-    df.loc[df["loss_flag"] & df["valuation_label"].eq("데이터 부족"), "valuation_label"] = "판단 보류(적자)"
+    df["ranked_gap"] = gap
+    df["cheapness_rank"] = _pct_rank(-gap, df["as_of"])
+    df["valuation_label"] = df["cheapness_rank"].apply(valuation_label)
+    df.loc[loss & df["valuation_label"].eq("데이터 부족"), "valuation_label"] = "판단 보류(적자)"
     # distressed loss-makers: the model can't see default risk -> no cheap verdict (config)
     df["financial_risk_flag"] = financial_risk(df)
-    cheap_side = df["valuation_label"].isin([LOSS_LABEL_PREFIX + VERY_CHEAP_LABEL, LOSS_LABEL_PREFIX + "할인"])
+    cheap_side = df["valuation_label"].isin(LABELS[:2])
     df["financial_risk_withheld"] = df["financial_risk_flag"] & cheap_side
     df.loc[df["financial_risk_withheld"], "valuation_label"] = FINANCIAL_RISK_LABEL
     df["heavy_debt_flag"] = heavy_debt(df) & ~df["loss_flag"].astype(bool)
@@ -304,6 +307,45 @@ def _sentiment_text(row: pd.Series) -> str:
     elif pd.notna(attention) and attention >= SENTIMENT_HIGH and (pd.isna(short) or short <= SENTIMENT_LOW):
         text += " — 관심이 높고 공매도가 적은 종목은 같은 규모·섹터에서 대체로 더 비싸게 거래됨(기대감이 프리미엄에 반영됐을 수 있음)"
     return text + ". 원인과 결과는 구분하지 못함"
+
+
+def add_deterioration_risk(panel: pd.DataFrame) -> pd.DataFrame:
+    """deterioration_risk for profitable labelled rows (deterioration.risk);
+    a 큰 할인 / 할인 label at or above DETERIORATION_THRESHOLD becomes
+    DETERIORATION_LABEL (deterioration_withheld). label_deteriorated_rate /
+    label_turned_loss_rate / label_outcome_cases: what happened a year later,
+    in history, to stocks with the same final label (description only)."""
+    import deterioration
+
+    df = panel.copy()
+    eps = df["eps_ttm"] if "eps_ttm" in df.columns else pd.Series(np.nan, index=df.index)
+    df["loss_type"] = deterioration.loss_type(df) if "eps_ttm" in df.columns else np.nan
+    eligible = df["valuation_label"].isin(LABELS) & eps.notna()
+    df["deterioration_risk"] = deterioration.risk(df, eligible) if eligible.any() else np.nan
+    cheap = df["valuation_label"].isin(LABELS[:2])
+    df["deterioration_withheld"] = cheap & (df["deterioration_risk"] >= DETERIORATION_THRESHOLD)
+    df.loc[df["deterioration_withheld"], "valuation_label"] = DETERIORATION_LABEL
+    rates = deterioration.base_rates(df, df["valuation_label"]) if "eps_ttm" in df.columns else pd.DataFrame()
+    for col, src in (("label_deteriorated_rate", "deteriorated"), ("label_turned_loss_rate", "turned_loss"),
+                     ("label_outcome_cases", "n")):
+        df[col] = df["valuation_label"].map(rates[src]) if src in rates else np.nan
+    return df
+
+
+def _deterioration_text(row: pd.Series) -> list[str]:
+    lines = []
+    p = row.get("deterioration_risk")
+    profit = row.get("eps_ttm", np.nan) > 0
+    what = "12개월 이익이 10% 이상 줄거나 적자로 돌아설" if profit else "적자가 절반도 줄지 않을"
+    if row.get("deterioration_withheld"):
+        lines.append(f"판단 보류(실적 악화 위험): 재무 대비로는 할인 쪽이지만, 1년 안에 {what} 확률이 {p:.0%}로 높음 — "
+                     "실적이 나빠지거나 회복하지 못할 회사가 낮은 가격에 거래되는 것은 할인이 아니므로 할인으로 판단하지 않음")
+    elif pd.notna(p):
+        lines.append(f"실적 악화 위험(1년 안에 {what} 확률): {p:.0%}")
+    if pd.notna(row.get("label_deteriorated_rate")) and row.get("label_outcome_cases", 0) >= 100:
+        lines.append(f"과거 '{row['valuation_label']}' 종목의 1년 뒤: 실적 악화 {row['label_deteriorated_rate']:.0%}, "
+                     f"적자 전환 {row['label_turned_loss_rate']:.0%} ({int(row['label_outcome_cases']):,}개 사례)")
+    return lines
 
 
 def add_expectations(panel: pd.DataFrame, years: int = IMPLIED_GROWTH_YEARS) -> pd.DataFrame:
@@ -493,11 +535,11 @@ def flag_single_view(panel: pd.DataFrame) -> pd.DataFrame:
     n_gaps = df["n_gaps"] if "n_gaps" in df.columns else pd.Series(np.nan, index=df.index)
     basis = df["valuation_basis"] if "valuation_basis" in df.columns else pd.Series("", index=df.index)
     if "loss_n_gaps" in df.columns:  # loss-makers: their own verdict's multiples
-        loss = df["valuation_label"].astype(str).str.startswith(LOSS_LABEL_PREFIX)
+        loss = df.get("loss_flag", pd.Series(False, index=df.index)).astype(bool)
         n_gaps = n_gaps.where(~loss, df["loss_n_gaps"])
         basis = basis.where(~loss, df["loss_valuation_basis"])
     directional = [lbl for lbl in LABELS if lbl != "중립"]
-    labelled = df["valuation_label"].isin(directional + [LOSS_LABEL_PREFIX + lbl for lbl in directional])
+    labelled = df["valuation_label"].isin(directional)
     df["single_view_flag"] = (labelled & (n_gaps == 1)).fillna(False).astype(bool)
     df["single_view_reason"] = [
         f"{b} 한 가지 배수로만 판단 — 다른 배수는 범위 밖이거나 값이 없어 교차 확인이 안 됨 (신뢰도 낮음)" if hit else ""
@@ -711,9 +753,10 @@ def explain(row: pd.Series) -> str:
         n = int(row["loss_n_gaps"])
         agree = int(round(row["loss_gap_agreement"] * n))
         side = "싸다" if row["loss_valuation_gap"] < 0 else "비싸다"
-        lines.append(f"최근 12개월 적자 — PER을 쓸 수 없어 {row['loss_valuation_basis']}로 전체 종목과 비교: "
+        kind = f" (적자 유형: {row['loss_type']})" if isinstance(row.get("loss_type"), str) else ""
+        lines.append(f"최근 12개월 적자{kind} — PER을 쓸 수 없어 {row['loss_valuation_basis']}로 전체 종목과 같은 순위에서 비교: "
                      f"{n}개 관점 중 {agree}개가 '{side}' 쪽 (평균 괴리 {np.expm1(row['loss_valuation_gap']):+.0%}). "
-                     "적자가 일회성 손상 때문인지 구조적 부진인지는 재무 지표만으로 구분할 수 없음")
+                     "적자 유형은 재무제표로 추정한 것이라 실제 사정과 다를 수 있음")
         if row.get("financial_risk_withheld"):
             lines.append("판단 보류(재무 위험): 위 비교로는 싼 쪽이지만, 빚이 많아 부도·재무 위험이 가격에 반영됐을 수 있고 "
                          "모델은 그 위험을 측정하지 못해 '싸다'고 판단하지 않음")
@@ -732,6 +775,7 @@ def explain(row: pd.Series) -> str:
                      "— 다른 배수로 교차 확인할 수 없음")
     if row.get("new_listing_withheld"):
         lines.append("판단 보류(신규 상장): 상장 후 1년이 안 됐고 배수 하나로만 비교돼, 데이터가 부족해 판단하지 않음")
+    lines.extend(_deterioration_text(row))
     decomposition = _decomposition_text(row)
     if decomposition:
         lines.append(decomposition)
@@ -750,11 +794,12 @@ def screen(panel: pd.DataFrame) -> pd.DataFrame:
     df, _ = add_fair_value(panel)
     df = add_labels(df)
     df = add_gap_decomposition(df)
-    df = add_label_streak(df)
     df = flag_meme_stock(df)
-    df = flag_value_trap(df)
     df = flag_report_lag(df)
     df = flag_fundamental_break(df)
+    df = add_deterioration_risk(df)  # reads the two flags above; may withhold a discount label
+    df = add_label_streak(df)
+    df = flag_value_trap(df)
     df = flag_single_view(df)
     df = flag_financial_risk(df)
     df = add_expectations(df)
@@ -774,11 +819,12 @@ REPORT_COLUMNS = [
     "implied_excess_growth", "realized_excess_growth", "earnings_cagr_3y", "earnings_cagr_3y_median",
     "earnings_turnaround_3y",
     "sector_valuation_rank", "quality_score",
-    "momentum_score", "loss_flag", "loss_cheapness_rank", "loss_peer_rank", "loss_valuation_gap_pct", "loss_valuation_basis",
+    "momentum_score", "loss_flag", "loss_type", "ranked_gap", "loss_peer_rank", "loss_valuation_gap_pct", "loss_valuation_basis",
     "loss_n_gaps", "loss_gap_agreement", "meme_flag", "value_trap_flag", "transition_flag", "transition_type",
     "report_lag_flag", "price_move_since_report", "fundamental_break_flag", "single_view_flag",
     "financial_risk_flag", "financial_risk_withheld", "financial_risk_reason", "heavy_debt_flag", "heavy_debt_reason",
-    "new_listing_withheld", "industry_group", "industry_gap", "industry_gap_1y", "size_gap", "own_gap",
+    "new_listing_withheld", "deterioration_risk", "deterioration_withheld",
+    "label_deteriorated_rate", "label_turned_loss_rate", "label_outcome_cases", "industry_group", "industry_gap", "industry_gap_1y", "size_gap", "own_gap",
     "label_streak", "short_ratio", "short_interest_pct", "wiki_views_3m", "attention_pct",
     "meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason", "fundamental_break_reason",
     "single_view_reason", "explanation",
