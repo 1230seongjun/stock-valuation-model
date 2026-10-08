@@ -198,6 +198,19 @@ def add_labels(panel: pd.DataFrame) -> pd.DataFrame:
 
 # A sector x size group needs this many stocks with a gap on the date to give a shared part.
 GROUP_GAP_MIN_STOCKS = 5
+# The mega-cap group of the gap decomposition: the date's largest stocks by market cap.
+# Market cap has the price in it, so this only splits the description, never a model input.
+MEGA_CAP_COUNT = 50
+
+
+def _market_cap(df: pd.DataFrame) -> pd.Series:
+    """Market cap (millions): book x PBR, else PSR x revenue (negative book). NaN without the columns."""
+    if not {"book_value", "price_to_book"} <= set(df.columns):
+        return pd.Series(np.nan, index=df.index)
+    cap = df["book_value"] * df["price_to_book"]
+    if {"price_to_sales", "log_revenue"} <= set(df.columns):
+        cap = cap.fillna(df["price_to_sales"] * np.exp(df["log_revenue"]))
+    return cap
 
 
 def _group_median(values: pd.Series, by: list) -> pd.Series:
@@ -206,7 +219,7 @@ def _group_median(values: pd.Series, by: list) -> pd.Series:
 
 
 def add_gap_decomposition(panel: pd.DataFrame) -> pd.DataFrame:
-    """Splits the combined gap (log) into three descriptive parts; the verdict
+    """Splits the combined gap (log) into four descriptive parts; the verdict
     still uses the whole gap:
       - industry_gap: median gap of the stock's industry group on the date
         (GICS sub-industry with enough members, else "<sector> 기타"), e.g. a
@@ -214,6 +227,10 @@ def add_gap_decomposition(panel: pd.DataFrame) -> pd.DataFrame:
         industry_gap_1y: the same group's value about a year earlier
       - size_gap: median of what is left within the date's size group
         (e.g. the small-cap discount)
+      - mega_gap: for the date's MEGA_CAP_COUNT largest stocks (mega_cap), the
+        median of what is left after size_gap among them — the premium the
+        largest stocks have shared since about 2020, which industry, R&D
+        accounting and passive (ETF) ownership did not explain (2026-10-08)
       - own_gap: the rest, the company's own part
     A part needs GROUP_GAP_MIN_STOCKS stocks, otherwise it is NaN (and counts as 0)."""
     df = panel.copy()
@@ -223,7 +240,10 @@ def add_gap_decomposition(panel: pd.DataFrame) -> pd.DataFrame:
     df["industry_gap"] = _group_median(gap, [df["as_of"], group])
     rest = gap - df["industry_gap"].fillna(0.0)
     df["size_gap"] = _group_median(rest, [df["as_of"], size])
-    df["own_gap"] = rest - df["size_gap"].fillna(0.0)
+    rest = rest - df["size_gap"].fillna(0.0)
+    df["mega_cap"] = _market_cap(df).groupby(df["as_of"]).rank(ascending=False) <= MEGA_CAP_COUNT
+    df["mega_gap"] = _group_median(rest.where(df["mega_cap"]), [df["as_of"]]).where(df["mega_cap"])
+    df["own_gap"] = rest - df["mega_gap"].fillna(0.0)
     # the group's value a year earlier: the snapshot closest to as_of - 365 days, within 45 days
     table = df["industry_gap"].groupby([df["as_of"], group]).first()
     dates = np.array(sorted(df["as_of"].unique()), dtype="datetime64[ns]")
@@ -265,6 +285,9 @@ def _decomposition_text(row: pd.Series) -> str:
     if pd.notna(row.get("size_gap")):
         size = row.get("size_group")
         parts.append(f"{_SIZE_KO.get(size, size)}라서 받는 몫 {np.expm1(row['size_gap']):+.0%}")
+    if pd.notna(row.get("mega_gap")):
+        parts.append(f"시가총액 상위 {MEGA_CAP_COUNT} 초대형주라서 받는 몫 {np.expm1(row['mega_gap']):+.0%} "
+                     f"(2020년 무렵부터 커진 현상, 업종·R&D 회계·ETF 보유로는 설명되지 않음)")
     parts.append(f"이 회사만의 몫 {np.expm1(row['own_gap']):+.0%}")
     return "괴리 나누기: " + ", ".join(parts) + " (log 기준으로 나눈 값이라 %로는 정확히 더해지지 않음)"
 
@@ -824,7 +847,7 @@ REPORT_COLUMNS = [
     "report_lag_flag", "price_move_since_report", "fundamental_break_flag", "single_view_flag",
     "financial_risk_flag", "financial_risk_withheld", "financial_risk_reason", "heavy_debt_flag", "heavy_debt_reason",
     "new_listing_withheld", "deterioration_risk", "deterioration_withheld",
-    "label_deteriorated_rate", "label_turned_loss_rate", "label_outcome_cases", "industry_group", "industry_gap", "industry_gap_1y", "size_gap", "own_gap",
+    "label_deteriorated_rate", "label_turned_loss_rate", "label_outcome_cases", "industry_group", "industry_gap", "industry_gap_1y", "size_gap", "mega_cap", "mega_gap", "own_gap",
     "label_streak", "short_ratio", "short_interest_pct", "wiki_views_3m", "attention_pct",
     "meme_reason", "value_trap_reason", "transition_reason", "report_lag_reason", "fundamental_break_reason",
     "single_view_reason", "explanation",

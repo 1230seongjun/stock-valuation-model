@@ -18,6 +18,14 @@ VAL_END = pd.Timestamp("2023-12-31")
 # features, net margin, a direct market-cap model, buyback/M&A features, a
 # rule-based financial-health grade. Point-in-time S&P 500 membership: gains vanish
 # once the own multiple and market-cap rank two years earlier are controlled for.
+# Pre-registered for the first sealed evaluation (2026-10-08, judged once, not re-tried
+# before then): ix_size_margin = (log_revenue - that date's median log_revenue) x
+# (operating_margin's percentile that date - 0.5), entered untransformed into every
+# in-verdict multiple. Explains the mega-cap premium if, on the sealed dates, (a) every
+# in-verdict multiple's R^2 moves by >= -0.002 and (b) the top-10-by-market-cap premium
+# (median gap of the top 10 minus that of large caps outside the top 50) is at most half
+# the current model's. A model change needs also +0.01 R^2 on some multiple and the user's
+# decision. (On Val it cut the premium 34% -> 21%, PSR R^2 +0.005 Train / +0.010 Val.)
 SEALED_TEST_START = pd.Timestamp("2027-01-01")
 
 REBALANCE_FREQ = "QS"            # quarterly snapshots (+ today's date)
