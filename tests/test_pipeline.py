@@ -1277,25 +1277,29 @@ def test_gap_decomposition_and_label_streak():
     out = add_gap_decomposition(pd.concat([year_ago, now], ignore_index=True))
     a = out[(out["as_of"] == d1) & (out["ticker"] == "A")].iloc[0]
     assert np.isclose(a["industry_gap"], 0.4) and np.isclose(a["industry_gap_1y"], 0.1), "group median now and a year earlier"
-    assert np.isclose(a["size_gap"], 0.1) and np.isclose(a["own_gap"], 0.1)
-    assert np.isclose(a["industry_gap"] + a["size_gap"] + a["own_gap"], a["valuation_gap"])
+    assert np.isclose(a["size_gap"], 0.1) and np.isclose(a["own_gap"], 0.2), "size_gap is a diagnostic, not taken out"
+    assert np.isclose(a["industry_gap"] + a["own_gap"], a["valuation_gap"])
     text = _decomposition_text(a)
-    assert "Semiconductors 업종 전체가 받는 몫 +49% (1년 전 +11%)" in text and "대형주라서 받는 몫" in text
+    assert "Semiconductors 업종 전체가 받는 몫 +49% (1년 전 +11%)" in text and "대형주" not in text
     lone = add_gap_decomposition(now.assign(industry=list("ABCDEFGHIJKL")))
-    assert lone["industry_gap"].isna().all() and np.allclose(lone["own_gap"] + lone["size_gap"], lone["valuation_gap"])
-    assert out["mega_gap"].isna().all() and not out["mega_cap"].any(), "no revenue column -> no mega part"
-    # mega part: the MEGA_CAP_COUNT largest by revenue share the median of what is left after size
+    assert lone["industry_gap"].isna().all() and np.allclose(lone["own_gap"], lone["valuation_gap"])
+    assert out["mega_gap"].isna().all() and not out["mega_cap"].any(), "no market-cap columns -> no mega part"
+    # mega part: the MEGA_CAP_COUNT largest by EXPLAINED market cap (cap / e^ranked_gap) share the median of the rest
     import screening
     n = 60
+    gap = np.r_[np.full(screening.MEGA_CAP_COUNT, 0.5), np.zeros(n - screening.MEGA_CAP_COUNT)]
     big = pd.DataFrame({"ticker": [f"T{i}" for i in range(n)], "industry": "X", "sector": "Tech", "size_group": "large",
-                        "as_of": d1, "log_revenue": np.arange(n, 0, -1, dtype=float),
-                        "valuation_gap": np.r_[np.full(screening.MEGA_CAP_COUNT, 0.5), np.zeros(n - screening.MEGA_CAP_COUNT)]})
+                        "as_of": d1, "book_value": np.arange(n, 0, -1, dtype=float), "valuation_gap": gap, "ranked_gap": gap})
+    big["price_to_book"] = np.exp(big["ranked_gap"])   # cap / e^gap = book: ranked by book, not by the rich price
     m = add_gap_decomposition(big)
     assert m["mega_cap"].sum() == screening.MEGA_CAP_COUNT and m.loc[m["mega_cap"], "ticker"].iloc[0] == "T0"
     assert m["mega_gap"].notna().sum() == screening.MEGA_CAP_COUNT and m.loc[~m["mega_cap"], "mega_gap"].isna().all()
-    parts = m[["industry_gap", "size_gap", "mega_gap", "own_gap"]].fillna(0.0).sum(axis=1)
-    assert np.allclose(parts, m["valuation_gap"]), "the four parts add up to the gap"
-    assert "최대 기업이라서 받는 몫" in _decomposition_text(m.iloc[0])
+    parts = m[["industry_gap", "mega_gap", "own_gap"]].fillna(0.0).sum(axis=1)
+    assert np.allclose(parts, m["valuation_gap"]), "industry + mega + own add up to the gap"
+    assert "재무 규모 상위 50 기업" in _decomposition_text(m.iloc[0])
+    pb = np.where(np.arange(n) == n - 1, 1e6, 1.0)  # the smallest company trades extremely rich ...
+    rich_small = big.assign(price_to_book=pb, ranked_gap=np.log(pb), valuation_gap=np.log(pb))
+    assert not add_gap_decomposition(rich_small)["mega_cap"].iloc[-1], "... which alone does not make it 'largest'"
     hist = pd.DataFrame({"ticker": ["A"] * 3 + ["B"] * 3, "as_of": [d1, d2, d3] * 2,
                          "valuation_label": ["할인", "큰 할인", "큰 할인", "중립", "중립", "중립"]})
     streak = add_label_streak(hist.iloc[::-1]).sort_values(["ticker", "as_of"])["label_streak"].tolist()

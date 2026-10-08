@@ -18,17 +18,18 @@ VAL_END = pd.Timestamp("2023-12-31")
 # features, net margin, a direct market-cap model, buyback/M&A features, a
 # rule-based financial-health grade. Point-in-time S&P 500 membership: gains vanish
 # once the own multiple and market-cap rank two years earlier are controlled for.
-# WITHDRAWN 2026-10-08 before any sealed data: criterion (b) measures the top-10-by-
-# market-cap premium, which turned out to be mostly a selection effect (top 10 by revenue:
-# +6%, not +42%), so nothing is left to halve. Kept for the record:
-# Pre-registered for the first sealed evaluation (2026-10-08, judged once, not re-tried
-# before then): ix_size_margin = (log_revenue - that date's median log_revenue) x
+# Size x margin, RE-REGISTERED 2026-10-08 before any sealed data (final; never changed again).
+# The first version measured the premium of the top 10 by market cap, which partly selects
+# rich stocks; it is now measured on the NEUTRAL basis: the top 10 by the market cap the
+# current model explains (cap / e^ranked_gap) minus ranks 51-500 on the same basis, and only
+# on sealed quarter-start dates. Judged on 8 such dates (2027-01-01 .. 2028-10-01):
+# (a) every in-verdict multiple's mean R^2 moves by >= -0.002, (b) the premium is at most
+# half the current model's, and on >= 6 of the 8 dates lower than the current model's.
+# Train/Val on that basis: premium Val +15% -> +6%, but Train -15% -> -19% (larger in size).
+# Definition: ix_size_margin = (log_revenue - that date's median log_revenue) x
 # (operating_margin's percentile that date - 0.5), entered untransformed into every
-# in-verdict multiple. Explains the mega-cap premium if, on the sealed dates, (a) every
-# in-verdict multiple's R^2 moves by >= -0.002 and (b) the top-10-by-market-cap premium
-# (median gap of the top 10 minus that of large caps outside the top 50) is at most half
-# the current model's. A model change needs also +0.01 R^2 on some multiple and the user's
-# decision. (On Val it cut the premium 34% -> 21%, PSR R^2 +0.005 Train / +0.010 Val.)
+# in-verdict multiple. A model change needs also +0.01 R^2 on some multiple and the user's
+# decision.
 # Also pre-registered (2026-10-08, same evaluation, judged once): S-RIM-shaped ROE in the
 # PBR model, untransformed. ROE = trailing return_on_equity kept in (0, 2], NaN (+ flag)
 # otherwise; r = 8%.
