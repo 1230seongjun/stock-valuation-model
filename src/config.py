@@ -26,6 +26,8 @@ VAL_END = pd.Timestamp("2023-12-31")
 # (a) every in-verdict multiple's mean R^2 moves by >= -0.002, (b) the premium is at most
 # half the current model's, and on >= 6 of the 8 dates lower than the current model's.
 # Train/Val on that basis: premium Val +15% -> +6%, but Train -15% -> -19% (larger in size).
+# If the current model's premium on the sealed dates is below +10%, record 'no verdict' and do not
+# adopt. 'At most half' means the variant's premium <= 0.5 x the current model's (both positive).
 # Definition: ix_size_margin = (log_revenue - that date's median log_revenue) x
 # (operating_margin's percentile that date - 0.5), entered untransformed into every
 # in-verdict multiple. A model change needs also +0.01 R^2 on some multiple and the user's

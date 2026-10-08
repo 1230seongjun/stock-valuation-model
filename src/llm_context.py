@@ -33,12 +33,14 @@ from config import (
 from fair_value import FEATURE_LABELS_KO, target_features
 from screening import DENOMINATOR_DRIVERS, MIN_DRIVER_EFFECT, multiple_status
 
-SCHEMA_VERSION = "2.0"  # 1.1: cash_backing, without_accruals, near_label_boundary; 1.2: loss-maker verdicts;
+SCHEMA_VERSION = "2.1"  # 1.1: cash_backing, without_accruals, near_label_boundary; 1.2: loss-maker verdicts;
 # 1.3: five 20% bands, loss-makers on the all-stock scale; 1.4: financial-risk withholding; 1.5: new-listing hold, heavy-debt warning;
 # 1.6: sentiment (short interest, Wikipedia attention); 1.7: labels renamed to discount/premium,
 # gap_decomposition, label_streak; 1.8: multiples above the fit range judged at the upper bound (status 'capped');
 # 1.9: earnings-deterioration risk, withheld discount labels, label outcome history;
-# 2.0: loss-makers on the same labels and rank as everyone (no '적자 · ' labels), loss_type
+# 2.0: loss-makers on the same labels and rank as everyone (no '적자 · ' labels), loss_type;
+# 2.1 (2026-10-08): gap_decomposition drops size_group / size_gap_pct (index groups lean by selection),
+# adds mega_cap / mega_gap_pct (top 50 by the market cap the fundamentals explain)
 MAX_DRIVERS = 3  # per direction and multiple
 BOUNDARY_POINTS = 3  # cheapness_rank this close to a label threshold -> near_label_boundary
 _BAND_EN = dict(zip(LABELS, ["large_discount", "discount", "neutral", "premium", "large_premium"]))
