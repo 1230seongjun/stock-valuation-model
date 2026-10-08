@@ -513,10 +513,19 @@ def publish(api_key: str | None = None, cache_dir: str | Path = DEFAULT_CACHE_DI
 
     screened = screen_panel(panel)
     as_of = screened["as_of"].max()
-    latest = write_site(screened, out_dir, _market_context(as_of, save=False, cache_dir=cache_dir), keep=keep)
+    market = _market_context(as_of, save=False, cache_dir=cache_dir)
+    latest = write_site(screened, out_dir, market, keep=keep)
     counts = screened.loc[screened["as_of"] == as_of, "valuation_label"].value_counts()
     print(f"\npublished {as_of.date()} ({int(counts.sum())} stocks) -> {latest}  [{time.time() - start:.0f}s]")
     print("  " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+    # what went out incomplete, said at the end where it is seen (a skipped part used to pass silently)
+    warnings = []
+    if market is None:
+        warnings.append("시장 전체 맥락이 빠진 채 게시됨 (위의 '시장 전체 맥락' 줄 참고)")
+    if counts.sum() < 0.98 * len(tickers):
+        warnings.append(f"최신 기준일 종목 {int(counts.sum())}개 < 유니버스 {len(tickers)}개의 98%")
+    for line in warnings:
+        print(f"  경고: {line}")
     return latest
 
 
