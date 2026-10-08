@@ -16,7 +16,8 @@ VAL_END = pd.Timestamp("2023-12-31")
 # no design choice may use them, and they are evaluated once a year at most.
 # 2026-10-08 (all rejected, README 실험 이력): standardized gap ranking, loss-maker
 # features, net margin, a direct market-cap model, buyback/M&A features, a
-# rule-based financial-health grade.
+# rule-based financial-health grade. Point-in-time S&P 500 membership: gains vanish
+# once the own multiple and market-cap rank two years earlier are controlled for.
 SEALED_TEST_START = pd.Timestamp("2027-01-01")
 
 REBALANCE_FREQ = "QS"            # quarterly snapshots (+ today's date)
