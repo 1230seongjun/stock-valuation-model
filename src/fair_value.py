@@ -10,7 +10,7 @@ Per as_of date and multiple:
   2. Features = FAIR_VALUE_FEATURES + extra_features, as percentiles within
      the date (median-imputed, + missing flags), plus sector one-hot.
      Target = log(multiple).
-  3. Ridge, out-of-fold by ticker (GroupKFold): a stock's fair multiple comes
+  3. Ridge, out-of-fold by ticker (fold fixed per ticker, _ticker_folds): a stock's fair multiple comes
      from a model that never saw it, so its own price can't pull it along.
   4. fair_<m> = exp(prediction), <m>_gap = log(actual / fair);
      valuation_gap = mean of the in-verdict gaps (loss-makers: see loss_flag).
@@ -29,11 +29,11 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 from sklearn.linear_model import RidgeCV
-from sklearn.model_selection import GroupKFold
 from statsmodels.stats.multitest import multipletests
 
 from config import (
     FAIR_VALUE_CV_FOLDS,
+    FAIR_VALUE_FOLD_SEED,
     FAIR_VALUE_FEATURE_EXCLUDE_SECTORS,
     FAIR_VALUE_FEATURE_TRANSFORM,
     FAIR_VALUE_FEATURES,
@@ -218,6 +218,24 @@ def _fit_ridge(X: pd.DataFrame, y: pd.Series) -> tuple[RidgeCV, pd.Series, pd.Se
     return model, mean, scale
 
 
+def _ticker_fold(ticker: str, n_splits: int = FAIR_VALUE_CV_FOLDS, seed: int | None = None) -> int:
+    """A ticker's fold from its name alone (md5, stable across runs and machines)."""
+    import hashlib
+
+    seed = FAIR_VALUE_FOLD_SEED if seed is None else seed
+    return int(hashlib.md5(f"{seed}:{ticker}".encode()).hexdigest(), 16) % n_splits
+
+
+def _ticker_folds(tickers: pd.Series, n_splits: int = FAIR_VALUE_CV_FOLDS):
+    """(train positions, test positions) per fold; a ticker's fold does not depend on which
+    other tickers are present. Empty folds are skipped."""
+    fold = tickers.map(lambda t: _ticker_fold(t, n_splits)).to_numpy()
+    for k in range(n_splits):
+        test = np.flatnonzero(fold == k)
+        if len(test) and len(test) < len(fold):
+            yield np.flatnonzero(fold != k), test
+
+
 def _fit_cross_section(
     cs: pd.DataFrame, key: str, spec: dict, sectors: list[str], features: list[str] = FAIR_VALUE_FEATURES,
     transform: str = FAIR_VALUE_FEATURE_TRANSFORM, contributions: bool = True,
@@ -241,8 +259,7 @@ def _fit_cross_section(
     baseline = pd.Series(np.nan, index=eligible.index)
     contrib = pd.DataFrame(np.nan, index=eligible.index, columns=list(groups))
 
-    n_splits = min(FAIR_VALUE_CV_FOLDS, eligible["ticker"].nunique())
-    for train_idx, test_idx in GroupKFold(n_splits=n_splits).split(X, y, eligible["ticker"]):
+    for train_idx, test_idx in _ticker_folds(eligible["ticker"]):
         tr, te = eligible.index[train_idx], eligible.index[test_idx]
         model, mean, scale = _fit_ridge(X.loc[tr], y.loc[tr])
         z = (X.loc[te] - mean) / scale

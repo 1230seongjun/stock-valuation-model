@@ -597,6 +597,19 @@ def test_distressed_loss_makers_are_not_called_cheap():
     assert out.loc["T002", "loss_flag"] and out.loc["T002", "valuation_label"] in ("큰 할인", "할인", "중립", "프리미엄", "큰 프리미엄")
 
 
+def test_folds_fixed_per_ticker():
+    """A ticker's out-of-fold group does not move when other stocks join or leave."""
+    from fair_value import _ticker_fold, _ticker_folds
+    few = pd.Series([f"T{i:03d}" for i in range(40)])
+    more = pd.concat([few, pd.Series([f"X{i}" for i in range(25)])], ignore_index=True)
+    fold_of = lambda s: {s.iloc[i]: k for k, (_, test) in enumerate(_ticker_folds(s)) for i in test}
+    a, b = fold_of(few), fold_of(more)
+    assert all(a[t] == b[t] for t in few), "joining stocks reshuffled existing folds"
+    assert all(_ticker_fold(t) == _ticker_fold(t) for t in few) and len(set(a.values())) == 5
+    for train, test in _ticker_folds(few):
+        assert not set(few.iloc[train]) & set(few.iloc[test])
+
+
 def test_new_listing_single_multiple_is_withheld():
     """A stock first seen after the panel's first date, judged on one
     multiple within a year, gets "판단 보류(신규 상장)"; an older stock judged

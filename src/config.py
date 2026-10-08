@@ -137,6 +137,10 @@ FAIR_VALUE_FEATURE_CANDIDATES = [
 ]
 
 FAIR_VALUE_CV_FOLDS = 5             # out-of-fold by ticker within each as_of
+# A ticker's fold = md5(f"{seed}:{ticker}") mod folds: fixed per ticker, so adding or dropping
+# other stocks no longer reshuffles everyone's fold (GroupKFold's assignment followed the whole
+# ticker list and flipped about 7% of labels when five tickers left, 2026-10-08).
+FAIR_VALUE_FOLD_SEED = 0
 FAIR_VALUE_WINSOR_QUANTILE = 0.02   # used by the "winsor" transform only
 FAIR_VALUE_FEATURE_TRANSFORM = "rank"  # each feature -> its percentile within the as_of ("winsor" for comparison)
 FAIR_VALUE_MIN_ROWS = 50            # skip an as_of with fewer usable rows
