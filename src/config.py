@@ -26,6 +26,15 @@ VAL_END = pd.Timestamp("2023-12-31")
 # (median gap of the top 10 minus that of large caps outside the top 50) is at most half
 # the current model's. A model change needs also +0.01 R^2 on some multiple and the user's
 # decision. (On Val it cut the premium 34% -> 21%, PSR R^2 +0.005 Train / +0.010 Val.)
+# Also pre-registered (2026-10-08, same evaluation, judged once): S-RIM-shaped ROE in the
+# PBR model, untransformed. ROE = trailing return_on_equity kept in (0, 2], NaN (+ flag)
+# otherwise; r = 8%.
+#   (1) srim_w09 = log(max(1 + (ROE - r) * 0.9 / (1 + r - 0.9), 0.05))
+#   (2) roe_raw  = log(ROE)  (the same ROE size without the S-RIM shape)
+# Adopt (1) into PBR's extra_features only if, on the sealed dates, (a) (1) raises PBR R^2
+# by >= +0.01, (b) by >= +0.005 more than (2), and (c) (1) added to PSR and EV/EBITDA
+# (not tied to ROE by an identity, unlike PBR = PER x ROE) raises at least one by
+# >= +0.005. (Train / Val / Test so far: PBR +0.016 / +0.011 / +0.009.)
 SEALED_TEST_START = pd.Timestamp("2027-01-01")
 
 REBALANCE_FREQ = "QS"            # quarterly snapshots (+ today's date)
