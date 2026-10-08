@@ -270,6 +270,7 @@ def stock_context(row: pd.Series, ranks: pd.DataFrame, fit: dict, market_file: s
             "label": row.get("valuation_label"), "label_en": LABEL_EN.get(row.get("valuation_label")),
             "label_detail": detail or None, "view": row.get("valuation_view"),
             "comparison_group": "loss_makers" if loss_view else "all_stocks",
+            "share_class_of": row.get("share_class_of") if isinstance(row.get("share_class_of"), str) else None,
             "cheapness_rank": _num(rank, 0),
             "cheapness_rank_note": ("percentile among all stocks on this date; this loss-maker's gap uses PSR, PBR, EV/EBITDA, "
                                     "P/FCF" if loss_view else "percentile among stocks on this date") + ", 100 = cheapest",

@@ -49,6 +49,11 @@ VAL_END = pd.Timestamp("2023-12-31")
 # dates (2027-01-01 .. 2028-10-01), and each condition must also hold in direction on at
 # least 6 of those 8 dates (Train+Val: positive on 99% / 91% / 98% of dates for PBR / vs-ROE / PSR).
 SEALED_TEST_START = pd.Timestamp("2027-01-01")
+# One company, two listed share classes (same SEC CIK): only the primary one (more dollar
+# volume, 2026-10-08) is fitted, ranked and counted; the other shows the primary's verdict.
+# Fitting both let one class's own price sit in the other's out-of-fold fair multiple and
+# counted the company twice in ranks and return tests.
+SHARE_CLASS_PRIMARY = {"GOOG": "GOOGL", "FOX": "FOXA", "NWS": "NWSA", "UA": "UAA", "CENT": "CENTA"}
 
 REBALANCE_FREQ = "QS"            # quarterly snapshots (+ today's date)
 HORIZONS_MONTHS = [1, 3, 6, 12]  # forward returns: labels for gap_return_test only, never features

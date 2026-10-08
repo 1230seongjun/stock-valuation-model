@@ -48,6 +48,7 @@ from config import (
     FINANCIAL_RISK_TOP_SHARE,
     NEW_LISTING_DAYS,
     NEW_LISTING_LABEL,
+    SHARE_CLASS_PRIMARY,
     DETERIORATION_LABEL,
     DETERIORATION_THRESHOLD,
     LABEL_BANDS,
@@ -728,6 +729,8 @@ def explain(row: pd.Series) -> str:
     that could be evaluated, the drivers behind each fair multiple, and why
     a multiple was skipped if it was."""
     lines = []
+    if isinstance(row.get("share_class_of"), str):
+        lines.append(f"같은 회사의 다른 주식({row['share_class_of']})과 같은 판정입니다(순위·라벨 분포에는 한 번만 셈).")
     for key, spec in FAIR_VALUE_TARGETS.items():
         if spec["column"] not in row.index:  # panel built before this multiple existed
             continue
@@ -829,11 +832,22 @@ def screen(panel: pd.DataFrame) -> pd.DataFrame:
     df = add_expectations(df)
     df = add_sentiment(df)
     df = add_label_detail(df)  # after the break flag, which it reads
-    return classify_valuation_transition(df)
+    return copy_share_classes(classify_valuation_transition(df))
+
+
+def copy_share_classes(df: pd.DataFrame) -> pd.DataFrame:
+    """A secondary share class (config.SHARE_CLASS_PRIMARY) gets its primary's rows, verdict
+    and all, under its own ticker, with share_class_of naming the primary; it was left out
+    of the fit and the ranks."""
+    keep = df[~df["ticker"].isin(SHARE_CLASS_PRIMARY)]
+    copies = [keep[keep["ticker"] == primary].assign(ticker=secondary, share_class_of=primary)
+              for secondary, primary in SHARE_CLASS_PRIMARY.items()
+              if (df["ticker"] == secondary).any()]
+    return pd.concat([keep, *copies], ignore_index=True) if copies else df
 
 
 REPORT_COLUMNS = [
-    "ticker", "sector", "size_group", "as_of", "valuation_label", "label_detail", "valuation_view",
+    "ticker", "share_class_of", "sector", "size_group", "as_of", "valuation_label", "label_detail", "valuation_view",
     "cheapness_rank", "valuation_gap_pct", "valuation_basis",
     "n_gaps", "gap_agreement",
     "trailing_pe", "fair_pe", "price_to_book", "fair_pb", "price_to_sales", "fair_ps",

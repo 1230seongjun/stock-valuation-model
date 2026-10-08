@@ -610,6 +610,32 @@ def test_folds_fixed_per_ticker():
         assert not set(few.iloc[train]) & set(few.iloc[test])
 
 
+def test_secondary_share_class_is_fitted_and_ranked_once():
+    """GOOG-style second share class: out of the fit and ranks, then shown with the primary's verdict."""
+    import config
+    from screening import copy_share_classes
+    panel = make_fair_value_panel(n_dates=1)
+    twin = panel[panel["ticker"] == "T001"].assign(ticker="TWIN")
+    panel = pd.concat([panel, twin], ignore_index=True)
+    old = dict(config.SHARE_CLASS_PRIMARY)
+    import fair_value, screening
+    try:
+        for mod in (config, fair_value, screening):
+            mod.SHARE_CLASS_PRIMARY = {"TWIN": "T001"}
+        fitted = add_fair_value(panel, n_jobs=1)[0]
+        assert fitted.loc[fitted["ticker"] == "TWIN", "valuation_gap"].isna().all(), "the secondary class is not fitted"
+        ready = screen_ready(fitted)
+        assert ready.loc[ready["ticker"] == "TWIN", "cheapness_rank"].isna().all(), "nor ranked"
+        out = copy_share_classes(ready).set_index("ticker")
+        assert out.loc["TWIN", "share_class_of"] == "T001"
+        assert out.loc["TWIN", "valuation_label"] == out.loc["T001", "valuation_label"]
+        assert out.loc["TWIN", "cheapness_rank"] == out.loc["T001", "cheapness_rank"]
+        assert (out.index == "TWIN").sum() == 1
+    finally:
+        for mod in (config, fair_value, screening):
+            mod.SHARE_CLASS_PRIMARY = old
+
+
 def test_new_listing_single_multiple_is_withheld():
     """A stock first seen after the panel's first date, judged on one
     multiple within a year, gets "판단 보류(신규 상장)"; an older stock judged

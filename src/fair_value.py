@@ -44,6 +44,7 @@ from config import (
     N_JOBS,
     RIDGE_ALPHAS,
     SEALED_TEST_START,
+    SHARE_CLASS_PRIMARY,
     TRAIN_END,
     VAL_END,
 )
@@ -356,7 +357,8 @@ def add_fair_value(
     diagnostics = []
 
     n_jobs = N_JOBS if n_jobs is None else n_jobs
-    dates = list(df.groupby("as_of"))
+    fit = df[~df["ticker"].isin(SHARE_CLASS_PRIMARY)]  # one class per company (config)
+    dates = list(fit.groupby("as_of"))
     if n_jobs == 1 or len(dates) < _MIN_DATES_FOR_PARALLEL:
         per_date = [_fit_date(as_of, cs, sectors, features, transform, drop) for as_of, cs in dates]
     else:
@@ -439,7 +441,7 @@ def compare_feature_sets(
                                           else spec[0] if isinstance(spec, tuple) else spec)}
     used |= {f for spec in FAIR_VALUE_TARGETS.values() for f in (spec["column"], *spec.get("extra_features", ()))}
     keep = ["as_of", "ticker", "sector", "eps", "trailing_pe", "return_on_equity", *sorted(used)]
-    slim = panel[list(dict.fromkeys(c for c in keep if c in panel.columns))]
+    slim = panel.loc[~panel["ticker"].isin(SHARE_CLASS_PRIMARY), list(dict.fromkeys(c for c in keep if c in panel.columns))]
     if n_jobs == 1 or len(specs) == 1 or slim["as_of"].nunique() < _MIN_DATES_FOR_PARALLEL:
         diags = [_set_diagnostics(slim, spec) for spec in specs]
     else:
